@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Ordered live refresh pipeline for the Big Five prediction system.
 
-Expensive/public providers are freshness-gated so an hourly/manual refresh can be
-safe without burning quota. Downstream feature/readiness/prediction steps still
-run after every refresh using the freshest stored snapshots.
+Provider calls are freshness-gated. The scheduled Thursday/Friday refreshes build
+all current context, advanced feature layers and finally the quality-gated Top-10.
 """
 from __future__ import annotations
 
@@ -25,20 +24,21 @@ RUN_ESPN_TEAM_SCHEDULE = os.getenv("LIVE_REFRESH_ESPN_TEAM_SCHEDULE", "true").lo
 RUN_UNDERSTAT = os.getenv("LIVE_REFRESH_UNDERSTAT", "true").lower() in {"1", "true", "yes"}
 RUN_ODDSPAPI = os.getenv("LIVE_REFRESH_ODDSPAPI", "true").lower() in {"1", "true", "yes"}
 RUN_FOTMOB_AVAILABILITY = os.getenv("LIVE_REFRESH_FOTMOB_AVAILABILITY", "true").lower() in {"1", "true", "yes"}
-# BBS forward-looking soccer injuries are disabled; BBS match/lineup routes remain useful.
 RUN_BBS = os.getenv("LIVE_REFRESH_BBS", "false").lower() in {"1", "true", "yes"}
 RUN_BBS_LINEUPS = os.getenv("LIVE_REFRESH_BBS_LINEUPS", "true").lower() in {"1", "true", "yes"}
 RUN_SOFASCORE = os.getenv("LIVE_REFRESH_SOFASCORE", "true").lower() in {"1", "true", "yes"}
+RUN_ADVANCED = os.getenv("LIVE_REFRESH_ADVANCED", "true").lower() in {"1", "true", "yes"}
 RUN_PREMATCH = os.getenv("LIVE_REFRESH_PREMATCH", "true").lower() in {"1", "true", "yes"}
 RUN_ODDS_MOVEMENT = os.getenv("LIVE_REFRESH_ODDS_MOVEMENT", "true").lower() in {"1", "true", "yes"}
 RUN_AVAILABILITY_ENRICH = os.getenv("LIVE_REFRESH_AVAILABILITY_ENRICH", "true").lower() in {"1", "true", "yes"}
 RUN_READINESS = os.getenv("LIVE_REFRESH_READINESS", "true").lower() in {"1", "true", "yes"}
 RUN_PREDICTIONS = os.getenv("LIVE_REFRESH_PREDICTIONS", "true").lower() in {"1", "true", "yes"}
 
-ESPN_CONTEXT_REFRESH_HOURS = float(os.getenv("ESPN_CONTEXT_REFRESH_HOURS", "2"))
-TEAM_SCHEDULE_REFRESH_HOURS = float(os.getenv("TEAM_SCHEDULE_REFRESH_HOURS", "12"))
-ODDSPAPI_REFRESH_HOURS = float(os.getenv("ODDSPAPI_REFRESH_HOURS", "8"))
-FOTMOB_REFRESH_HOURS = float(os.getenv("FOTMOB_REFRESH_HOURS", "6"))
+ESPN_CONTEXT_REFRESH_HOURS = float(os.getenv("ESPN_CONTEXT_REFRESH_HOURS", "20"))
+TEAM_SCHEDULE_REFRESH_HOURS = float(os.getenv("TEAM_SCHEDULE_REFRESH_HOURS", "120"))
+UNDERSTAT_REFRESH_HOURS = float(os.getenv("UNDERSTAT_REFRESH_HOURS", "48"))
+ODDSPAPI_REFRESH_HOURS = float(os.getenv("ODDSPAPI_REFRESH_HOURS", "20"))
+FOTMOB_REFRESH_HOURS = float(os.getenv("FOTMOB_REFRESH_HOURS", "20"))
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("live-refresh")
@@ -66,7 +66,7 @@ def recent_success(table: str, hours: float) -> bool:
     if not DATABASE_URL or hours <= 0:
         return False
     allowed = {
-        "espn_context_runs", "espn_team_schedule_runs", "oddspapi_import_runs",
+        "espn_context_runs", "espn_team_schedule_runs", "oddspapi_import_runs", "oddspapi_allbooks_runs",
         "fotmob_availability_runs", "understat_import_runs",
     }
     if table not in allowed:
@@ -119,18 +119,18 @@ def main() -> Dict[str, Any]:
             run_step("espn_team_schedule", lambda: fn(DATABASE_URL), steps, optional=True)
 
     if RUN_UNDERSTAT:
-        if recent_success("understat_import_runs", 5.5):
-            skip(steps, "understat", "fresh<5.5h")
+        if recent_success("understat_import_runs", UNDERSTAT_REFRESH_HOURS):
+            skip(steps, "understat", f"fresh<{UNDERSTAT_REFRESH_HOURS}h")
         else:
             from understat_xg_importer import run_import as fn
             run_step("understat", lambda: fn(DATABASE_URL), steps, optional=True)
 
     if RUN_ODDSPAPI:
-        if recent_success("oddspapi_import_runs", ODDSPAPI_REFRESH_HOURS):
-            skip(steps, "oddspapi", f"fresh<{ODDSPAPI_REFRESH_HOURS}h")
+        if recent_success("oddspapi_allbooks_runs", ODDSPAPI_REFRESH_HOURS):
+            skip(steps, "oddspapi_allbooks", f"fresh<{ODDSPAPI_REFRESH_HOURS}h")
         else:
-            from oddspapi_canonical_importer import run_import as fn
-            run_step("oddspapi", lambda: fn(DATABASE_URL), steps, optional=True)
+            from oddspapi_allbooks_importer import run_import as fn
+            run_step("oddspapi_allbooks", lambda: fn(DATABASE_URL), steps, optional=True)
 
     if RUN_FOTMOB_AVAILABILITY:
         if recent_success("fotmob_availability_runs", FOTMOB_REFRESH_HOURS):
@@ -149,6 +149,10 @@ def main() -> Dict[str, Any]:
         from sofascore_availability_www import run_import as fn
         run_step("sofascore_availability", lambda: fn(DATABASE_URL), steps, optional=True)
 
+    if RUN_ADVANCED:
+        from advanced_features_pipeline import run as fn
+        run_step("advanced_features", lambda: fn(DATABASE_URL), steps, optional=True)
+
     if RUN_PREMATCH:
         from prematch_context_builder_fixed import run_build as fn
         run_step("prematch_context", lambda: fn(DATABASE_URL), steps)
@@ -162,7 +166,7 @@ def main() -> Dict[str, Any]:
         from data_readiness_audit_v4 import run_audit as fn
         run_step("data_readiness", lambda: fn(DATABASE_URL), steps)
     if RUN_PREDICTIONS:
-        from production_predictor_v2 import run_predictions as fn
+        from production_predictor_v3 import run_predictions as fn
         run_step("production_predictions", lambda: fn(DATABASE_URL), steps)
 
     summary["finished_at"] = utcnow().isoformat()
