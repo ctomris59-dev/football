@@ -24,7 +24,9 @@ RUN_ESPN_CONTEXT = os.getenv("LIVE_REFRESH_ESPN_CONTEXT", "true").lower() in {"1
 RUN_ESPN_TEAM_SCHEDULE = os.getenv("LIVE_REFRESH_ESPN_TEAM_SCHEDULE", "true").lower() in {"1", "true", "yes"}
 RUN_UNDERSTAT = os.getenv("LIVE_REFRESH_UNDERSTAT", "true").lower() in {"1", "true", "yes"}
 RUN_ODDSPAPI = os.getenv("LIVE_REFRESH_ODDSPAPI", "true").lower() in {"1", "true", "yes"}
-RUN_BBS = os.getenv("LIVE_REFRESH_BBS", "true").lower() in {"1", "true", "yes"}
+# BBS currently documents football match/lineup routes but not a forward-looking soccer injury-report route.
+# Keep the historical absence probe opt-in only instead of spending five requests every refresh.
+RUN_BBS = os.getenv("LIVE_REFRESH_BBS", "false").lower() in {"1", "true", "yes"}
 RUN_BBS_LINEUPS = os.getenv("LIVE_REFRESH_BBS_LINEUPS", "true").lower() in {"1", "true", "yes"}
 RUN_SOFASCORE = os.getenv("LIVE_REFRESH_SOFASCORE", "true").lower() in {"1", "true", "yes"}
 RUN_PREMATCH = os.getenv("LIVE_REFRESH_PREMATCH", "true").lower() in {"1", "true", "yes"}
@@ -77,7 +79,7 @@ def main() -> Dict[str, Any]:
     if RUN_BBS_LINEUPS:
         from bbs_lineups_importer import run_import as fn; run_step("bbs_lineups",lambda:fn(DATABASE_URL),steps,optional=True)
     if RUN_SOFASCORE:
-        from sofascore_availability_importer import run_import as fn; run_step("sofascore_availability",lambda:fn(DATABASE_URL),steps,optional=True)
+        from sofascore_availability_www import run_import as fn; run_step("sofascore_availability",lambda:fn(DATABASE_URL),steps,optional=True)
     if RUN_PREMATCH:
         from prematch_context_builder_fixed import run_build as fn; run_step("prematch_context",lambda:fn(DATABASE_URL),steps)
     if RUN_AVAILABILITY_ENRICH:
