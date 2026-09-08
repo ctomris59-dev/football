@@ -9,8 +9,9 @@ GET /download?token=...
 The ZIP is generated on demand from PostgreSQL. This avoids relying on Render's
 ephemeral local disk after a Cron/One-Off run has ended.
 
-On startup, the service also starts the free Football-Data.co.uk importer in a
-background thread. The importer is idempotent and refresh-limited.
+On startup, the service starts two idempotent background imports:
+- Football-Data mirror for completed Big Five seasons
+- ESPN public soccer data for the current season and upcoming fixtures
 """
 from __future__ import annotations
 
@@ -36,6 +37,11 @@ AUTO_IMPORT_FOOTBALL_DATA = os.getenv("AUTO_IMPORT_FOOTBALL_DATA", "true").lower
     "true",
     "yes",
 }
+AUTO_IMPORT_ESPN = os.getenv("AUTO_IMPORT_ESPN", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 log = logging.getLogger("football-export")
 
@@ -51,6 +57,10 @@ TABLES = [
     "football_data_upcoming",
     "football_data_source_state",
     "football_data_import_runs",
+    "espn_current_matches",
+    "espn_upcoming",
+    "espn_import_state",
+    "espn_import_runs",
 ]
 
 
@@ -61,9 +71,18 @@ def _run_football_data_import() -> None:
         result = run_import(DATABASE_URL)
         log.info("Football-Data startup import completed: %s", result)
     except Exception:
-        # Export service must stay online even if a free source is
-        # temporarily rate-limited or unavailable.
         log.exception("Football-Data startup import failed")
+
+
+def _run_espn_import() -> None:
+    try:
+        from espn_current_importer import run_import
+
+        result = run_import(DATABASE_URL)
+        log.info("ESPN startup import completed: %s", result)
+    except Exception:
+        # Current-source problems must never take the protected export service down.
+        log.exception("ESPN startup import failed")
 
 
 @asynccontextmanager
@@ -74,10 +93,16 @@ async def lifespan(app: FastAPI):
             name="football-data-importer",
             daemon=True,
         ).start()
+    if DATABASE_URL and AUTO_IMPORT_ESPN:
+        threading.Thread(
+            target=_run_espn_import,
+            name="espn-current-importer",
+            daemon=True,
+        ).start()
     yield
 
 
-app = FastAPI(title="Football Dataset Export", version="1.2", lifespan=lifespan)
+app = FastAPI(title="Football Dataset Export", version="1.3", lifespan=lifespan)
 
 
 def auth(token: str) -> None:
@@ -137,10 +162,25 @@ def status(token: str = Query(...)):
             conn.rollback()
             last_fd_run = None
 
+        try:
+            last_espn_run = conn.execute(
+                """
+                SELECT id, started_at, finished_at, status,
+                       completed_matches, upcoming_matches, summary_calls, message
+                FROM espn_import_runs
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        except Exception:
+            conn.rollback()
+            last_espn_run = None
+
     return {
         "counts": out,
         "last_run": list(last_run) if last_run else None,
         "last_football_data_run": list(last_fd_run) if last_fd_run else None,
+        "last_espn_run": list(last_espn_run) if last_espn_run else None,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
