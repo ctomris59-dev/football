@@ -1,273 +1,627 @@
-# 5 Büyük Lig – API-Football Toplu Veri Çekici
+# Big Five Football Intelligence — Veri, Model ve Top‑10 Tahmin Sistemi
 
-Bu paket, API-Football'dan **5 büyük lig × 2 sezon** verisini elle kopyala-yapıştır yapmadan toplamak için hazırlandı.
+Bu repo artık yalnızca bir API-Football collector değildir. Sistem; Avrupa'nın 5 büyük ligindeki maçları farklı veri kaynaklarından birleştirir, veri kalitesini kontrol eder, üç bahis marketi için açıklanabilir olasılık üretir ve yalnızca kalite eşiklerini geçen maçlardan haftalık **Top‑10** listesi oluşturur.
 
-Varsayılan kapsam:
+> Hedef marketler: **2.5 Gol Üst/Alt**, **BTTS Var/Yok**, **8.5 Toplam Korner Üst/Alt**.
 
-- Premier League — league id **39**
-- La Liga — **140**
-- Serie A — **135**
-- Bundesliga — **78**
-- Ligue 1 — **61**
-- season **2024** = 2024/25
-- season **2025** = 2025/26
+## 1. Kapsam
 
-## Ne topluyor?
+Ligler:
 
-1. `/leagues?id=...&season=...`  
-   Coverage kontrolü.
+- Premier League
+- La Liga
+- Serie A
+- Bundesliga
+- Ligue 1
 
-2. `/fixtures?league=...&season=...`  
-   Bütün sezon fikstürü, skorlar, takımlar, tarih, statü vb.
+Ana dönemler:
 
-3. `/fixtures?ids=ID1-ID2-...` — **20 maça kadar tek çağrı**  
-   API-Football'un toplu fixture detay yolunu kullanır. Dönen yanıttan:
-   - events
-   - lineups
-   - fixture statistics
-   - fixture player statistics
-   alanlarını saklar.
+- 2023/24 — tarihsel taban
+- 2024/25 — tarihsel taban
+- 2025/26 — model/backtest için ana tam sezon
+- 2026/27 — güncel sezon / canlı tahmin dönemi
 
-4. Gömülü veri eksikse opsiyonel fallback:
-   - `/fixtures/events?fixture=...`
-   - `/fixtures/lineups?fixture=...`
-   - `/fixtures/statistics?fixture=...`
-   - `/fixtures/players?fixture=...`
-
-5. `/players?league=...&season=...&page=...`  
-   Sezon oyuncu istatistiklerini sayfa sayfa toplar.
-
-6. `/injuries?league=...&season=...`  
-   Sakatlık + ceza (suspension) listesini **1 çağrıda tüm sezon** için çeker (fixture bazlı değil, çok daha ucuz). Önce `league_coverage.coverage.injuries` kontrol edilir, `false` ise atlanır.
-
-   **Önemli:** API'nin `type` alanı pratikte hep `"Missing Fixture"` değerini taşıyor — Injury/Suspension ayrımı gerçekte `reason` metninde (örn. "Thigh Injury" vs "Suspended"). Bu ayrımı model tarafında `reason` üzerinden kendimiz türeteceğiz.
-
-## Neden doğrudan `.zip` dosyasına yazmıyor?
-
-Render Cron Job / One-Off Job yerel diski kalıcı değildir. İş bitince oraya yazılan dosyaya güvenemeyiz.
-
-Bu nedenle:
-
-**API-Football → Collector → Render Postgres → Export Web Service → ZIP**
-
-akışı kullanılıyor.
-
-Toplama işi yarıda kesilirse veriler Postgres'te kalır ve tekrar çalıştırınca script kaldığı yerden devam eder.
-
-**Tarihsel sezonlar** tamamlandıktan sonra state kilidi korunur ve gereksiz yere tekrar indirilmez. **Aktif sezon** için ise istenirse `REFRESH_ACTIVE_SEASON=true` ile fixtures, injuries ve sezon oyuncu verileri yeniden tazelenebilir.
+Sistem tek bir veri sağlayıcısına bağlı değildir. Bir kaynak geçici olarak başarısız olduğunda mümkün olan alanlarda diğer kaynaklarla devam eder ve eksik veri **"0" veya "sağlıklı"** olarak yorumlanmaz.
 
 ---
 
-# Kurulum – terminal kullanmadan
+# 2. Mimari
 
-## 1. Bu paketi GitHub reposuna yükle
+```text
+Football-Data mirrors ─┐
+ESPN current season ───┤
+Understat xG ──────────┤
+OddsPapi markets ──────┤
+FotMob injuries ───────┤
+BBS lineups ───────────┤──> Render PostgreSQL
+Sofascore optional ────┘          │
+                                  v
+                     Prematch Context Builder
+                                  │
+                         Availability Enricher
+                                  │
+                         Odds Movement Enricher
+                                  │
+                          Readiness Audit v4
+                                  │
+                          Production Predictor
+                                  │
+                     2.5 / BTTS / Corner 8.5
+                                  │
+                    one pick per match -> Top‑10
+                                  │
+                    FastAPI status / predictions
+```
 
-ZIP'i aç ve içindeki dosyaları yeni bir GitHub reposunun köküne yükle.
+Render bileşenleri:
 
-Dosyalar:
+- PostgreSQL: `football-dataset-db`
+- Web/API: `football-dataset-export`
+- Tarihsel API-Football collector cron: `football-bulk-collector`
 
-- `collector.py`
-- `export_app.py`
-- `requirements.txt`
-- `render.yaml`
-
-## 2. Render'da Blueprint oluştur
-
-Render Dashboard → **New → Blueprint** → GitHub reposunu seç.
-
-`render.yaml` otomatik olarak:
-
-- kalıcı Postgres,
-- veri indirme Web Service'i,
-- manuel tetiklenebilir collector Cron Job
-
-oluşturur.
-
-Blueprint oluşturma sırasında Render senden:
-
-`API_FOOTBALL_KEY`
-
-değerini ister. Anahtarı sadece Render Dashboard'a gir; GitHub'a koyma.
-
-## 3. Toplu çekimi başlat
-
-Render Dashboard:
-
-**football-bulk-collector → Runs → Trigger Run**
-
-Bundan sonra terminal gerekmez.
-
-Script:
-
-- hangi sezon/lig kaldığını veritabanından kontrol eder,
-- tamamlanan adımları yeniden çekmez,
-- API rate-limit header'larını izler,
-- günlük limit kritik seviyeye gelirse veriyi kaydedip temiz şekilde durur.
-
-Tekrar `Trigger Run` dersen kaldığı yerden devam eder.
-
-### One-Off Job kullanmak istersen
-
-Aynı kodun komutu:
-
-`python collector.py`
-
-Render One-Off Jobs aynı build ve environment variable'ları bir base service'ten alabilir. Ancak Render'ın güncel dokümantasyonunda **One-Off Job oluşturma Render API üzerinden** tarif ediliyor; Dashboard'dan tamamen elle tek-tık akış isteyen kullanıcı için yukarıdaki **Cron Job → Trigger Run** yolu daha basittir.
+GitHub repo: `ctomris59-dev/football`
 
 ---
 
-# API planı hakkında
+# 3. Veri kaynakları
 
-Script API çağrılarını mümkün olduğunca azaltır.
+## 3.1 Football-Data tarihsel veri
 
-En büyük optimizasyon:
+Ana kullanım:
 
-`/fixtures?ids=...`
+- skor
+- gol
+- ev/deplasman
+- şut
+- isabetli şut
+- korner (`HC + AC`)
+- kartlar
+- mevcut tarihsel bahis kolonları
 
-ile **20 fixture'ı tek istekte** çekmesidir.
+Türetilen hedefler:
 
-Bu yüzden eski "her maç için lineups + statistics + players = 3 ayrı çağrı" yaklaşımından çok daha ucuzdur.
+- `over_2_5`
+- `btts`
+- `corners_over_8_5`
 
-Yine de Free plan:
+Tarihsel tam sezonlar modelin form, lig tabanı ve backtest katmanını oluşturur.
 
-- günlük yalnızca 100 istek,
-- tarihsel sezon erişimi sınırlı
+## 3.2 ESPN — güncel sezon ve fikstür
 
-olduğu için 2 sezon × 5 lig toplu tarihsel çekimde ücretli API-Football planı daha güvenlidir.
+Kullanım:
 
-Script `x-ratelimit-requests-remaining` header'ını takip eder ve son `20` isteği güvenlik payı olarak bırakır.
+- 2026/27 tamamlanmış maçlar
+- yaklaşan maçlar
+- skorlar
+- boxscore istatistikleri
+- roster / lineup varlığı
+- bazı maçlarda bookmaker / total line bilgisi
+- takım programı
+
+`espn_team_schedule_importer.py`, yalnızca lig fikstürüne bakmak yerine takımın ESPN'de görünen daha geniş programını kaydeder. Bu katman **dinlenme günü ve fikstür yoğunluğu** hesabını güçlendirir.
+
+## 3.3 Understat — xG/xGA
+
+Maç bazında:
+
+- home xG
+- away xG
+- xG geçmişi
+
+Model xG mevcut ve yeterli olduğunda bunu ek sinyal olarak kullanır; xG eksikse model çalışmayı tamamen bırakmaz.
+
+## 3.4 OddsPapi — gerçek piyasa fiyatları
+
+Aktif marketler:
+
+- 2.5 Goals Over/Under
+- BTTS Yes/No
+- Total Corners 8.5 Over/Under
+
+Sistem:
+
+- market ID'lerini dinamik keşfeder,
+- fixture snapshot saklar,
+- decimal fiyatları saklar,
+- ilk ve son snapshot arasında gerçek fiyat hareketi hesaplar,
+- iki yönün fiyatı varsa no-vig piyasa olasılığı çıkarır.
+
+**Piyasa olasılığı model olasılığının yerine geçirilmez.** Piyasa yalnızca bağımsız bir kalibrasyon / agreement / kalite sinyali olarak tutulur.
+
+## 3.5 FotMob — güncel sakatlık durumu
+
+Bir takımın squad payload'ından:
+
+- `injured`
+- `injury`
+- oyuncu
+- pozisyon
+- varsa `expectedReturn`
+
+alanları alınır.
+
+Bu kaynak sözleşmeli/resmî geliştirici API'si olmadığı için **fail-soft** çalışır. Erişim bozulursa sistem sakat oyuncu sayısını sıfır kabul etmez; ilgili readiness alanını eksik sayar.
+
+## 3.6 BBS / Big Balls Sports
+
+BBS key kullanılır. Futbolda ileriye dönük `/injuries` cevabı faydalı oyuncu satırı üretmediği için bu yol production'da varsayılan olarak kapalıdır.
+
+BBS'nin kullanım alanı:
+
+- scheduled match eşleştirmesi
+- yayınlandığında starting XI
+- bench
+- lineup confirmation sinyali
+
+## 3.7 Sofascore — opsiyonel redundancy
+
+Amaç:
+
+- event eşleştirme
+- `missingPlayers`
+- `confirmed` lineup bayrağı
+
+Render/WAF 403 durumunda bu kaynak **optional failure** olarak kaydedilir ve ana pipeline durmaz.
+
+## 3.8 API-Football
+
+Free plan nedeniyle 2025/26+ erişimi sınırlı olduğundan production sistemin güncel omurgası değildir.
+
+Mevcut collector 2024 erişilebilir tarihsel detaylarını resume-safe şekilde toplayabilir:
+
+- fixture
+- event
+- lineup
+- statistics
+- player stats
+- season players
+- API'nin izin verdiği injuries
+
+Bu veri ek enrichment olarak tutulur.
 
 ---
 
-# Veriyi indir
+# 4. PostgreSQL veri katmanı
 
-Toplama tamamlandıktan sonra:
+## Tarihsel / ana maç tabloları
 
-Render Dashboard → `football-dataset-export` → Environment
+- `football_data_matches`
+- `football_data_source_state`
+- `football_data_import_runs`
+- `espn_current_matches`
+- `espn_upcoming`
+- `espn_import_runs`
 
-içinden `DOWNLOAD_TOKEN` değerini gör.
+## ESPN context
 
-Sonra tarayıcıda:
+- `espn_odds_snapshots`
+- `espn_prematch_snapshots`
+- `espn_advanced_match_stats`
+- `espn_context_runs`
+- `espn_team_schedule_events`
+- `espn_team_schedule_runs`
 
-`https://SENIN-SERVIS-ADRESIN.onrender.com/status?token=DOWNLOAD_TOKEN`
+## xG
 
-ile satır sayılarını kontrol et.
+- `understat_matches`
+- `understat_team_seasons`
+- `understat_source_state`
+- `understat_import_runs`
 
-Veri tamam ise:
+## Bookmaker / market
 
-`https://SENIN-SERVIS-ADRESIN.onrender.com/download?token=DOWNLOAD_TOKEN`
+- `oddspapi_tournaments`
+- `oddspapi_market_catalog`
+- `oddspapi_fixture_snapshots`
+- `oddspapi_market_prices`
+- `oddspapi_import_runs`
 
-adresini aç.
+## Oyuncu uygunluğu / lineup
 
-Tarayıcı tek bir ZIP indirir.
+- `fotmob_team_availability_snapshots`
+- `fotmob_fixture_availability_snapshots`
+- `fotmob_availability_runs`
+- `bbs_lineup_snapshots`
+- `bbs_lineup_runs`
+- `sofascore_availability_snapshots`
+- `sofascore_availability_runs`
 
-ZIP içinde:
+Legacy/audit için eski BBS absence ve ESPN injury tabloları tutulabilir; production availability kararı bunlara körü körüne dayanmaz.
 
-- `league_coverage.jsonl`
-- `fixtures.jsonl`
-- `fixture_details.jsonl`
-- `injuries.jsonl`
-- `season_players.jsonl`
-- `collection_runs.jsonl`
-- `api_call_log.jsonl`
-- `manifest.json`
+## Maç önü birleşik feature katmanı
+
+- `prematch_feature_snapshots`
+- `prematch_context_runs`
+
+Bu tablo maç başına aşağıdaki bağlamı birleştirir:
+
+- ev/deplasman takımı
+- maç tarihi
+- dinlenme günleri
+- 7/14 günlük maç yoğunluğu
+- roster/lineup varlığı
+- güncel injury snapshot
+- match-specific lineup sinyali
+- OddsPapi fixture eşleşmesi
+- 2.5 / BTTS / corner 8.5 market varlığı
+- odds snapshot yaşı
+- gerçek odds movement JSON'u
+
+## Readiness
+
+- `prediction_readiness_snapshots`
+- `data_readiness_runs`
+
+## Production tahmin
+
+- `production_prediction_runs`
+- `production_predictions`
+
+## Backtest
+
+- `model_backtest_runs`
+- `model_policy_backtest_runs`
+- `model_value_backtest_runs`
+
+---
+
+# 5. Model
+
+`model_engine.py` açıklanabilir, recency-weighted Poisson tabanlıdır.
+
+Temel sinyaller:
+
+- takımın son formu
+- gol üretme / yeme oranı
+- ev/deplasman ayrımı
+- isabetli şut
+- lig ortalamasına shrinkage
+- xG/xGA mevcutsa xG katkısı
+- takım korner üretme / verme oranı
+- zaman ağırlığı
+
+Çıktılar:
+
+- `p_over_2_5`
+- `p_btts`
+- `p_corners_over_8_5`
+- beklenen ev golü / deplasman golü
+- beklenen toplam korner
+- sample count
+- `data_quality`
+- `xg_used`
+
+Model sakatlık sayısını doğrudan keyfi bir gol katsayısına çevirmemektedir. Oyuncu önemini güvenilir şekilde ölçmeden "3 sakat = -0.25 gol" gibi doğrulanmamış bir kural kullanmak yerine injury/lineup bilgisi **readiness ve seçim güveni** katmanında tutulur.
+
+---
+
+# 6. Readiness Audit v4
+
+Tahmin motoru yalnızca olasılık hesaplamaz; önce o market için veri yeterli mi kontrol eder.
+
+## Gol / BTTS provisional readiness
+
+Temel koşullar:
+
+- iki takım için yeterli maç geçmişi
+- yeterli xG geçmişi
+- ilgili bookmaker marketinin var olması
+- odds snapshot'ın bayat olmaması
+
+Varsayılan odds freshness: **12 saat**.
+
+## Korner provisional readiness
+
+- iki takım için yeterli korner geçmişi
+- 8.5 corner marketi mevcut
+- odds snapshot fresh
+
+## Final context readiness
+
+Daha sıkıdır:
+
+- schedule context mevcut
+- güncel current injury report mevcut
+- maç için confirmed-current lineup sinyali mevcut
+
+Confirmed lineup günler önceden doğal olarak mevcut olmayabilir. Bu nedenle sistem **provisional prediction** ile **final pre-kickoff prediction** kavramlarını ayırır.
+
+## Blocker örnekleri
+
+- `insufficient_match_history`
+- `insufficient_xg_history`
+- `insufficient_corner_history`
+- `schedule_context_missing`
+- `current_injury_report_missing`
+- `match_lineup_not_confirmed_current`
+- `ou25_odds_missing`
+- `btts_odds_missing`
+- `corner85_odds_missing`
+- `odds_snapshot_stale`
+
+Eksik kaynak asla otomatik olarak olumlu veri kabul edilmez.
+
+---
+
+# 7. Odds movement
+
+`odds_movement_enricher.py` her OddsPapi fixture için ilk ve son snapshot'ı karşılaştırır.
+
+Üç markette outcome bazında saklanan örnek yapı:
+
+```json
+{
+  "first_price": 1.95,
+  "latest_price": 1.82,
+  "absolute_delta": -0.13,
+  "percent_delta": -6.667
+}
+```
+
+Şu aşamada hareket bilgisi **saklanır ve raporlanır**, ancak yeterli tarihsel movement backtest'i olmadan production modeline yönsel ağırlık olarak zorla eklenmez.
+
+---
+
+# 8. Production Predictor ve Top‑10
+
+`production_predictor.py` yaklaşan maçları tarar.
+
+Her maç için üç market ayrı ayrı hesaplanır:
+
+1. 2.5 Üst/Alt
+2. BTTS Var/Yok
+3. 8.5 Korner Üst/Alt
+
+Her market kaydında:
+
+- seçilen yön
+- seçilen yönün model olasılığı
+- bookmaker fiyatı
+- no-vig piyasa olasılığı
+- model data quality
+- readiness score
+- final-context durumu
+- xG kullanıldı mı
+- odds snapshot yaşı
+- dinlenme günleri
+- sakat sayıları
+- availability source
+- blocker listesi
+- model detay JSON'u
 
 bulunur.
 
-Her `.jsonl` dosyasında her satır tek bir JSON kaydıdır.
+## Top‑10 seçim politikası
+
+- yalnız provisional-ready marketler aday olabilir,
+- varsayılan minimum model güveni: `%60`,
+- varsayılan minimum fiyat: `1.20`,
+- model confidence + data quality + readiness + model/piyasa agreement birlikte sıralanır,
+- **bir maçtan en fazla bir seçim** Top‑10'a girebilir,
+- kaliteyi geçen 10 maç yoksa sistem 10'u zorla doldurmaz.
+
+Bu Top‑10 sıralama politikası bir "garantili bahis" veya kanıtlanmış pozitif ROI iddiası değildir. Amaç veri kalitesi düşük seçimleri otomatik elemek ve en sağlam adayları sıralamaktır.
 
 ---
 
-# Model için özellikle işimize yarayacak alanlar
+# 9. Backtest sonuçları
 
-`fixture_details.statistics` içinden tipik olarak:
+Bugüne kadarki testlerde:
 
-- shots on target
-- shots off target
-- total shots
-- **blocked shots**
-- shots inside box
-- shots outside box
-- **corner kicks**
-- ball possession
-- goalkeeper saves
-- passes / pass accuracy
-- cards
+## Eski form modeli / rolling weekly Top‑10
 
-gelecektir.
+- 370 seçim
+- 253 doğru
+- **%68.38 hit rate**
 
-Bu, özellikle:
+## xG ağırlığı artırılmış v2
 
-- **Over 2.5**
-- **BTTS**
-- **korner tahmini**
+- 370 seçim
+- 250 doğru
+- **%67.57 hit rate**
 
-modelleri için değerlidir.
+Sonuç: xG 2.5 gol kalibrasyonunda faydalı olsa da genel Top‑10 başarı oranını otomatik artırmadı. Bu nedenle xG yardımcı sinyal olarak kullanılmaktadır; tek başına her markete baskın ağırlık verilmemektedir.
 
-`fixture_details.lineups`:
+## Hybrid policy denemesi
 
-- ilk 11
-- formasyon
-- yedekler
-- teknik direktör
+- yaklaşık **%66.76**
+- korner marketini aşırı seçtiği için production policy olarak reddedildi.
 
-bilgisini sağlar.
+## 2.5 gol market/value backtest
 
-`fixture_details.players`:
+- piyasa Brier: **0.24165**
+- model Brier: **0.24514**
+- naive model-vs-market edge bahisleri negatif ROI üretti.
 
-- minutes
-- rating
-- shots
-- passes / key passes
-- tackles
-- interceptions
-- duels
-- dribbles
-- cards
+Bu nedenle sistem:
 
-gibi maç bazlı oyuncu bilgilerini tutar.
+> "model %65 dedi, otomatik value bet"
+
+mantığını kullanmaz.
+
+Bookmaker fiyatı modelin yerine geçmez; piyasa bağımsız benchmark ve filtre olarak kullanılır.
 
 ---
 
-# Güvenlik
+# 10. Live refresh sırası
 
-- API key kaynak koda yazılmaz.
-- `DOWNLOAD_TOKEN` olmadan dataset indirilemez.
-- Postgres `ipAllowList: []` ile dış internete kapalıdır.
-- Collector tekrar çalıştırılabilir; `UPSERT` + `collection_state` ile duplicate üretmez.
+`live_refresh.py`:
+
+1. Football-Data 2023/24
+2. Football-Data diğer tarihsel sezonlar
+3. ESPN current season / fixtures
+4. ESPN prematch context
+5. ESPN team schedule
+6. Understat xG
+7. OddsPapi market snapshot
+8. FotMob current injuries
+9. opsiyonel BBS absence (varsayılan kapalı)
+10. BBS lineups
+11. opsiyonel Sofascore
+12. prematch context builder
+13. actual odds movement enrichment
+14. availability enrichment
+15. readiness v4
+16. production predictions / Top‑10
+
+Provider freshness gate varsayılanları:
+
+| Katman | Minimum yeniden çağrı aralığı |
+|---|---:|
+| ESPN current | kendi importer freshness kontrolü |
+| ESPN prematch context | 2 saat |
+| ESPN team schedule | 12 saat |
+| Understat | yaklaşık 6 saat / internal season cache |
+| OddsPapi | 8 saat |
+| FotMob injuries | 6 saat |
+
+Bu yapı özellikle düşük API kotalarını deploy veya manuel refresh yüzünden tüketmemek için kullanılır.
+
+`AUTO_LIVE_REFRESH=false` production varsayılanıdır. **Deploy veri toplama tetikleyicisi değildir.**
 
 ---
 
-# Ayarlanabilir environment variable'lar
+# 11. Web API
 
-| Değişken | Varsayılan |
-|---|---|
-| `SEASONS` | `2024,2025` |
-| `LEAGUES` | 5 büyük lig |
-| `BATCH_SIZE` | `20` |
-| `DAILY_REQUEST_RESERVE` | `20` |
-| `INCLUDE_SEASON_PLAYERS` | `true` |
-| `INCLUDE_INJURIES` | `true` |
-| `REFRESH_ACTIVE_SEASON` | `false` |
-| `ACTIVE_SEASON` | `2026` |
-| `ENABLE_FALLBACK` | `true` |
-| `MAX_FALLBACK_REQUESTS` | `500` |
-| `ONLY_FINISHED_FOR_DETAILS` | `true` |
+Base URL:
 
-## Daha sonra 2026/27 eklemek
+`https://football-dataset-export.onrender.com`
 
-İlk kez 2026/27 sezonunu toplamak için Render Environment'ta:
+## Public health
 
-`SEASONS=2024,2025,2026`
+`GET /health`
 
-`ACTIVE_SEASON=2026`
+## Protected status
 
-olarak ayarla ve `REFRESH_ACTIVE_SEASON=false` bırak. Böylece ilk backfill resume-safe çalışır; kota nedeniyle tekrar tetiklersen kaldığı yerden devam eder.
+`GET /status`
 
-İlk aktif sezon backfill'i tamamlandıktan sonra güncel veriyi yenilemek istediğin çalıştırmada:
+## Protected predictions
 
-`REFRESH_ACTIVE_SEASON=true`
+`GET /predictions`
 
-yap. Bu mod coverage + fixture listesini, injuries snapshot'ını ve sezon oyuncu sayfalarını yeniden çeker. Yeni biten maçların detayları da otomatik eklenir. Refresh tamamlandıktan sonra sürekli gereksiz çağrı yapmamak için değişkeni tekrar `false` yapabilirsin.
+Varsayılan `top_only=true`; son başarılı production run'ın yalnız Top‑10 kayıtlarını döndürür.
 
-Tarihsel 2024/25 ve 2025/26 sezonlarının tamamlanmış state'leri bu işlemden etkilenmez.
+## Protected refresh
+
+`POST /refresh`
+
+Aynı anda ikinci refresh başlamasını lock engeller.
+
+## Protected dataset export
+
+`GET /download`
+
+Tüm ana tabloları JSON Lines olarak ZIP'e koyar.
+
+### Authentication
+
+Tercih edilen:
+
+```http
+Authorization: Bearer <DOWNLOAD_TOKEN>
+```
+
+Eski uyumluluk için `?token=` da desteklenir; fakat token'ın URL/browser geçmişine düşmemesi için Bearer daha güvenlidir.
+
+API key veya token hiçbir zaman GitHub source içine yazılmamalıdır.
+
+---
+
+# 12. CI / kalite kontrolü
+
+`.github/workflows/ci.yml` her main push'ta:
+
+- Python 3.12 kurar,
+- requirements yükler,
+- bütün Python modüllerini compile eder,
+- production modüllerini import smoke testinden geçirir.
+
+Render deploy başarılı olsa bile CI başarısızsa sürüm production-ready kabul edilmemelidir.
+
+---
+
+# 13. Güvenlik
+
+Environment secrets:
+
+- `DATABASE_URL`
+- `DOWNLOAD_TOKEN`
+- `ODDSPAPI_API_KEY`
+- `BBS_API_KEY`
+- opsiyonel `API_FOOTBALL_KEY`
+
+Kurallar:
+
+- secret GitHub'a commit edilmez,
+- dataset/status/predictions/refresh korumalıdır,
+- Bearer auth tercih edilir,
+- missing injury/lineup verisi `0` diye yorumlanmaz,
+- deploy sırasında otomatik provider çağrıları varsayılan kapalıdır.
+
+---
+
+# 14. Önemli environment ayarları
+
+| Değişken | Varsayılan | Açıklama |
+|---|---|---|
+| `AUTO_LIVE_REFRESH` | `false` | deploy sırasında refresh yapma |
+| `ODDSPAPI_REFRESH_HOURS` | `8` | bookmaker kota koruması |
+| `FOTMOB_REFRESH_HOURS` | `6` | current injury tazeliği |
+| `ESPN_CONTEXT_REFRESH_HOURS` | `2` | maç önü context |
+| `TEAM_SCHEDULE_REFRESH_HOURS` | `12` | takım programı |
+| `CURRENT_INJURY_MAX_AGE_HOURS` | `18` | injury snapshot freshness |
+| `MATCH_LINEUP_MAX_AGE_HOURS` | `6` | lineup freshness |
+| `READINESS_ODDS_MAX_AGE_HOURS` | `12` | market snapshot freshness |
+| `PREDICTION_LOOKAHEAD_DAYS` | `7` | production horizon |
+| `PREDICTION_MIN_CONFIDENCE` | `0.60` | aday minimum güven |
+| `PREDICTION_MIN_PRICE` | `1.20` | aday minimum fiyat |
+| `LIVE_REFRESH_BBS` | `false` | forward BBS absence probe kapalı |
+| `LIVE_REFRESH_BBS_LINEUPS` | `true` | BBS lineup açık |
+| `LIVE_REFRESH_SOFASCORE` | `true` | optional redundancy |
+
+---
+
+# 15. Bilinen sınırlar
+
+1. **FotMob ve Sofascore public web endpointleri sözleşmeli API değildir.** Şema/WAF değişebilir. Bu yüzden fail-soft kullanılır.
+2. BBS futbol injury endpointi production forward injury kaynağı olarak güvenilir sonuç vermedi; açıkça devre dışıdır.
+3. Confirmed starting XI çoğu ligde kickoff'a yakın yayınlanır. Günler önce `final_context_ready=false` olması hata değildir.
+4. Corner 8.5 marketi bütün maçlarda günler önceden açılmayabilir. Market yoksa sistem korner seçimini zorlamaz.
+5. xG modeli iyileştirebilir ama geçmiş testte global Top‑10 hit rate'i otomatik yükseltmemiştir.
+6. Model/backtest geçmiş performansı gelecekte kâr veya isabet garantisi değildir.
+7. Gerçek odds movement artık saklanır; movement sinyalinin yönsel bahis etkisi yeterli tarihsel snapshot oluşmadan production sıralamasına eklenmemiştir.
+8. Sakatlık verisi şu anda current injury count/readiness olarak kullanılır. Oyuncu önem katsayısı yeterince doğrulanmadan gol/kornere keyfi matematiksel ceza uygulanmaz.
+
+---
+
+# 16. Production çalışma prensibi
+
+Maç haftası ideal akış:
+
+```text
+Güncel fixture
+   ↓
+Form + home/away + shots + xG + corners
+   ↓
+Rest/congestion
+   ↓
+Current injuries
+   ↓
+Bookmaker prices + movement
+   ↓
+Provisional readiness
+   ↓
+Model probabilities
+   ↓
+Top candidate pool
+   ↓
+Kickoff'a yakın confirmed lineup refresh
+   ↓
+Final readiness
+   ↓
+Final Top‑10
+```
+
+Sistemin temel güvenlik prensibi:
+
+> **Eksik veriyle yüksek güven üretmek yerine seçimi blokla veya kalite puanını düşür.**
