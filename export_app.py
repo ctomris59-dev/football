@@ -25,15 +25,16 @@ AUTO_IMPORT_ESPN_CONTEXT = os.getenv("AUTO_IMPORT_ESPN_CONTEXT", "true").lower()
 AUTO_IMPORT_UNDERSTAT = os.getenv("AUTO_IMPORT_UNDERSTAT", "true").lower() in {"1", "true", "yes"}
 AUTO_RUN_BACKTEST = os.getenv("AUTO_RUN_BACKTEST", "false").lower() in {"1", "true", "yes"}
 AUTO_BACKTEST_NEW_MODEL = os.getenv("AUTO_BACKTEST_NEW_MODEL", "true").lower() in {"1", "true", "yes"}
+AUTO_BACKTEST_HYBRID = os.getenv("AUTO_BACKTEST_HYBRID", "true").lower() in {"1", "true", "yes"}
 log = logging.getLogger("football-export")
 
 TABLES = [
     "league_coverage", "fixtures", "fixture_details", "injuries", "season_players", "collection_runs", "api_call_log",
     "football_data_matches", "football_data_upcoming", "football_data_source_state", "football_data_import_runs",
     "espn_current_matches", "espn_upcoming", "espn_import_state", "espn_import_runs",
-    "espn_injury_snapshots", "espn_odds_snapshots", "espn_advanced_match_stats", "espn_context_runs",
+    "espn_injury_snapshots", "espn_odds_snapshots", "espn_prematch_snapshots", "espn_advanced_match_stats", "espn_context_runs",
     "understat_matches", "understat_team_seasons", "understat_source_state", "understat_import_runs",
-    "model_backtest_runs",
+    "model_backtest_runs", "model_policy_backtest_runs",
 ]
 
 def _run_football_data_import() -> None:
@@ -79,6 +80,19 @@ def _run_backtest_if_new() -> None:
         log.info("NEW_MODEL_BACKTEST_COMPLETED version=%s matches=%s top10=%s markets=%s", MODEL_VERSION, r.get("matches_scored"), r.get("top10"), r.get("markets"))
     except Exception: log.exception("New-model backtest failed")
 
+def _run_hybrid_if_new() -> None:
+    try:
+        from hybrid_policy_backtest import MODEL_VERSION, SCHEMA, run_backtest
+        with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
+            conn.execute(SCHEMA)
+            exists = conn.execute("SELECT 1 FROM model_policy_backtest_runs WHERE policy_version=%s AND status='success' LIMIT 1", (MODEL_VERSION,)).fetchone()
+        if exists:
+            log.info("Hybrid policy backtest already exists for %s; skipping.", MODEL_VERSION)
+            return
+        r = run_backtest(DATABASE_URL)
+        log.info("HYBRID_POLICY_BACKTEST_COMPLETED version=%s picks=%s hits=%s hit_rate=%s by_market=%s", MODEL_VERSION, r.get("picks"), r.get("hits"), r.get("hit_rate"), r.get("by_market"))
+    except Exception: log.exception("Hybrid policy backtest failed")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if DATABASE_URL and AUTO_IMPORT_FOOTBALL_DATA:
@@ -93,9 +107,11 @@ async def lifespan(app: FastAPI):
         threading.Thread(target=_run_backtest, name="model-backtest", daemon=True).start()
     elif DATABASE_URL and AUTO_BACKTEST_NEW_MODEL:
         threading.Thread(target=_run_backtest_if_new, name="model-backtest-new-version", daemon=True).start()
+    if DATABASE_URL and AUTO_BACKTEST_HYBRID:
+        threading.Thread(target=_run_hybrid_if_new, name="hybrid-policy-backtest", daemon=True).start()
     yield
 
-app = FastAPI(title="Football Dataset Export", version="1.7", lifespan=lifespan)
+app = FastAPI(title="Football Dataset Export", version="1.8", lifespan=lifespan)
 
 def auth(token: str) -> None:
     if not DOWNLOAD_TOKEN: raise HTTPException(500, "DOWNLOAD_TOKEN is not configured.")
@@ -106,7 +122,7 @@ def json_default(value: Any):
     return str(value)
 
 @app.get("/health")
-def health(): return {"ok": True, "version": "1.7"}
+def health(): return {"ok": True, "version": "1.8"}
 
 @app.get("/status")
 def status(token: str = Query(...)):
@@ -123,10 +139,11 @@ def status(token: str = Query(...)):
         last_run = one("SELECT run_id::text, started_at, finished_at, status, api_calls, message FROM collection_runs ORDER BY started_at DESC LIMIT 1")
         last_fd_run = one("SELECT id, started_at, finished_at, status, historical_rows, upcoming_rows, message FROM football_data_import_runs ORDER BY id DESC LIMIT 1")
         last_espn_run = one("SELECT id, started_at, finished_at, status, completed_matches, upcoming_matches, summary_calls, message FROM espn_import_runs ORDER BY id DESC LIMIT 1")
-        last_context = one("SELECT id, started_at, finished_at, injury_teams, odds_events, xg_matches, status, message FROM espn_context_runs ORDER BY id DESC LIMIT 1")
+        last_context = one("SELECT id, started_at, finished_at, injury_teams, odds_events, prematch_events, xg_matches, status, message FROM espn_context_runs ORDER BY id DESC LIMIT 1")
         last_understat = one("SELECT id, started_at, finished_at, status, requests, match_rows, xg_rows, team_rows, message FROM understat_import_runs ORDER BY id DESC LIMIT 1")
         last_backtest = one("SELECT id, started_at, finished_at, model_version, train_season, test_season, matches_scored, status, metrics, market_metrics, top10_metrics, message FROM model_backtest_runs ORDER BY id DESC LIMIT 1")
-    return {"counts": out, "last_run": list(last_run) if last_run else None, "last_football_data_run": list(last_fd_run) if last_fd_run else None, "last_espn_run": list(last_espn_run) if last_espn_run else None, "last_context_run": list(last_context) if last_context else None, "last_understat_run": list(last_understat) if last_understat else None, "last_backtest": list(last_backtest) if last_backtest else None, "generated_at": datetime.now(timezone.utc).isoformat()}
+        last_policy = one("SELECT id, started_at, finished_at, policy_version, train_season, test_season, matches_scored, candidate_picks, metrics, status, message FROM model_policy_backtest_runs ORDER BY id DESC LIMIT 1")
+    return {"counts": out, "last_run": list(last_run) if last_run else None, "last_football_data_run": list(last_fd_run) if last_fd_run else None, "last_espn_run": list(last_espn_run) if last_espn_run else None, "last_context_run": list(last_context) if last_context else None, "last_understat_run": list(last_understat) if last_understat else None, "last_backtest": list(last_backtest) if last_backtest else None, "last_policy_backtest": list(last_policy) if last_policy else None, "generated_at": datetime.now(timezone.utc).isoformat()}
 
 def remove_file(path: str) -> None:
     try: os.remove(path)
