@@ -2,8 +2,8 @@
 """Ordered live refresh pipeline for the Big Five prediction system.
 
 Runs data producers sequentially so downstream pre-match features are built only
-after the freshest available fixture, lineup/context, xG and market snapshots are
-stored. Optional providers fail soft and are reported in the pipeline summary.
+after the freshest available fixture, lineup/context, xG, schedule, availability
+and market snapshots are stored. Optional providers fail soft and are reported.
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ RUN_FD2324 = os.getenv("LIVE_REFRESH_FD2324", "true").lower() in {"1", "true", "
 RUN_FOOTBALL_DATA = os.getenv("LIVE_REFRESH_FOOTBALL_DATA", "true").lower() in {"1", "true", "yes"}
 RUN_ESPN = os.getenv("LIVE_REFRESH_ESPN", "true").lower() in {"1", "true", "yes"}
 RUN_ESPN_CONTEXT = os.getenv("LIVE_REFRESH_ESPN_CONTEXT", "true").lower() in {"1", "true", "yes"}
+RUN_ESPN_TEAM_SCHEDULE = os.getenv("LIVE_REFRESH_ESPN_TEAM_SCHEDULE", "true").lower() in {"1", "true", "yes"}
 RUN_UNDERSTAT = os.getenv("LIVE_REFRESH_UNDERSTAT", "true").lower() in {"1", "true", "yes"}
 RUN_ODDSPAPI = os.getenv("LIVE_REFRESH_ODDSPAPI", "true").lower() in {"1", "true", "yes"}
 RUN_BBS = os.getenv("LIVE_REFRESH_BBS", "true").lower() in {"1", "true", "yes"}
@@ -55,10 +56,8 @@ def oddspapi_fresh_this_hour() -> bool:
         with psycopg.connect(DATABASE_URL) as conn:
             row = conn.execute(
                 """
-                SELECT 1
-                FROM oddspapi_import_runs
-                WHERE status='success'
-                  AND finished_at >= date_trunc('hour', NOW())
+                SELECT 1 FROM oddspapi_import_runs
+                WHERE status='success' AND finished_at >= date_trunc('hour', NOW())
                 LIMIT 1
                 """
             ).fetchone()
@@ -89,6 +88,10 @@ def main() -> Dict[str, Any]:
     if RUN_ESPN_CONTEXT:
         from espn_prematch_refresh import run_import as run_espn_context
         run_step("espn_context", lambda: run_espn_context(DATABASE_URL), steps, optional=True)
+
+    if RUN_ESPN_TEAM_SCHEDULE:
+        from espn_team_schedule_importer import run_import as run_team_schedule
+        run_step("espn_team_schedule", lambda: run_team_schedule(DATABASE_URL), steps, optional=True)
 
     if RUN_UNDERSTAT:
         from understat_xg_importer import run_import as run_understat
