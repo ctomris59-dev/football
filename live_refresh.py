@@ -24,8 +24,8 @@ RUN_ESPN_CONTEXT = os.getenv("LIVE_REFRESH_ESPN_CONTEXT", "true").lower() in {"1
 RUN_ESPN_TEAM_SCHEDULE = os.getenv("LIVE_REFRESH_ESPN_TEAM_SCHEDULE", "true").lower() in {"1", "true", "yes"}
 RUN_UNDERSTAT = os.getenv("LIVE_REFRESH_UNDERSTAT", "true").lower() in {"1", "true", "yes"}
 RUN_ODDSPAPI = os.getenv("LIVE_REFRESH_ODDSPAPI", "true").lower() in {"1", "true", "yes"}
-# BBS currently documents football match/lineup routes but not a forward-looking soccer injury-report route.
-# Keep the historical absence probe opt-in only instead of spending five requests every refresh.
+RUN_FOTMOB_AVAILABILITY = os.getenv("LIVE_REFRESH_FOTMOB_AVAILABILITY", "true").lower() in {"1", "true", "yes"}
+# BBS documents football match/lineup routes but not a forward-looking soccer injury-report route.
 RUN_BBS = os.getenv("LIVE_REFRESH_BBS", "false").lower() in {"1", "true", "yes"}
 RUN_BBS_LINEUPS = os.getenv("LIVE_REFRESH_BBS_LINEUPS", "true").lower() in {"1", "true", "yes"}
 RUN_SOFASCORE = os.getenv("LIVE_REFRESH_SOFASCORE", "true").lower() in {"1", "true", "yes"}
@@ -74,6 +74,8 @@ def main() -> Dict[str, Any]:
             steps["oddspapi"]={"status":"skipped","reason":"successful snapshot already exists this UTC hour"};log.info("LIVE_REFRESH_STEP step=oddspapi status=skipped reason=same_hour_success")
         else:
             from oddspapi_canonical_importer import run_import as fn; run_step("oddspapi",lambda:fn(DATABASE_URL),steps,optional=True)
+    if RUN_FOTMOB_AVAILABILITY:
+        from fotmob_availability_importer import run_import as fn; run_step("fotmob_availability",lambda:fn(DATABASE_URL),steps,optional=True)
     if RUN_BBS:
         from bbs_availability_canonical import run_import as fn; run_step("bbs_availability",lambda:fn(DATABASE_URL),steps,optional=True)
     if RUN_BBS_LINEUPS:
@@ -83,9 +85,9 @@ def main() -> Dict[str, Any]:
     if RUN_PREMATCH:
         from prematch_context_builder_fixed import run_build as fn; run_step("prematch_context",lambda:fn(DATABASE_URL),steps)
     if RUN_AVAILABILITY_ENRICH:
-        from availability_enricher import run_enrich as fn; run_step("availability_enrich",lambda:fn(DATABASE_URL),steps,optional=True)
+        from availability_enricher_v2 import run_enrich as fn; run_step("availability_enrich",lambda:fn(DATABASE_URL),steps,optional=True)
     if RUN_READINESS:
-        from data_readiness_audit_v2 import run_audit as fn; run_step("data_readiness",lambda:fn(DATABASE_URL),steps)
+        from data_readiness_audit_v3 import run_audit as fn; run_step("data_readiness",lambda:fn(DATABASE_URL),steps)
     summary["finished_at"]=utcnow().isoformat();summary["status"]="success";log.info("LIVE_REFRESH_RESULT %s",json.dumps(summary,ensure_ascii=False,default=str,separators=(",",":")));return summary
 
 if __name__=="__main__":print(json.dumps(main(),ensure_ascii=False,indent=2,default=str))
