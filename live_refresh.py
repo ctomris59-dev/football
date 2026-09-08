@@ -30,6 +30,7 @@ RUN_BBS = os.getenv("LIVE_REFRESH_BBS", "false").lower() in {"1", "true", "yes"}
 RUN_BBS_LINEUPS = os.getenv("LIVE_REFRESH_BBS_LINEUPS", "true").lower() in {"1", "true", "yes"}
 RUN_SOFASCORE = os.getenv("LIVE_REFRESH_SOFASCORE", "true").lower() in {"1", "true", "yes"}
 RUN_PREMATCH = os.getenv("LIVE_REFRESH_PREMATCH", "true").lower() in {"1", "true", "yes"}
+RUN_ODDS_MOVEMENT = os.getenv("LIVE_REFRESH_ODDS_MOVEMENT", "true").lower() in {"1", "true", "yes"}
 RUN_AVAILABILITY_ENRICH = os.getenv("LIVE_REFRESH_AVAILABILITY_ENRICH", "true").lower() in {"1", "true", "yes"}
 RUN_READINESS = os.getenv("LIVE_REFRESH_READINESS", "true").lower() in {"1", "true", "yes"}
 RUN_PREDICTIONS = os.getenv("LIVE_REFRESH_PREDICTIONS", "true").lower() in {"1", "true", "yes"}
@@ -151,6 +152,9 @@ def main() -> Dict[str, Any]:
     if RUN_PREMATCH:
         from prematch_context_builder_fixed import run_build as fn
         run_step("prematch_context", lambda: fn(DATABASE_URL), steps)
+    if RUN_ODDS_MOVEMENT:
+        from odds_movement_enricher import run_enrich as fn
+        run_step("odds_movement", lambda: fn(DATABASE_URL), steps, optional=True)
     if RUN_AVAILABILITY_ENRICH:
         from availability_enricher_v2 import run_enrich as fn
         run_step("availability_enrich", lambda: fn(DATABASE_URL), steps, optional=True)
