@@ -40,14 +40,21 @@ refresh_state: dict[str, Any] = {"running": False, "last_started": None, "last_f
 TABLES = [
     "league_coverage", "fixtures", "fixture_details", "injuries", "season_players", "collection_runs", "api_call_log",
     "football_data_matches", "football_data_upcoming", "football_data_source_state", "football_data_import_runs",
+    "second_tier_matches", "second_tier_import_runs",
+    "promotion_transfer_factors", "promotion_priors", "promotion_prior_runs", "promotion_prior_backtest_runs",
     "espn_current_matches", "espn_upcoming", "espn_import_state", "espn_import_runs",
     "espn_injury_snapshots", "espn_odds_snapshots", "espn_prematch_snapshots", "espn_advanced_match_stats", "espn_context_runs",
     "espn_team_schedule_events", "espn_team_schedule_runs",
     "understat_matches", "understat_team_seasons", "understat_source_state", "understat_import_runs",
-    "oddspapi_tournaments", "oddspapi_market_catalog", "oddspapi_fixture_snapshots", "oddspapi_market_prices", "oddspapi_import_runs",
+    "clubelo_daily_snapshots", "clubelo_team_map", "clubelo_history", "clubelo_import_runs",
+    "oddspapi_tournaments", "oddspapi_market_catalog", "oddspapi_fixture_snapshots", "oddspapi_market_prices", "oddspapi_import_runs", "oddspapi_allbooks_runs",
+    "market_consensus_snapshots", "market_consensus_runs",
     "bbs_absence_snapshots", "bbs_availability_runs", "bbs_lineup_snapshots", "bbs_lineup_runs",
     "sofascore_availability_snapshots", "sofascore_availability_runs",
     "fotmob_team_availability_snapshots", "fotmob_fixture_availability_snapshots", "fotmob_availability_runs",
+    "fotmob_player_strength_snapshots", "fotmob_team_style_snapshots", "fotmob_strength_runs",
+    "score_state_adjusted_matches", "score_state_runs", "score_state_backtest_runs",
+    "fixture_enrichment_snapshots", "fixture_enrichment_runs",
     "prematch_feature_snapshots", "prematch_context_runs",
     "prediction_readiness_snapshots", "data_readiness_runs",
     "model_backtest_runs", "model_policy_backtest_runs", "model_value_backtest_runs",
@@ -137,7 +144,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Football Prediction Data Service", version="3.0", lifespan=lifespan)
+app = FastAPI(title="Football Prediction Data Service", version="4.0", lifespan=lifespan)
 
 
 def auth(token: Optional[str], authorization: Optional[str]) -> None:
@@ -165,7 +172,12 @@ def rowdict(cur, row) -> Optional[dict[str, Any]]:
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": "3.0", "auto_live_refresh": AUTO_LIVE_REFRESH, "refresh": dict(refresh_state)}
+    return {"ok": True, "version": "4.0", "auto_live_refresh": AUTO_LIVE_REFRESH, "refresh": dict(refresh_state)}
+
+
+@app.get("/")
+def root():
+    return health()
 
 
 @app.post("/refresh")
@@ -204,14 +216,24 @@ def status(token: Optional[str] = Query(None), authorization: Optional[str] = He
 
         one("collector", "SELECT run_id::text AS run_id,started_at,finished_at,status,api_calls,message FROM collection_runs ORDER BY started_at DESC LIMIT 1")
         one("football_data", "SELECT * FROM football_data_import_runs ORDER BY id DESC LIMIT 1")
+        one("second_tier", "SELECT * FROM second_tier_import_runs ORDER BY id DESC LIMIT 1")
+        one("promotion_priors", "SELECT * FROM promotion_prior_runs ORDER BY id DESC LIMIT 1")
+        one("promotion_backtest", "SELECT * FROM promotion_prior_backtest_runs ORDER BY id DESC LIMIT 1")
         one("espn_current", "SELECT * FROM espn_import_runs ORDER BY id DESC LIMIT 1")
         one("espn_context", "SELECT * FROM espn_context_runs ORDER BY id DESC LIMIT 1")
         one("team_schedule", "SELECT * FROM espn_team_schedule_runs ORDER BY id DESC LIMIT 1")
         one("understat", "SELECT * FROM understat_import_runs ORDER BY id DESC LIMIT 1")
+        one("clubelo", "SELECT * FROM clubelo_import_runs ORDER BY id DESC LIMIT 1")
         one("oddspapi", "SELECT * FROM oddspapi_import_runs ORDER BY id DESC LIMIT 1")
+        one("oddspapi_allbooks", "SELECT * FROM oddspapi_allbooks_runs ORDER BY id DESC LIMIT 1")
+        one("market_consensus", "SELECT * FROM market_consensus_runs ORDER BY id DESC LIMIT 1")
         one("bbs_lineups", "SELECT * FROM bbs_lineup_runs ORDER BY id DESC LIMIT 1")
         one("sofascore_availability", "SELECT * FROM sofascore_availability_runs ORDER BY id DESC LIMIT 1")
         one("fotmob_availability", "SELECT * FROM fotmob_availability_runs ORDER BY id DESC LIMIT 1")
+        one("fotmob_strength", "SELECT * FROM fotmob_strength_runs ORDER BY id DESC LIMIT 1")
+        one("score_state", "SELECT * FROM score_state_runs ORDER BY id DESC LIMIT 1")
+        one("score_state_backtest", "SELECT * FROM score_state_backtest_runs ORDER BY id DESC LIMIT 1")
+        one("fixture_enrichment", "SELECT * FROM fixture_enrichment_runs ORDER BY id DESC LIMIT 1")
         one("prematch_context", "SELECT * FROM prematch_context_runs ORDER BY id DESC LIMIT 1")
         one("readiness", "SELECT * FROM data_readiness_runs ORDER BY id DESC LIMIT 1")
         one("backtest", "SELECT * FROM model_backtest_runs ORDER BY id DESC LIMIT 1")
