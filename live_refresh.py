@@ -87,7 +87,7 @@ def main() -> Dict[str, Any]:
         run_step("espn_current", lambda: run_espn(DATABASE_URL), steps)
 
     if RUN_ESPN_CONTEXT:
-        from espn_context_importer import run_import as run_espn_context
+        from espn_prematch_refresh import run_import as run_espn_context
         run_step("espn_context", lambda: run_espn_context(DATABASE_URL), steps, optional=True)
 
     if RUN_UNDERSTAT:
