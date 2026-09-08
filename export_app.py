@@ -56,12 +56,12 @@ TABLES = [
 
 def _run_football_data_import() -> None:
     try:
-        from football_data_importer import run_import
+        from football_data_mirror_importer import run_import
 
         result = run_import(DATABASE_URL)
         log.info("Football-Data startup import completed: %s", result)
     except Exception:
-        # Export service must stay online even if the free source is
+        # Export service must stay online even if a free source is
         # temporarily rate-limited or unavailable.
         log.exception("Football-Data startup import failed")
 
@@ -77,7 +77,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Football Dataset Export", version="1.1", lifespan=lifespan)
+app = FastAPI(title="Football Dataset Export", version="1.2", lifespan=lifespan)
 
 
 def auth(token: str) -> None:
