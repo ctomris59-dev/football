@@ -107,7 +107,7 @@ def main() -> Dict[str, Any]:
         run_step("bbs_availability", lambda: run_bbs(DATABASE_URL), steps, optional=True)
 
     if RUN_PREMATCH:
-        from prematch_context_builder import run_build
+        from prematch_context_builder_fixed import run_build
         run_step("prematch_context", lambda: run_build(DATABASE_URL), steps)
 
     summary["finished_at"] = utcnow().isoformat()
