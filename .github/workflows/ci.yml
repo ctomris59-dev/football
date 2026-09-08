@@ -22,10 +22,23 @@ jobs:
         run: |
           python - <<'PY'
           import model_engine
+          import model_engine_v1
           import production_predictor
+          import production_predictor_v3
           import data_readiness_audit_v4
           import odds_movement_enricher
           import live_refresh
+          import advanced_features_pipeline
+          import second_tier_importer_v2
+          import promotion_prior_builder
+          import promotion_prior_backtest
+          import clubelo_importer
+          import fotmob_strength_style_importer
+          import fixture_enrichment_builder
+          import oddspapi_allbooks_importer
+          import market_consensus_builder
+          import score_state_builder
+          import score_state_backtest
           import export_app
           print('imports-ok')
           PY
@@ -34,6 +47,8 @@ jobs:
           python - <<'PY'
           from model_engine import predict_match
           from production_predictor import market_kind, outcome_side, no_vig_selected
+          from market_consensus_builder import no_vig
+          from oddspapi_allbooks_importer import market_kind as allbooks_market_kind
 
           history=[]
           for i in range(20):
@@ -45,7 +60,6 @@ jobs:
                   'home_corners':6,'away_corners':4,
                   'home_xg':1.7,'away_xg':1.1,
               })
-          # Ensure both requested teams have adequate home/away samples.
           for i in range(8):
               history.append({'home_team':'alpha','away_team':'delta','home_goals':2,'away_goals':1,'home_shots_on_target':5,'away_shots_on_target':4,'home_corners':6,'away_corners':4,'home_xg':1.8,'away_xg':1.0})
               history.append({'home_team':'gamma','away_team':'beta','home_goals':1,'away_goals':1,'home_shots_on_target':4,'away_shots_on_target':4,'home_corners':5,'away_corners':5,'home_xg':1.2,'away_xg':1.2})
@@ -56,9 +70,12 @@ jobs:
           assert market_kind('Total Goals Over Under',2.5) == 'over_2_5'
           assert market_kind('Total Corners Over Under',8.5) == 'corners_over_8_5'
           assert market_kind('Both Teams To Score',None) == 'btts'
+          assert allbooks_market_kind('Total Goals Over Under',2.5) == 'over_2_5'
           assert outcome_side('over_2_5','Over 2.5') is True
           assert outcome_side('btts','No') is False
           price, nv = no_vig_selected({True:1.90,False:2.00},True)
           assert price == 1.90 and nv is not None and 0 < nv < 1
-          print('logic-smoke-ok', p.as_dict())
+          nv_book = no_vig(1.90,2.00)
+          assert nv_book is not None and 0 < nv_book < 1
+          print('logic-smoke-ok', p.as_dict(), nv_book)
           PY
