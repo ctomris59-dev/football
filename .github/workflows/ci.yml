@@ -1,0 +1,30 @@
+name: football-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  python-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile all Python modules
+        run: python -m compileall -q .
+      - name: Import production modules
+        run: |
+          python - <<'PY'
+          import model_engine
+          import production_predictor
+          import data_readiness_audit_v4
+          import live_refresh
+          import export_app
+          print('imports-ok')
+          PY
