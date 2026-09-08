@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Readiness audit v4.
+"""Readiness audit v4 for the production v1 selection engine.
 
-Fixes two v3 issues:
-- availability was double-counted in readiness_score after the enrichment step;
-- data_readiness_runs kept the base final-context count instead of the strict current-lineup count.
-
-It also treats stale bookmaker snapshots as unavailable for market readiness.
+Fixes:
+- availability double-counting;
+- stale run counters;
+- stale bookmaker snapshots;
+- xG is a quality/diagnostic component, not a hard blocker, because the primary
+  production model is the backtest-leading non-xG v1 engine.
 """
 from __future__ import annotations
 
@@ -48,7 +49,7 @@ def run_audit(database_url: Optional[str] = None) -> Dict[str, Any]:
         raise RuntimeError("Missing DATABASE_URL")
 
     base = run_base(db)
-    updated = injury_ready = match_specific = confirmed = final_ready = 0
+    updated = injury_ready = match_specific = confirmed = final_ready = xg_ready = 0
     goals_ready = btts_ready = corners_ready = 0
 
     with psycopg.connect(db, autocommit=True) as conn:
@@ -107,17 +108,21 @@ def run_audit(database_url: Optional[str] = None) -> Dict[str, Any]:
             schedule_ok = bool(schedule_complete)
             lineup_signal = bool(lineup_available or match_specific_present)
 
-            goals = bool(match_history_ok and xg_ok and ou_fresh)
-            btts = bool(match_history_ok and xg_ok and btts_fresh)
+            # Primary production model is v1; xG is useful but not mandatory.
+            goals = bool(match_history_ok and ou_fresh)
+            btts = bool(match_history_ok and btts_fresh)
             corners = bool(corner_history_ok and corner_fresh)
             final_context = bool(schedule_ok and current_injury_present and confirmed_current)
 
             bl = list(blockers or [])
+            # Base audit was xG-v2 oriented. Remove this as a production blocker.
+            _set_blocker(bl, "insufficient_xg_history", False)
             _set_blocker(bl, "fresh_availability_missing", not availability_present)
             _set_blocker(bl, "current_injury_report_missing", not current_injury_present)
             _set_blocker(bl, "match_lineup_not_confirmed_current", not confirmed_current)
             _set_blocker(bl, "odds_snapshot_stale", bool((has_ou or has_btts or has_corner) and not odds_fresh))
 
+            # xG still contributes to data-quality score when present.
             components = [
                 match_history_ok,
                 xg_ok,
@@ -166,6 +171,7 @@ def run_audit(database_url: Optional[str] = None) -> Dict[str, Any]:
             injury_ready += int(current_injury_present)
             match_specific += int(match_specific_present)
             confirmed += int(confirmed_current)
+            xg_ready += int(xg_ok)
             goals_ready += int(goals)
             btts_ready += int(btts)
             corners_ready += int(corners)
@@ -175,18 +181,19 @@ def run_audit(database_url: Optional[str] = None) -> Dict[str, Any]:
             conn.execute(
                 """UPDATE data_readiness_runs SET
                        goals_ready=%s,btts_ready=%s,corners_ready=%s,final_context_ready=%s,
-                       message='v4 freshness/availability corrected'
+                       message='v4 v1-primary freshness/availability corrected'
                    WHERE id=%s""",
                 (goals_ready,btts_ready,corners_ready,final_ready,latest_run_id),
             )
 
     result = {
         **base,
-        "version": "readiness-v4",
+        "version": "readiness-v4-v1-primary",
         "v4_updated": updated,
         "current_injury_reports": injury_ready,
         "match_specific_availability": match_specific,
         "confirmed_current_lineups": confirmed,
+        "xg_diagnostic_ready": xg_ready,
         "goals_ready": goals_ready,
         "btts_ready": btts_ready,
         "corners_ready": corners_ready,
