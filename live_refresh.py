@@ -26,98 +26,55 @@ RUN_UNDERSTAT = os.getenv("LIVE_REFRESH_UNDERSTAT", "true").lower() in {"1", "tr
 RUN_ODDSPAPI = os.getenv("LIVE_REFRESH_ODDSPAPI", "true").lower() in {"1", "true", "yes"}
 RUN_BBS = os.getenv("LIVE_REFRESH_BBS", "true").lower() in {"1", "true", "yes"}
 RUN_PREMATCH = os.getenv("LIVE_REFRESH_PREMATCH", "true").lower() in {"1", "true", "yes"}
+RUN_READINESS = os.getenv("LIVE_REFRESH_READINESS", "true").lower() in {"1", "true", "yes"}
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("live-refresh")
 
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
+def utcnow() -> datetime:return datetime.now(timezone.utc)
 
 def run_step(name: str, fn: Callable[[], Any], summary: Dict[str, Any], *, optional: bool = False) -> None:
     try:
-        result = fn()
-        summary[name] = {"status": "ok", "result": result}
-        log.info("LIVE_REFRESH_STEP step=%s status=ok result=%s", name, result)
+        result = fn(); summary[name] = {"status":"ok","result":result}; log.info("LIVE_REFRESH_STEP step=%s status=ok result=%s",name,result)
     except Exception as exc:
-        summary[name] = {"status": "failed", "error": str(exc)}
-        if optional:
-            log.warning("LIVE_REFRESH_STEP step=%s status=failed_optional error=%s", name, exc)
-        else:
-            log.exception("LIVE_REFRESH_STEP step=%s status=failed", name)
-            raise
-
+        summary[name] = {"status":"failed","error":str(exc)}
+        if optional: log.warning("LIVE_REFRESH_STEP step=%s status=failed_optional error=%s",name,exc)
+        else: log.exception("LIVE_REFRESH_STEP step=%s status=failed",name); raise
 
 def oddspapi_fresh_this_hour() -> bool:
-    if not DATABASE_URL:
-        return False
+    if not DATABASE_URL:return False
     try:
         with psycopg.connect(DATABASE_URL) as conn:
-            row = conn.execute(
-                """
-                SELECT 1 FROM oddspapi_import_runs
-                WHERE status='success' AND finished_at >= date_trunc('hour', NOW())
-                LIMIT 1
-                """
-            ).fetchone()
+            row=conn.execute("SELECT 1 FROM oddspapi_import_runs WHERE status='success' AND finished_at>=date_trunc('hour',NOW()) LIMIT 1").fetchone()
         return bool(row)
-    except Exception:
-        return False
-
+    except Exception:return False
 
 def main() -> Dict[str, Any]:
-    if not DATABASE_URL:
-        raise RuntimeError("Missing DATABASE_URL")
-    started = utcnow()
-    summary: Dict[str, Any] = {"started_at": started.isoformat(), "steps": {}}
-    steps: Dict[str, Any] = summary["steps"]
-
+    if not DATABASE_URL:raise RuntimeError("Missing DATABASE_URL")
+    started=utcnow();summary:Dict[str,Any]={"started_at":started.isoformat(),"steps":{}};steps=summary["steps"]
     if RUN_FD2324:
-        from football_data_2324_importer import run_import as run_fd2324
-        run_step("football_data_2324", lambda: run_fd2324(DATABASE_URL), steps, optional=True)
-
+        from football_data_2324_importer import run_import as fn; run_step("football_data_2324",lambda:fn(DATABASE_URL),steps,optional=True)
     if RUN_FOOTBALL_DATA:
-        from football_data_mirror_importer import run_import as run_fd
-        run_step("football_data", lambda: run_fd(DATABASE_URL), steps, optional=True)
-
+        from football_data_mirror_importer import run_import as fn; run_step("football_data",lambda:fn(DATABASE_URL),steps,optional=True)
     if RUN_ESPN:
-        from espn_current_importer import run_import as run_espn
-        run_step("espn_current", lambda: run_espn(DATABASE_URL), steps)
-
+        from espn_current_importer import run_import as fn; run_step("espn_current",lambda:fn(DATABASE_URL),steps)
     if RUN_ESPN_CONTEXT:
-        from espn_prematch_refresh import run_import as run_espn_context
-        run_step("espn_context", lambda: run_espn_context(DATABASE_URL), steps, optional=True)
-
+        from espn_prematch_refresh import run_import as fn; run_step("espn_context",lambda:fn(DATABASE_URL),steps,optional=True)
     if RUN_ESPN_TEAM_SCHEDULE:
-        from espn_team_schedule_importer import run_import as run_team_schedule
-        run_step("espn_team_schedule", lambda: run_team_schedule(DATABASE_URL), steps, optional=True)
-
+        from espn_team_schedule_importer import run_import as fn; run_step("espn_team_schedule",lambda:fn(DATABASE_URL),steps,optional=True)
     if RUN_UNDERSTAT:
-        from understat_xg_importer import run_import as run_understat
-        run_step("understat", lambda: run_understat(DATABASE_URL), steps, optional=True)
-
+        from understat_xg_importer import run_import as fn; run_step("understat",lambda:fn(DATABASE_URL),steps,optional=True)
     if RUN_ODDSPAPI:
         if oddspapi_fresh_this_hour():
-            steps["oddspapi"] = {"status": "skipped", "reason": "successful snapshot already exists this UTC hour"}
-            log.info("LIVE_REFRESH_STEP step=oddspapi status=skipped reason=same_hour_success")
+            steps["oddspapi"]={"status":"skipped","reason":"successful snapshot already exists this UTC hour"};log.info("LIVE_REFRESH_STEP step=oddspapi status=skipped reason=same_hour_success")
         else:
-            from oddspapi_canonical_importer import run_import as run_odds
-            run_step("oddspapi", lambda: run_odds(DATABASE_URL), steps, optional=True)
-
+            from oddspapi_canonical_importer import run_import as fn; run_step("oddspapi",lambda:fn(DATABASE_URL),steps,optional=True)
     if RUN_BBS:
-        from bbs_availability_importer import run_import as run_bbs
-        run_step("bbs_availability", lambda: run_bbs(DATABASE_URL), steps, optional=True)
-
+        from bbs_availability_importer import run_import as fn; run_step("bbs_availability",lambda:fn(DATABASE_URL),steps,optional=True)
     if RUN_PREMATCH:
-        from prematch_context_builder_fixed import run_build
-        run_step("prematch_context", lambda: run_build(DATABASE_URL), steps)
+        from prematch_context_builder_fixed import run_build as fn; run_step("prematch_context",lambda:fn(DATABASE_URL),steps)
+    if RUN_READINESS:
+        from data_readiness_audit import run_audit as fn; run_step("data_readiness",lambda:fn(DATABASE_URL),steps)
+    summary["finished_at"]=utcnow().isoformat();summary["status"]="success";log.info("LIVE_REFRESH_RESULT %s",json.dumps(summary,ensure_ascii=False,default=str,separators=(",",":")));return summary
 
-    summary["finished_at"] = utcnow().isoformat()
-    summary["status"] = "success"
-    log.info("LIVE_REFRESH_RESULT %s", json.dumps(summary, ensure_ascii=False, default=str, separators=(",", ":")))
-    return summary
-
-
-if __name__ == "__main__":
-    print(json.dumps(main(), ensure_ascii=False, indent=2, default=str))
+if __name__=="__main__":print(json.dumps(main(),ensure_ascii=False,indent=2,default=str))
