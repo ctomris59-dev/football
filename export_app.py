@@ -26,6 +26,7 @@ AUTO_IMPORT_UNDERSTAT = os.getenv("AUTO_IMPORT_UNDERSTAT", "true").lower() in {"
 AUTO_RUN_BACKTEST = os.getenv("AUTO_RUN_BACKTEST", "false").lower() in {"1", "true", "yes"}
 AUTO_BACKTEST_NEW_MODEL = os.getenv("AUTO_BACKTEST_NEW_MODEL", "true").lower() in {"1", "true", "yes"}
 AUTO_BACKTEST_HYBRID = os.getenv("AUTO_BACKTEST_HYBRID", "true").lower() in {"1", "true", "yes"}
+AUTO_BACKTEST_VALUE = os.getenv("AUTO_BACKTEST_VALUE", "true").lower() in {"1", "true", "yes"}
 log = logging.getLogger("football-export")
 
 TABLES = [
@@ -34,7 +35,7 @@ TABLES = [
     "espn_current_matches", "espn_upcoming", "espn_import_state", "espn_import_runs",
     "espn_injury_snapshots", "espn_odds_snapshots", "espn_prematch_snapshots", "espn_advanced_match_stats", "espn_context_runs",
     "understat_matches", "understat_team_seasons", "understat_source_state", "understat_import_runs",
-    "model_backtest_runs", "model_policy_backtest_runs",
+    "model_backtest_runs", "model_policy_backtest_runs", "model_value_backtest_runs",
 ]
 
 def _run_football_data_import() -> None:
@@ -74,8 +75,7 @@ def _run_backtest_if_new() -> None:
         with psycopg.connect(DATABASE_URL) as conn:
             exists = conn.execute("SELECT 1 FROM model_backtest_runs WHERE model_version=%s AND status='success' LIMIT 1", (MODEL_VERSION,)).fetchone()
         if exists:
-            log.info("Backtest already exists for model %s; skipping.", MODEL_VERSION)
-            return
+            log.info("Backtest already exists for model %s; skipping.", MODEL_VERSION); return
         r = run_backtest(DATABASE_URL)
         log.info("NEW_MODEL_BACKTEST_COMPLETED version=%s matches=%s top10=%s markets=%s", MODEL_VERSION, r.get("matches_scored"), r.get("top10"), r.get("markets"))
     except Exception: log.exception("New-model backtest failed")
@@ -84,34 +84,37 @@ def _run_hybrid_if_new() -> None:
     try:
         from hybrid_policy_backtest import MODEL_VERSION, SCHEMA, run_backtest
         with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
-            conn.execute(SCHEMA)
-            exists = conn.execute("SELECT 1 FROM model_policy_backtest_runs WHERE policy_version=%s AND status='success' LIMIT 1", (MODEL_VERSION,)).fetchone()
+            conn.execute(SCHEMA); exists = conn.execute("SELECT 1 FROM model_policy_backtest_runs WHERE policy_version=%s AND status='success' LIMIT 1", (MODEL_VERSION,)).fetchone()
         if exists:
-            log.info("Hybrid policy backtest already exists for %s; skipping.", MODEL_VERSION)
-            return
+            log.info("Hybrid policy backtest already exists for %s; skipping.", MODEL_VERSION); return
         r = run_backtest(DATABASE_URL)
         log.info("HYBRID_POLICY_BACKTEST_COMPLETED version=%s picks=%s hits=%s hit_rate=%s by_market=%s", MODEL_VERSION, r.get("picks"), r.get("hits"), r.get("hit_rate"), r.get("by_market"))
     except Exception: log.exception("Hybrid policy backtest failed")
 
+def _run_value_if_new() -> None:
+    try:
+        from value_backtest import VERSION, SCHEMA, run_backtest
+        with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
+            conn.execute(SCHEMA); exists = conn.execute("SELECT 1 FROM model_value_backtest_runs WHERE version=%s AND status='success' LIMIT 1", (VERSION,)).fetchone()
+        if exists:
+            log.info("Value backtest already exists for %s; skipping.", VERSION); return
+        r = run_backtest(DATABASE_URL)
+        log.info("VALUE_BACKTEST_COMPLETED version=%s odds_matches=%s model_brier=%s market_brier=%s gates=%s", VERSION, r.get("odds_matches"), r.get("model_brier"), r.get("market_brier"), r.get("gates"))
+    except Exception: log.exception("Value backtest failed")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if DATABASE_URL and AUTO_IMPORT_FOOTBALL_DATA:
-        threading.Thread(target=_run_football_data_import, name="football-data-importer", daemon=True).start()
-    if DATABASE_URL and AUTO_IMPORT_ESPN:
-        threading.Thread(target=_run_espn_import, name="espn-current-importer", daemon=True).start()
-    if DATABASE_URL and AUTO_IMPORT_ESPN_CONTEXT:
-        threading.Thread(target=_run_espn_context, name="espn-context-importer", daemon=True).start()
-    if DATABASE_URL and AUTO_IMPORT_UNDERSTAT:
-        threading.Thread(target=_run_understat, name="understat-xg-importer", daemon=True).start()
-    if DATABASE_URL and AUTO_RUN_BACKTEST:
-        threading.Thread(target=_run_backtest, name="model-backtest", daemon=True).start()
-    elif DATABASE_URL and AUTO_BACKTEST_NEW_MODEL:
-        threading.Thread(target=_run_backtest_if_new, name="model-backtest-new-version", daemon=True).start()
-    if DATABASE_URL and AUTO_BACKTEST_HYBRID:
-        threading.Thread(target=_run_hybrid_if_new, name="hybrid-policy-backtest", daemon=True).start()
+    if DATABASE_URL and AUTO_IMPORT_FOOTBALL_DATA: threading.Thread(target=_run_football_data_import, name="football-data-importer", daemon=True).start()
+    if DATABASE_URL and AUTO_IMPORT_ESPN: threading.Thread(target=_run_espn_import, name="espn-current-importer", daemon=True).start()
+    if DATABASE_URL and AUTO_IMPORT_ESPN_CONTEXT: threading.Thread(target=_run_espn_context, name="espn-context-importer", daemon=True).start()
+    if DATABASE_URL and AUTO_IMPORT_UNDERSTAT: threading.Thread(target=_run_understat, name="understat-xg-importer", daemon=True).start()
+    if DATABASE_URL and AUTO_RUN_BACKTEST: threading.Thread(target=_run_backtest, name="model-backtest", daemon=True).start()
+    elif DATABASE_URL and AUTO_BACKTEST_NEW_MODEL: threading.Thread(target=_run_backtest_if_new, name="model-backtest-new-version", daemon=True).start()
+    if DATABASE_URL and AUTO_BACKTEST_HYBRID: threading.Thread(target=_run_hybrid_if_new, name="hybrid-policy-backtest", daemon=True).start()
+    if DATABASE_URL and AUTO_BACKTEST_VALUE: threading.Thread(target=_run_value_if_new, name="value-backtest", daemon=True).start()
     yield
 
-app = FastAPI(title="Football Dataset Export", version="1.8", lifespan=lifespan)
+app = FastAPI(title="Football Dataset Export", version="1.9", lifespan=lifespan)
 
 def auth(token: str) -> None:
     if not DOWNLOAD_TOKEN: raise HTTPException(500, "DOWNLOAD_TOKEN is not configured.")
@@ -122,7 +125,7 @@ def json_default(value: Any):
     return str(value)
 
 @app.get("/health")
-def health(): return {"ok": True, "version": "1.8"}
+def health(): return {"ok": True, "version": "1.9"}
 
 @app.get("/status")
 def status(token: str = Query(...)):
@@ -143,7 +146,8 @@ def status(token: str = Query(...)):
         last_understat = one("SELECT id, started_at, finished_at, status, requests, match_rows, xg_rows, team_rows, message FROM understat_import_runs ORDER BY id DESC LIMIT 1")
         last_backtest = one("SELECT id, started_at, finished_at, model_version, train_season, test_season, matches_scored, status, metrics, market_metrics, top10_metrics, message FROM model_backtest_runs ORDER BY id DESC LIMIT 1")
         last_policy = one("SELECT id, started_at, finished_at, policy_version, train_season, test_season, matches_scored, candidate_picks, metrics, status, message FROM model_policy_backtest_runs ORDER BY id DESC LIMIT 1")
-    return {"counts": out, "last_run": list(last_run) if last_run else None, "last_football_data_run": list(last_fd_run) if last_fd_run else None, "last_espn_run": list(last_espn_run) if last_espn_run else None, "last_context_run": list(last_context) if last_context else None, "last_understat_run": list(last_understat) if last_understat else None, "last_backtest": list(last_backtest) if last_backtest else None, "last_policy_backtest": list(last_policy) if last_policy else None, "generated_at": datetime.now(timezone.utc).isoformat()}
+        last_value = one("SELECT id, started_at, finished_at, version, train_season, test_season, matches_scored, odds_matches, metrics, status, message FROM model_value_backtest_runs ORDER BY id DESC LIMIT 1")
+    return {"counts": out, "last_run": list(last_run) if last_run else None, "last_football_data_run": list(last_fd_run) if last_fd_run else None, "last_espn_run": list(last_espn_run) if last_espn_run else None, "last_context_run": list(last_context) if last_context else None, "last_understat_run": list(last_understat) if last_understat else None, "last_backtest": list(last_backtest) if last_backtest else None, "last_policy_backtest": list(last_policy) if last_policy else None, "last_value_backtest": list(last_value) if last_value else None, "generated_at": datetime.now(timezone.utc).isoformat()}
 
 def remove_file(path: str) -> None:
     try: os.remove(path)
