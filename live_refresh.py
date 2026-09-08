@@ -162,7 +162,7 @@ def main() -> Dict[str, Any]:
         from data_readiness_audit_v4 import run_audit as fn
         run_step("data_readiness", lambda: fn(DATABASE_URL), steps)
     if RUN_PREDICTIONS:
-        from production_predictor import run_predictions as fn
+        from production_predictor_v2 import run_predictions as fn
         run_step("production_predictions", lambda: fn(DATABASE_URL), steps)
 
     summary["finished_at"] = utcnow().isoformat()
