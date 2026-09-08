@@ -1,0 +1,65 @@
+services:
+  # Small web service only for checking status and downloading the final ZIP.
+  - type: web
+    name: football-dataset-export
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn export_app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: football-dataset-db
+          property: connectionString
+      - key: DOWNLOAD_TOKEN
+        generateValue: true
+
+  # Dashboard-only "Run now" option:
+  # Create as a Cron Job, then use Runs -> Trigger Run manually.
+  # The annual schedule prevents routine collection; delete/suspend after the one-time pull.
+  - type: cron
+    name: football-bulk-collector
+    runtime: python
+    plan: 0.5c-512mb
+    region: frankfurt
+    schedule: "0 3 1 1 *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python collector.py
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: football-dataset-db
+          property: connectionString
+      - key: API_FOOTBALL_KEY
+        sync: false
+      - key: SEASONS
+        value: "2024,2025"
+      - key: LEAGUES
+        value: "39:Premier League,140:La Liga,135:Serie A,78:Bundesliga,61:Ligue 1"
+      - key: BATCH_SIZE
+        value: "20"
+      - key: DAILY_REQUEST_RESERVE
+        value: "20"
+      - key: INCLUDE_SEASON_PLAYERS
+        value: "true"
+      - key: INCLUDE_INJURIES
+        value: "true"
+      - key: REFRESH_ACTIVE_SEASON
+        value: "false"
+      - key: ACTIVE_SEASON
+        value: "2026"
+      - key: ENABLE_FALLBACK
+        value: "true"
+      - key: MAX_FALLBACK_REQUESTS
+        value: "500"
+      - key: ONLY_FINISHED_FOR_DETAILS
+        value: "true"
+
+databases:
+  - name: football-dataset-db
+    plan: 0.1c-256mb
+    region: frankfurt
+    databaseName: football_dataset
+    user: football_dataset
+    ipAllowList: []
