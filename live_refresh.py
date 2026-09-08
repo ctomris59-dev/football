@@ -80,7 +80,7 @@ def main() -> Dict[str, Any]:
     if RUN_AVAILABILITY_ENRICH:
         from availability_enricher import run_enrich as fn; run_step("availability_enrich",lambda:fn(DATABASE_URL),steps,optional=True)
     if RUN_READINESS:
-        from data_readiness_audit import run_audit as fn; run_step("data_readiness",lambda:fn(DATABASE_URL),steps)
+        from data_readiness_audit_v2 import run_audit as fn; run_step("data_readiness",lambda:fn(DATABASE_URL),steps)
     summary["finished_at"]=utcnow().isoformat();summary["status"]="success";log.info("LIVE_REFRESH_RESULT %s",json.dumps(summary,ensure_ascii=False,default=str,separators=(",",":")));return summary
 
 if __name__=="__main__":print(json.dumps(main(),ensure_ascii=False,indent=2,default=str))
