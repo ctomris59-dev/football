@@ -24,7 +24,41 @@ jobs:
           import model_engine
           import production_predictor
           import data_readiness_audit_v4
+          import odds_movement_enricher
           import live_refresh
           import export_app
           print('imports-ok')
+          PY
+      - name: Model and market logic smoke test
+        run: |
+          python - <<'PY'
+          from model_engine import predict_match
+          from production_predictor import market_kind, outcome_side, no_vig_selected
+
+          history=[]
+          for i in range(20):
+              history.append({
+                  'home_team':'alpha' if i % 2 == 0 else 'gamma',
+                  'away_team':'beta' if i % 2 == 0 else 'delta',
+                  'home_goals':2,'away_goals':1,
+                  'home_shots_on_target':5,'away_shots_on_target':4,
+                  'home_corners':6,'away_corners':4,
+                  'home_xg':1.7,'away_xg':1.1,
+              })
+          # Ensure both requested teams have adequate home/away samples.
+          for i in range(8):
+              history.append({'home_team':'alpha','away_team':'delta','home_goals':2,'away_goals':1,'home_shots_on_target':5,'away_shots_on_target':4,'home_corners':6,'away_corners':4,'home_xg':1.8,'away_xg':1.0})
+              history.append({'home_team':'gamma','away_team':'beta','home_goals':1,'away_goals':1,'home_shots_on_target':4,'away_shots_on_target':4,'home_corners':5,'away_corners':5,'home_xg':1.2,'away_xg':1.2})
+
+          p=predict_match(history,'alpha','beta')
+          assert all(0.0 <= x <= 1.0 for x in (p.p_over_2_5,p.p_btts,p.p_corners_over_8_5))
+          assert p.lambda_home_goals > 0 and p.lambda_away_goals > 0 and p.lambda_total_corners > 0
+          assert market_kind('Total Goals Over Under',2.5) == 'over_2_5'
+          assert market_kind('Total Corners Over Under',8.5) == 'corners_over_8_5'
+          assert market_kind('Both Teams To Score',None) == 'btts'
+          assert outcome_side('over_2_5','Over 2.5') is True
+          assert outcome_side('btts','No') is False
+          price, nv = no_vig_selected({True:1.90,False:2.00},True)
+          assert price == 1.90 and nv is not None and 0 < nv < 1
+          print('logic-smoke-ok', p.as_dict())
           PY
