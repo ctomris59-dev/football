@@ -23,7 +23,8 @@ AUTO_IMPORT_FOOTBALL_DATA = os.getenv("AUTO_IMPORT_FOOTBALL_DATA", "true").lower
 AUTO_IMPORT_ESPN = os.getenv("AUTO_IMPORT_ESPN", "true").lower() in {"1", "true", "yes"}
 AUTO_IMPORT_ESPN_CONTEXT = os.getenv("AUTO_IMPORT_ESPN_CONTEXT", "true").lower() in {"1", "true", "yes"}
 AUTO_IMPORT_UNDERSTAT = os.getenv("AUTO_IMPORT_UNDERSTAT", "true").lower() in {"1", "true", "yes"}
-AUTO_RUN_BACKTEST = os.getenv("AUTO_RUN_BACKTEST", "true").lower() in {"1", "true", "yes"}
+AUTO_RUN_BACKTEST = os.getenv("AUTO_RUN_BACKTEST", "false").lower() in {"1", "true", "yes"}
+AUTO_BACKTEST_NEW_MODEL = os.getenv("AUTO_BACKTEST_NEW_MODEL", "true").lower() in {"1", "true", "yes"}
 log = logging.getLogger("football-export")
 
 TABLES = [
@@ -34,7 +35,6 @@ TABLES = [
     "understat_matches", "understat_team_seasons", "understat_source_state", "understat_import_runs",
     "model_backtest_runs",
 ]
-
 
 def _run_football_data_import() -> None:
     try:
@@ -67,6 +67,18 @@ def _run_backtest() -> None:
         log.info("BACKTEST_COMPLETED matches=%s top10=%s markets=%s", r.get("matches_scored"), r.get("top10"), r.get("markets"))
     except Exception: log.exception("Model backtest failed")
 
+def _run_backtest_if_new() -> None:
+    try:
+        from backtest_model import MODEL_VERSION, run_backtest
+        with psycopg.connect(DATABASE_URL) as conn:
+            exists = conn.execute("SELECT 1 FROM model_backtest_runs WHERE model_version=%s AND status='success' LIMIT 1", (MODEL_VERSION,)).fetchone()
+        if exists:
+            log.info("Backtest already exists for model %s; skipping.", MODEL_VERSION)
+            return
+        r = run_backtest(DATABASE_URL)
+        log.info("NEW_MODEL_BACKTEST_COMPLETED version=%s matches=%s top10=%s markets=%s", MODEL_VERSION, r.get("matches_scored"), r.get("top10"), r.get("markets"))
+    except Exception: log.exception("New-model backtest failed")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if DATABASE_URL and AUTO_IMPORT_FOOTBALL_DATA:
@@ -79,9 +91,11 @@ async def lifespan(app: FastAPI):
         threading.Thread(target=_run_understat, name="understat-xg-importer", daemon=True).start()
     if DATABASE_URL and AUTO_RUN_BACKTEST:
         threading.Thread(target=_run_backtest, name="model-backtest", daemon=True).start()
+    elif DATABASE_URL and AUTO_BACKTEST_NEW_MODEL:
+        threading.Thread(target=_run_backtest_if_new, name="model-backtest-new-version", daemon=True).start()
     yield
 
-app = FastAPI(title="Football Dataset Export", version="1.6", lifespan=lifespan)
+app = FastAPI(title="Football Dataset Export", version="1.7", lifespan=lifespan)
 
 def auth(token: str) -> None:
     if not DOWNLOAD_TOKEN: raise HTTPException(500, "DOWNLOAD_TOKEN is not configured.")
@@ -92,7 +106,7 @@ def json_default(value: Any):
     return str(value)
 
 @app.get("/health")
-def health(): return {"ok": True, "version": "1.6"}
+def health(): return {"ok": True, "version": "1.7"}
 
 @app.get("/status")
 def status(token: str = Query(...)):
