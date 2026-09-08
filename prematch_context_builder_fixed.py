@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Safe parameter-binding wrapper for prematch context snapshots."""
+"""Safe pre-match context builder with cross-competition schedule preference."""
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from typing import Any, Dict, Optional
 
 from psycopg.types.json import Jsonb
@@ -11,6 +12,34 @@ from prematch_context_builder import PrematchContextBuilder, age_hours
 
 
 class SafePrematchContextBuilder(PrematchContextBuilder):
+    def schedule(self, team: str, fixture_dt):
+        """Prefer ESPN team-schedule history; fall back to domestic league rows."""
+        try:
+            team_row = self.conn.execute(
+                """SELECT team_id FROM espn_team_schedule_events
+                   WHERE lower(team_name)=lower(%s) ORDER BY updated_at DESC LIMIT 1""",
+                (team,),
+            ).fetchone()
+            if team_row and team_row[0]:
+                rows = self.conn.execute(
+                    """SELECT match_date FROM espn_team_schedule_events
+                       WHERE team_id=%s AND match_date < %s
+                         AND COALESCE(completed,FALSE)=TRUE
+                       ORDER BY match_date DESC LIMIT 20""",
+                    (team_row[0], fixture_dt),
+                ).fetchall()
+                dates = [r[0] for r in rows if r[0]]
+                if dates:
+                    rest = (fixture_dt-dates[0]).total_seconds()/86400.0
+                    seven = sum(1 for d in dates if fixture_dt-timedelta(days=7) <= d < fixture_dt)
+                    fourteen = sum(1 for d in dates if fixture_dt-timedelta(days=14) <= d < fixture_dt)
+                    return {"days_rest": round(rest,2), "last7": seven, "last14": fourteen, "scope":"team_schedule_endpoint"}
+        except Exception:
+            pass
+        result = super().schedule(team, fixture_dt)
+        result["scope"] = "domestic_league_only"
+        return result
+
     def build(self) -> Dict[str, Any]:
         run_id = self.conn.execute("INSERT INTO prematch_context_runs(status) VALUES('running') RETURNING id").fetchone()[0]
         odds_matched = availability_matched = 0
@@ -30,13 +59,18 @@ class SafePrematchContextBuilder(PrematchContextBuilder):
                 if hc["all"] or ac["all"]:
                     availability_matched += 1
 
+                schedule_scope = "team_schedule_endpoint" if home_sched.get("scope")=="team_schedule_endpoint" and away_sched.get("scope")=="team_schedule_endpoint" else "domestic_league_only"
                 quality = {
-                    "schedule_scope": "domestic_league_only",
+                    "schedule_scope": schedule_scope,
                     "schedule_complete": home_sched["days_rest"] is not None and away_sched["days_rest"] is not None,
                     "prematch_roster_or_lineup": bool((pre.get("lineup") or 0) > 0 or (pre.get("roster") or 0) > 0),
                     "odds_matched": bool(odds_match),
                     "availability_source_present": bool(absence_rows),
                     "availability_is_confirmed_current": False,
+                    "availability_stale": avail_stale,
+                    "has_ou25": bool(odds.get("ou25")),
+                    "has_btts": bool(odds.get("btts")),
+                    "has_corner85": bool(odds.get("corner85")),
                 }
 
                 params = (
@@ -82,22 +116,17 @@ class SafePrematchContextBuilder(PrematchContextBuilder):
                 "UPDATE prematch_context_runs SET finished_at=NOW(),status='success',upcoming_matches=%s,odds_matched=%s,availability_matched=%s,message='ok' WHERE id=%s",
                 (len(matches), odds_matched, availability_matched, run_id),
             )
-            result = {"status": "success", "upcoming": len(matches), "odds_matched": odds_matched, "availability_matched": availability_matched}
+            result = {"status":"success","upcoming":len(matches),"odds_matched":odds_matched,"availability_matched":availability_matched}
             return result
         except Exception as exc:
             self.conn.execute("UPDATE prematch_context_runs SET finished_at=NOW(),status='failed',message=%s WHERE id=%s", (str(exc)[:1000], run_id))
             raise
 
 
-def run_build(database_url: Optional[str] = None) -> Dict[str, Any]:
-    builder = SafePrematchContextBuilder(database_url)
+def run_build(database_url: Optional[str]=None) -> Dict[str, Any]:
+    builder=SafePrematchContextBuilder(database_url)
     try:
-        result = builder.build()
-        print("PREMATCH_CONTEXT_RESULT", json.dumps(result, separators=(",", ":")))
-        return result
-    finally:
-        builder.close()
+        result=builder.build();print("PREMATCH_CONTEXT_RESULT",json.dumps(result,separators=(",",":")));return result
+    finally:builder.close()
 
-
-if __name__ == "__main__":
-    print(json.dumps(run_build(), ensure_ascii=False, indent=2))
+if __name__=="__main__":print(json.dumps(run_build(),ensure_ascii=False,indent=2))
