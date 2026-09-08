@@ -22,6 +22,7 @@ DOWNLOAD_TOKEN = os.getenv("DOWNLOAD_TOKEN", "").strip()
 AUTO_IMPORT_FOOTBALL_DATA = os.getenv("AUTO_IMPORT_FOOTBALL_DATA", "true").lower() in {"1", "true", "yes"}
 AUTO_IMPORT_ESPN = os.getenv("AUTO_IMPORT_ESPN", "true").lower() in {"1", "true", "yes"}
 AUTO_IMPORT_ESPN_CONTEXT = os.getenv("AUTO_IMPORT_ESPN_CONTEXT", "true").lower() in {"1", "true", "yes"}
+AUTO_IMPORT_UNDERSTAT = os.getenv("AUTO_IMPORT_UNDERSTAT", "true").lower() in {"1", "true", "yes"}
 AUTO_RUN_BACKTEST = os.getenv("AUTO_RUN_BACKTEST", "true").lower() in {"1", "true", "yes"}
 log = logging.getLogger("football-export")
 
@@ -30,6 +31,7 @@ TABLES = [
     "football_data_matches", "football_data_upcoming", "football_data_source_state", "football_data_import_runs",
     "espn_current_matches", "espn_upcoming", "espn_import_state", "espn_import_runs",
     "espn_injury_snapshots", "espn_odds_snapshots", "espn_advanced_match_stats", "espn_context_runs",
+    "understat_matches", "understat_team_seasons", "understat_source_state", "understat_import_runs",
     "model_backtest_runs",
 ]
 
@@ -52,6 +54,12 @@ def _run_espn_context() -> None:
         log.info("ESPN context import completed: %s", run_import(DATABASE_URL))
     except Exception: log.exception("ESPN context import failed")
 
+def _run_understat() -> None:
+    try:
+        from understat_xg_importer import run_import
+        log.info("Understat startup import completed: %s", run_import(DATABASE_URL))
+    except Exception: log.exception("Understat xG import failed")
+
 def _run_backtest() -> None:
     try:
         from backtest_model import run_backtest
@@ -67,11 +75,13 @@ async def lifespan(app: FastAPI):
         threading.Thread(target=_run_espn_import, name="espn-current-importer", daemon=True).start()
     if DATABASE_URL and AUTO_IMPORT_ESPN_CONTEXT:
         threading.Thread(target=_run_espn_context, name="espn-context-importer", daemon=True).start()
+    if DATABASE_URL and AUTO_IMPORT_UNDERSTAT:
+        threading.Thread(target=_run_understat, name="understat-xg-importer", daemon=True).start()
     if DATABASE_URL and AUTO_RUN_BACKTEST:
         threading.Thread(target=_run_backtest, name="model-backtest", daemon=True).start()
     yield
 
-app = FastAPI(title="Football Dataset Export", version="1.5", lifespan=lifespan)
+app = FastAPI(title="Football Dataset Export", version="1.6", lifespan=lifespan)
 
 def auth(token: str) -> None:
     if not DOWNLOAD_TOKEN: raise HTTPException(500, "DOWNLOAD_TOKEN is not configured.")
@@ -82,7 +92,7 @@ def json_default(value: Any):
     return str(value)
 
 @app.get("/health")
-def health(): return {"ok": True, "version": "1.5"}
+def health(): return {"ok": True, "version": "1.6"}
 
 @app.get("/status")
 def status(token: str = Query(...)):
@@ -100,8 +110,9 @@ def status(token: str = Query(...)):
         last_fd_run = one("SELECT id, started_at, finished_at, status, historical_rows, upcoming_rows, message FROM football_data_import_runs ORDER BY id DESC LIMIT 1")
         last_espn_run = one("SELECT id, started_at, finished_at, status, completed_matches, upcoming_matches, summary_calls, message FROM espn_import_runs ORDER BY id DESC LIMIT 1")
         last_context = one("SELECT id, started_at, finished_at, injury_teams, odds_events, xg_matches, status, message FROM espn_context_runs ORDER BY id DESC LIMIT 1")
+        last_understat = one("SELECT id, started_at, finished_at, status, requests, match_rows, xg_rows, team_rows, message FROM understat_import_runs ORDER BY id DESC LIMIT 1")
         last_backtest = one("SELECT id, started_at, finished_at, model_version, train_season, test_season, matches_scored, status, metrics, market_metrics, top10_metrics, message FROM model_backtest_runs ORDER BY id DESC LIMIT 1")
-    return {"counts": out, "last_run": list(last_run) if last_run else None, "last_football_data_run": list(last_fd_run) if last_fd_run else None, "last_espn_run": list(last_espn_run) if last_espn_run else None, "last_context_run": list(last_context) if last_context else None, "last_backtest": list(last_backtest) if last_backtest else None, "generated_at": datetime.now(timezone.utc).isoformat()}
+    return {"counts": out, "last_run": list(last_run) if last_run else None, "last_football_data_run": list(last_fd_run) if last_fd_run else None, "last_espn_run": list(last_espn_run) if last_espn_run else None, "last_context_run": list(last_context) if last_context else None, "last_understat_run": list(last_understat) if last_understat else None, "last_backtest": list(last_backtest) if last_backtest else None, "generated_at": datetime.now(timezone.utc).isoformat()}
 
 def remove_file(path: str) -> None:
     try: os.remove(path)
