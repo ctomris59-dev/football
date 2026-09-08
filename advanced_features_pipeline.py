@@ -29,6 +29,11 @@ ALLOWED_RUN_TABLES = {
     "score_state_backtest_runs",
     "promotion_prior_backtest_runs",
 }
+EXPECTED_SECOND_TIER = {
+    (season, division)
+    for season in ("2324", "2425", "2526")
+    for division in ("E1", "SP2", "I2", "D2", "F2")
+}
 
 
 def _recent(table: str, hours: float) -> bool:
@@ -41,6 +46,25 @@ def _recent(table: str, hours: float) -> bool:
                 (hours,),
             ).fetchone()
         return bool(row)
+    except Exception:
+        return False
+
+
+def _second_tier_complete() -> bool:
+    """Require all 3 validation seasons x all 5 second tiers, not merely a recent run."""
+    if not DATABASE_URL:
+        return False
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            rows = conn.execute(
+                """SELECT season_code,division,COUNT(*)
+                   FROM second_tier_matches
+                   WHERE season_code IN ('2324','2425','2526')
+                     AND division IN ('E1','SP2','I2','D2','F2')
+                   GROUP BY season_code,division"""
+            ).fetchall()
+        present = {(str(season), str(division)) for season, division, count in rows if int(count or 0) >= 20}
+        return EXPECTED_SECOND_TIER.issubset(present)
     except Exception:
         return False
 
@@ -67,8 +91,8 @@ def run(database_url: str | None = None) -> Dict[str, Any]:
     started = datetime.now(timezone.utc)
     steps: Dict[str, Any] = {}
 
-    if _recent("second_tier_import_runs", SECOND_TIER_REFRESH_HOURS):
-        _skip("second_tier", steps, f"fresh<{SECOND_TIER_REFRESH_HOURS}h")
+    if _second_tier_complete() and _recent("second_tier_import_runs", SECOND_TIER_REFRESH_HOURS):
+        _skip("second_tier", steps, f"complete-15-sources-and-fresh<{SECOND_TIER_REFRESH_HOURS}h")
     else:
         from second_tier_importer_v2 import run_import
         _step("second_tier", lambda: run_import(DATABASE_URL), steps)
@@ -107,7 +131,7 @@ def run(database_url: str | None = None) -> Dict[str, Any]:
         from promotion_prior_backtest import run_backtest
         _step("promotion_prior_backtest", lambda: run_backtest(DATABASE_URL), steps)
 
-    # These are DB-only transforms and should reflect the newest scheduled odds/availability snapshot.
+    # DB-only transforms: reflect the newest scheduled odds and availability snapshots.
     from market_consensus_builder import build as build_consensus
     _step("market_consensus", lambda: build_consensus(DATABASE_URL), steps)
 
