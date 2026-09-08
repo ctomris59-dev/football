@@ -25,6 +25,7 @@ RUN_ESPN_TEAM_SCHEDULE = os.getenv("LIVE_REFRESH_ESPN_TEAM_SCHEDULE", "true").lo
 RUN_UNDERSTAT = os.getenv("LIVE_REFRESH_UNDERSTAT", "true").lower() in {"1", "true", "yes"}
 RUN_ODDSPAPI = os.getenv("LIVE_REFRESH_ODDSPAPI", "true").lower() in {"1", "true", "yes"}
 RUN_BBS = os.getenv("LIVE_REFRESH_BBS", "true").lower() in {"1", "true", "yes"}
+RUN_BBS_LINEUPS = os.getenv("LIVE_REFRESH_BBS_LINEUPS", "true").lower() in {"1", "true", "yes"}
 RUN_SOFASCORE = os.getenv("LIVE_REFRESH_SOFASCORE", "true").lower() in {"1", "true", "yes"}
 RUN_PREMATCH = os.getenv("LIVE_REFRESH_PREMATCH", "true").lower() in {"1", "true", "yes"}
 RUN_AVAILABILITY_ENRICH = os.getenv("LIVE_REFRESH_AVAILABILITY_ENRICH", "true").lower() in {"1", "true", "yes"}
@@ -73,6 +74,8 @@ def main() -> Dict[str, Any]:
             from oddspapi_canonical_importer import run_import as fn; run_step("oddspapi",lambda:fn(DATABASE_URL),steps,optional=True)
     if RUN_BBS:
         from bbs_availability_canonical import run_import as fn; run_step("bbs_availability",lambda:fn(DATABASE_URL),steps,optional=True)
+    if RUN_BBS_LINEUPS:
+        from bbs_lineups_importer import run_import as fn; run_step("bbs_lineups",lambda:fn(DATABASE_URL),steps,optional=True)
     if RUN_SOFASCORE:
         from sofascore_availability_importer import run_import as fn; run_step("sofascore_availability",lambda:fn(DATABASE_URL),steps,optional=True)
     if RUN_PREMATCH:
