@@ -95,9 +95,8 @@ def _run_oddspapi() -> None:
                 log.info("OddsPapi snapshot already collected this hour; skipping.")
                 return
         except Exception:
-            # First run: tables do not exist yet, importer will create them.
             pass
-        from oddspapi_importer import run_import
+        from oddspapi_canonical_importer import run_import
         result = run_import(DATABASE_URL)
         log.info("ODDSPAPI_STARTUP_COMPLETED %s", json.dumps(result, ensure_ascii=False, separators=(",", ":")))
     except Exception:
