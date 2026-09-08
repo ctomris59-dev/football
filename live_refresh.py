@@ -27,6 +27,7 @@ RUN_ODDSPAPI = os.getenv("LIVE_REFRESH_ODDSPAPI", "true").lower() in {"1", "true
 RUN_BBS = os.getenv("LIVE_REFRESH_BBS", "true").lower() in {"1", "true", "yes"}
 RUN_SOFASCORE = os.getenv("LIVE_REFRESH_SOFASCORE", "true").lower() in {"1", "true", "yes"}
 RUN_PREMATCH = os.getenv("LIVE_REFRESH_PREMATCH", "true").lower() in {"1", "true", "yes"}
+RUN_AVAILABILITY_ENRICH = os.getenv("LIVE_REFRESH_AVAILABILITY_ENRICH", "true").lower() in {"1", "true", "yes"}
 RUN_READINESS = os.getenv("LIVE_REFRESH_READINESS", "true").lower() in {"1", "true", "yes"}
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s | %(levelname)s | %(message)s")
@@ -76,6 +77,8 @@ def main() -> Dict[str, Any]:
         from sofascore_availability_importer import run_import as fn; run_step("sofascore_availability",lambda:fn(DATABASE_URL),steps,optional=True)
     if RUN_PREMATCH:
         from prematch_context_builder_fixed import run_build as fn; run_step("prematch_context",lambda:fn(DATABASE_URL),steps)
+    if RUN_AVAILABILITY_ENRICH:
+        from availability_enricher import run_enrich as fn; run_step("availability_enrich",lambda:fn(DATABASE_URL),steps,optional=True)
     if RUN_READINESS:
         from data_readiness_audit import run_audit as fn; run_step("data_readiness",lambda:fn(DATABASE_URL),steps)
     summary["finished_at"]=utcnow().isoformat();summary["status"]="success";log.info("LIVE_REFRESH_RESULT %s",json.dumps(summary,ensure_ascii=False,default=str,separators=(",",":")));return summary
