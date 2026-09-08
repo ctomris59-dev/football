@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Ordered live refresh pipeline for the Big Five prediction system.
 
-Runs data producers sequentially so downstream pre-match features are built only
-after the freshest available fixture, lineup/context, xG, schedule, availability
-and market snapshots are stored. Optional providers fail soft and are reported.
+Expensive/public providers are freshness-gated so an hourly/manual refresh can be
+safe without burning quota. Downstream feature/readiness/prediction steps still
+run after every refresh using the freshest stored snapshots.
 """
 from __future__ import annotations
 
@@ -25,69 +25,147 @@ RUN_ESPN_TEAM_SCHEDULE = os.getenv("LIVE_REFRESH_ESPN_TEAM_SCHEDULE", "true").lo
 RUN_UNDERSTAT = os.getenv("LIVE_REFRESH_UNDERSTAT", "true").lower() in {"1", "true", "yes"}
 RUN_ODDSPAPI = os.getenv("LIVE_REFRESH_ODDSPAPI", "true").lower() in {"1", "true", "yes"}
 RUN_FOTMOB_AVAILABILITY = os.getenv("LIVE_REFRESH_FOTMOB_AVAILABILITY", "true").lower() in {"1", "true", "yes"}
-# BBS documents football match/lineup routes but not a forward-looking soccer injury-report route.
+# BBS forward-looking soccer injuries are disabled; BBS match/lineup routes remain useful.
 RUN_BBS = os.getenv("LIVE_REFRESH_BBS", "false").lower() in {"1", "true", "yes"}
 RUN_BBS_LINEUPS = os.getenv("LIVE_REFRESH_BBS_LINEUPS", "true").lower() in {"1", "true", "yes"}
 RUN_SOFASCORE = os.getenv("LIVE_REFRESH_SOFASCORE", "true").lower() in {"1", "true", "yes"}
 RUN_PREMATCH = os.getenv("LIVE_REFRESH_PREMATCH", "true").lower() in {"1", "true", "yes"}
 RUN_AVAILABILITY_ENRICH = os.getenv("LIVE_REFRESH_AVAILABILITY_ENRICH", "true").lower() in {"1", "true", "yes"}
 RUN_READINESS = os.getenv("LIVE_REFRESH_READINESS", "true").lower() in {"1", "true", "yes"}
+RUN_PREDICTIONS = os.getenv("LIVE_REFRESH_PREDICTIONS", "true").lower() in {"1", "true", "yes"}
+
+ESPN_CONTEXT_REFRESH_HOURS = float(os.getenv("ESPN_CONTEXT_REFRESH_HOURS", "2"))
+TEAM_SCHEDULE_REFRESH_HOURS = float(os.getenv("TEAM_SCHEDULE_REFRESH_HOURS", "12"))
+ODDSPAPI_REFRESH_HOURS = float(os.getenv("ODDSPAPI_REFRESH_HOURS", "8"))
+FOTMOB_REFRESH_HOURS = float(os.getenv("FOTMOB_REFRESH_HOURS", "6"))
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("live-refresh")
 
-def utcnow() -> datetime:return datetime.now(timezone.utc)
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
 
 def run_step(name: str, fn: Callable[[], Any], summary: Dict[str, Any], *, optional: bool = False) -> None:
     try:
-        result = fn(); summary[name] = {"status":"ok","result":result}; log.info("LIVE_REFRESH_STEP step=%s status=ok result=%s",name,result)
+        result = fn()
+        summary[name] = {"status": "ok", "result": result}
+        log.info("LIVE_REFRESH_STEP step=%s status=ok result=%s", name, result)
     except Exception as exc:
-        summary[name] = {"status":"failed","error":str(exc)}
-        if optional: log.warning("LIVE_REFRESH_STEP step=%s status=failed_optional error=%s",name,exc)
-        else: log.exception("LIVE_REFRESH_STEP step=%s status=failed",name); raise
+        summary[name] = {"status": "failed", "error": str(exc)}
+        if optional:
+            log.warning("LIVE_REFRESH_STEP step=%s status=failed_optional error=%s", name, exc)
+        else:
+            log.exception("LIVE_REFRESH_STEP step=%s status=failed", name)
+            raise
 
-def oddspapi_fresh_this_hour() -> bool:
-    if not DATABASE_URL:return False
+
+def recent_success(table: str, hours: float) -> bool:
+    if not DATABASE_URL or hours <= 0:
+        return False
+    allowed = {
+        "espn_context_runs", "espn_team_schedule_runs", "oddspapi_import_runs",
+        "fotmob_availability_runs", "understat_import_runs",
+    }
+    if table not in allowed:
+        return False
     try:
         with psycopg.connect(DATABASE_URL) as conn:
-            row=conn.execute("SELECT 1 FROM oddspapi_import_runs WHERE status='success' AND finished_at>=date_trunc('hour',NOW()) LIMIT 1").fetchone()
+            row = conn.execute(
+                f"SELECT 1 FROM {table} WHERE status='success' AND finished_at >= NOW()-(%s||' hours')::interval LIMIT 1",
+                (hours,),
+            ).fetchone()
         return bool(row)
-    except Exception:return False
+    except Exception:
+        return False
+
+
+def skip(steps: Dict[str, Any], name: str, reason: str) -> None:
+    steps[name] = {"status": "skipped", "reason": reason}
+    log.info("LIVE_REFRESH_STEP step=%s status=skipped reason=%s", name, reason)
+
 
 def main() -> Dict[str, Any]:
-    if not DATABASE_URL:raise RuntimeError("Missing DATABASE_URL")
-    started=utcnow();summary:Dict[str,Any]={"started_at":started.isoformat(),"steps":{}};steps=summary["steps"]
-    if RUN_FD2324:
-        from football_data_2324_importer import run_import as fn; run_step("football_data_2324",lambda:fn(DATABASE_URL),steps,optional=True)
-    if RUN_FOOTBALL_DATA:
-        from football_data_mirror_importer import run_import as fn; run_step("football_data",lambda:fn(DATABASE_URL),steps,optional=True)
-    if RUN_ESPN:
-        from espn_current_importer import run_import as fn; run_step("espn_current",lambda:fn(DATABASE_URL),steps)
-    if RUN_ESPN_CONTEXT:
-        from espn_prematch_refresh import run_import as fn; run_step("espn_context",lambda:fn(DATABASE_URL),steps,optional=True)
-    if RUN_ESPN_TEAM_SCHEDULE:
-        from espn_team_schedule_importer import run_import as fn; run_step("espn_team_schedule",lambda:fn(DATABASE_URL),steps,optional=True)
-    if RUN_UNDERSTAT:
-        from understat_xg_importer import run_import as fn; run_step("understat",lambda:fn(DATABASE_URL),steps,optional=True)
-    if RUN_ODDSPAPI:
-        if oddspapi_fresh_this_hour():
-            steps["oddspapi"]={"status":"skipped","reason":"successful snapshot already exists this UTC hour"};log.info("LIVE_REFRESH_STEP step=oddspapi status=skipped reason=same_hour_success")
-        else:
-            from oddspapi_canonical_importer import run_import as fn; run_step("oddspapi",lambda:fn(DATABASE_URL),steps,optional=True)
-    if RUN_FOTMOB_AVAILABILITY:
-        from fotmob_availability_importer import run_import as fn; run_step("fotmob_availability",lambda:fn(DATABASE_URL),steps,optional=True)
-    if RUN_BBS:
-        from bbs_availability_canonical import run_import as fn; run_step("bbs_availability",lambda:fn(DATABASE_URL),steps,optional=True)
-    if RUN_BBS_LINEUPS:
-        from bbs_lineups_importer import run_import as fn; run_step("bbs_lineups",lambda:fn(DATABASE_URL),steps,optional=True)
-    if RUN_SOFASCORE:
-        from sofascore_availability_www import run_import as fn; run_step("sofascore_availability",lambda:fn(DATABASE_URL),steps,optional=True)
-    if RUN_PREMATCH:
-        from prematch_context_builder_fixed import run_build as fn; run_step("prematch_context",lambda:fn(DATABASE_URL),steps)
-    if RUN_AVAILABILITY_ENRICH:
-        from availability_enricher_v2 import run_enrich as fn; run_step("availability_enrich",lambda:fn(DATABASE_URL),steps,optional=True)
-    if RUN_READINESS:
-        from data_readiness_audit_v3 import run_audit as fn; run_step("data_readiness",lambda:fn(DATABASE_URL),steps)
-    summary["finished_at"]=utcnow().isoformat();summary["status"]="success";log.info("LIVE_REFRESH_RESULT %s",json.dumps(summary,ensure_ascii=False,default=str,separators=(",",":")));return summary
+    if not DATABASE_URL:
+        raise RuntimeError("Missing DATABASE_URL")
+    started = utcnow()
+    summary: Dict[str, Any] = {"started_at": started.isoformat(), "steps": {}}
+    steps = summary["steps"]
 
-if __name__=="__main__":print(json.dumps(main(),ensure_ascii=False,indent=2,default=str))
+    if RUN_FD2324:
+        from football_data_2324_importer import run_import as fn
+        run_step("football_data_2324", lambda: fn(DATABASE_URL), steps, optional=True)
+    if RUN_FOOTBALL_DATA:
+        from football_data_mirror_importer import run_import as fn
+        run_step("football_data", lambda: fn(DATABASE_URL), steps, optional=True)
+    if RUN_ESPN:
+        from espn_current_importer import run_import as fn
+        run_step("espn_current", lambda: fn(DATABASE_URL), steps)
+
+    if RUN_ESPN_CONTEXT:
+        if recent_success("espn_context_runs", ESPN_CONTEXT_REFRESH_HOURS):
+            skip(steps, "espn_context", f"fresh<{ESPN_CONTEXT_REFRESH_HOURS}h")
+        else:
+            from espn_prematch_refresh import run_import as fn
+            run_step("espn_context", lambda: fn(DATABASE_URL), steps, optional=True)
+
+    if RUN_ESPN_TEAM_SCHEDULE:
+        if recent_success("espn_team_schedule_runs", TEAM_SCHEDULE_REFRESH_HOURS):
+            skip(steps, "espn_team_schedule", f"fresh<{TEAM_SCHEDULE_REFRESH_HOURS}h")
+        else:
+            from espn_team_schedule_importer import run_import as fn
+            run_step("espn_team_schedule", lambda: fn(DATABASE_URL), steps, optional=True)
+
+    if RUN_UNDERSTAT:
+        if recent_success("understat_import_runs", 5.5):
+            skip(steps, "understat", "fresh<5.5h")
+        else:
+            from understat_xg_importer import run_import as fn
+            run_step("understat", lambda: fn(DATABASE_URL), steps, optional=True)
+
+    if RUN_ODDSPAPI:
+        if recent_success("oddspapi_import_runs", ODDSPAPI_REFRESH_HOURS):
+            skip(steps, "oddspapi", f"fresh<{ODDSPAPI_REFRESH_HOURS}h")
+        else:
+            from oddspapi_canonical_importer import run_import as fn
+            run_step("oddspapi", lambda: fn(DATABASE_URL), steps, optional=True)
+
+    if RUN_FOTMOB_AVAILABILITY:
+        if recent_success("fotmob_availability_runs", FOTMOB_REFRESH_HOURS):
+            skip(steps, "fotmob_availability", f"fresh<{FOTMOB_REFRESH_HOURS}h")
+        else:
+            from fotmob_availability_importer import run_import as fn
+            run_step("fotmob_availability", lambda: fn(DATABASE_URL), steps, optional=True)
+
+    if RUN_BBS:
+        from bbs_availability_canonical import run_import as fn
+        run_step("bbs_availability", lambda: fn(DATABASE_URL), steps, optional=True)
+    if RUN_BBS_LINEUPS:
+        from bbs_lineups_importer import run_import as fn
+        run_step("bbs_lineups", lambda: fn(DATABASE_URL), steps, optional=True)
+    if RUN_SOFASCORE:
+        from sofascore_availability_www import run_import as fn
+        run_step("sofascore_availability", lambda: fn(DATABASE_URL), steps, optional=True)
+
+    if RUN_PREMATCH:
+        from prematch_context_builder_fixed import run_build as fn
+        run_step("prematch_context", lambda: fn(DATABASE_URL), steps)
+    if RUN_AVAILABILITY_ENRICH:
+        from availability_enricher_v2 import run_enrich as fn
+        run_step("availability_enrich", lambda: fn(DATABASE_URL), steps, optional=True)
+    if RUN_READINESS:
+        from data_readiness_audit_v4 import run_audit as fn
+        run_step("data_readiness", lambda: fn(DATABASE_URL), steps)
+    if RUN_PREDICTIONS:
+        from production_predictor import run_predictions as fn
+        run_step("production_predictions", lambda: fn(DATABASE_URL), steps)
+
+    summary["finished_at"] = utcnow().isoformat()
+    summary["status"] = "success"
+    log.info("LIVE_REFRESH_RESULT %s", json.dumps(summary, ensure_ascii=False, default=str, separators=(",", ":")))
+    return summary
+
+
+if __name__ == "__main__":
+    print(json.dumps(main(), ensure_ascii=False, indent=2, default=str))
