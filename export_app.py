@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Protected dataset/status service plus background data/model jobs."""
+"""Protected dataset/status service plus ordered live data/model jobs."""
 from __future__ import annotations
 
 import json
@@ -20,19 +20,18 @@ from starlette.background import BackgroundTask
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DOWNLOAD_TOKEN = os.getenv("DOWNLOAD_TOKEN", "").strip()
 
+
 def env_bool(name: str, default: str = "true") -> bool:
     return os.getenv(name, default).lower() in {"1", "true", "yes"}
 
-AUTO_IMPORT_FOOTBALL_DATA = env_bool("AUTO_IMPORT_FOOTBALL_DATA")
-AUTO_IMPORT_ESPN = env_bool("AUTO_IMPORT_ESPN")
-AUTO_IMPORT_ESPN_CONTEXT = env_bool("AUTO_IMPORT_ESPN_CONTEXT")
-AUTO_IMPORT_UNDERSTAT = env_bool("AUTO_IMPORT_UNDERSTAT")
-AUTO_IMPORT_ODDSPAPI = env_bool("AUTO_IMPORT_ODDSPAPI")
+
+AUTO_LIVE_REFRESH = env_bool("AUTO_LIVE_REFRESH")
 AUTO_RUN_BACKTEST = env_bool("AUTO_RUN_BACKTEST", "false")
 AUTO_BACKTEST_NEW_MODEL = env_bool("AUTO_BACKTEST_NEW_MODEL")
 AUTO_BACKTEST_HYBRID = env_bool("AUTO_BACKTEST_HYBRID")
 AUTO_BACKTEST_VALUE = env_bool("AUTO_BACKTEST_VALUE")
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("football-export")
 
 TABLES = [
@@ -42,65 +41,19 @@ TABLES = [
     "espn_injury_snapshots", "espn_odds_snapshots", "espn_prematch_snapshots", "espn_advanced_match_stats", "espn_context_runs",
     "understat_matches", "understat_team_seasons", "understat_source_state", "understat_import_runs",
     "oddspapi_tournaments", "oddspapi_market_catalog", "oddspapi_fixture_snapshots", "oddspapi_market_prices", "oddspapi_import_runs",
+    "bbs_absence_snapshots", "bbs_availability_runs",
+    "prematch_feature_snapshots", "prematch_context_runs",
     "model_backtest_runs", "model_policy_backtest_runs", "model_value_backtest_runs",
 ]
 
 
-def _run_football_data_import() -> None:
+def _run_live_refresh() -> None:
     try:
-        from football_data_mirror_importer import run_import
-        log.info("Football-Data startup import completed: %s", run_import(DATABASE_URL))
+        from live_refresh import main
+        result = main()
+        log.info("LIVE_REFRESH_STARTUP_COMPLETED %s", json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":")))
     except Exception:
-        log.exception("Football-Data startup import failed")
-
-
-def _run_espn_import() -> None:
-    try:
-        from espn_current_importer import run_import
-        log.info("ESPN startup import completed: %s", run_import(DATABASE_URL))
-    except Exception:
-        log.exception("ESPN startup import failed")
-
-
-def _run_espn_context() -> None:
-    try:
-        from espn_context_importer import run_import
-        log.info("ESPN context import completed: %s", run_import(DATABASE_URL))
-    except Exception:
-        log.exception("ESPN context import failed")
-
-
-def _run_understat() -> None:
-    try:
-        from understat_xg_importer import run_import
-        log.info("Understat startup import completed: %s", run_import(DATABASE_URL))
-    except Exception:
-        log.exception("Understat xG import failed")
-
-
-def _run_oddspapi() -> None:
-    try:
-        # Protect the free quota from repeated deploys during the same UTC hour.
-        try:
-            with psycopg.connect(DATABASE_URL) as conn:
-                fresh = conn.execute(
-                    """
-                    SELECT 1 FROM oddspapi_import_runs
-                    WHERE status='success'
-                      AND finished_at >= date_trunc('hour', NOW())
-                    LIMIT 1
-                    """
-                ).fetchone()
-            if fresh:
-                log.info("OddsPapi snapshot already collected this hour; skipping.")
-                return
-        except Exception:
-            pass
-        from oddspapi_canonical_importer import run_import
-        result = run_import(DATABASE_URL)
-        log.info("ODDSPAPI_STARTUP_COMPLETED %s", json.dumps(result, ensure_ascii=False, separators=(",", ":")))
-    except Exception:
-        log.exception("OddsPapi market import failed")
+        log.exception("Ordered live refresh failed")
 
 
 def _run_backtest() -> None:
@@ -171,16 +124,8 @@ def start_thread(target: Callable[[], None], name: str) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if DATABASE_URL and AUTO_IMPORT_FOOTBALL_DATA:
-        start_thread(_run_football_data_import, "football-data-importer")
-    if DATABASE_URL and AUTO_IMPORT_ESPN:
-        start_thread(_run_espn_import, "espn-current-importer")
-    if DATABASE_URL and AUTO_IMPORT_ESPN_CONTEXT:
-        start_thread(_run_espn_context, "espn-context-importer")
-    if DATABASE_URL and AUTO_IMPORT_UNDERSTAT:
-        start_thread(_run_understat, "understat-xg-importer")
-    if DATABASE_URL and AUTO_IMPORT_ODDSPAPI:
-        start_thread(_run_oddspapi, "oddspapi-market-importer")
+    if DATABASE_URL and AUTO_LIVE_REFRESH:
+        start_thread(_run_live_refresh, "ordered-live-refresh")
     if DATABASE_URL and AUTO_RUN_BACKTEST:
         start_thread(_run_backtest, "model-backtest")
     elif DATABASE_URL and AUTO_BACKTEST_NEW_MODEL:
@@ -192,7 +137,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Football Dataset Export", version="2.0", lifespan=lifespan)
+app = FastAPI(title="Football Dataset Export", version="2.1", lifespan=lifespan)
 
 
 def auth(token: str) -> None:
@@ -210,7 +155,7 @@ def json_default(value: Any):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": "2.0"}
+    return {"ok": True, "version": "2.1", "live_refresh": AUTO_LIVE_REFRESH}
 
 
 @app.get("/status")
@@ -240,18 +185,30 @@ def status(token: str = Query(...)):
         last_context = one("SELECT id, started_at, finished_at, injury_teams, odds_events, prematch_events, xg_matches, status, message FROM espn_context_runs ORDER BY id DESC LIMIT 1")
         last_understat = one("SELECT id, started_at, finished_at, status, requests, match_rows, xg_rows, team_rows, message FROM understat_import_runs ORDER BY id DESC LIMIT 1")
         last_oddspapi = one("SELECT id, started_at, finished_at, status, api_calls, tournament_count, fixture_count, price_rows, ou25_fixtures, btts_fixtures, corner85_fixtures, message FROM oddspapi_import_runs ORDER BY id DESC LIMIT 1")
+        last_bbs = one("SELECT id, started_at, finished_at, status, api_calls, leagues_ok, rows_stored, newest_as_of, stale_leagues, message FROM bbs_availability_runs ORDER BY id DESC LIMIT 1")
+        last_prematch = one("SELECT id, started_at, finished_at, status, upcoming_matches, odds_matched, availability_matched, message FROM prematch_context_runs ORDER BY id DESC LIMIT 1")
         last_backtest = one("SELECT id, started_at, finished_at, model_version, train_season, test_season, matches_scored, status, metrics, market_metrics, top10_metrics, message FROM model_backtest_runs ORDER BY id DESC LIMIT 1")
         last_policy = one("SELECT id, started_at, finished_at, policy_version, train_season, test_season, matches_scored, candidate_picks, metrics, status, message FROM model_policy_backtest_runs ORDER BY id DESC LIMIT 1")
         last_value = one("SELECT id, started_at, finished_at, version, train_season, test_season, matches_scored, odds_matches, metrics, status, message FROM model_value_backtest_runs ORDER BY id DESC LIMIT 1")
+        season_counts = None
+        try:
+            season_counts = conn.execute(
+                "SELECT season_code,COUNT(*) FROM football_data_matches GROUP BY season_code ORDER BY season_code"
+            ).fetchall()
+        except Exception:
+            conn.rollback()
 
     return {
         "counts": out,
+        "season_counts": [[str(a), int(b)] for a, b in season_counts] if season_counts else None,
         "last_run": list(last_run) if last_run else None,
         "last_football_data_run": list(last_fd_run) if last_fd_run else None,
         "last_espn_run": list(last_espn_run) if last_espn_run else None,
         "last_context_run": list(last_context) if last_context else None,
         "last_understat_run": list(last_understat) if last_understat else None,
         "last_oddspapi_run": list(last_oddspapi) if last_oddspapi else None,
+        "last_bbs_run": list(last_bbs) if last_bbs else None,
+        "last_prematch_context": list(last_prematch) if last_prematch else None,
         "last_backtest": list(last_backtest) if last_backtest else None,
         "last_policy_backtest": list(last_policy) if last_policy else None,
         "last_value_backtest": list(last_value) if last_value else None,
@@ -274,11 +231,7 @@ def download(token: str = Query(...)):
     tmp = tempfile.NamedTemporaryFile(prefix="football_dataset_", suffix=".zip", delete=False)
     tmp.close()
     zip_path = tmp.name
-    manifest = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "format": "JSON Lines (one JSON object per row)",
-        "tables": {},
-    }
+    manifest = {"generated_at": datetime.now(timezone.utc).isoformat(), "format": "JSON Lines (one JSON object per row)", "tables": {}}
     with psycopg.connect(DATABASE_URL) as conn, zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for table in TABLES:
             try:
