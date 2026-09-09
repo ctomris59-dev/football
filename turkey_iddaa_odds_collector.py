@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Collect official Turkish İddaa sportsbook prices for the production markets.
+"""Collect official Turkish İddaa prices for this weekend's Big-Five fixtures.
 
-The collector is deliberately fail-closed. It only stores a price after an official
-İddaa fixture is unambiguously matched to a production fixture and the market is one
-of: goals O2.5, BTTS Yes, or corners O8.5. Stored prices feed turkey_value_workflow;
-foreign bookmaker prices never enter the Turkey value decision.
+This collector is intentionally independent of the legacy production readiness gate.
+It matches official İddaa events directly to ESPN upcoming fixtures for Friday-Monday
+and stores only the three markets used by the Thursday decision engine:
+O2.5 goals, BTTS Yes, O8.5 corners.
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from typing import Any, Dict, Iterable, Optional
 import psycopg
 import requests
 
+from thursday_decision_engine import weekend_bounds
 from turkey_value_workflow import store_price, valid_price
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -48,31 +49,15 @@ CREATE TABLE IF NOT EXISTS turkey_odds_import_runs(
 """
 
 ALIASES = {
-    "man utd": "manchester united",
-    "man united": "manchester united",
-    "man city": "manchester city",
-    "spurs": "tottenham hotspur",
-    "tottenham": "tottenham hotspur",
-    "wolves": "wolverhampton wanderers",
-    "wolverhampton": "wolverhampton wanderers",
-    "brighton": "brighton hove albion",
-    "west ham": "west ham united",
-    "newcastle": "newcastle united",
-    "nottingham forest": "nottingham forest",
-    "nottm forest": "nottingham forest",
-    "hoffenheim": "tsg hoffenheim",
-    "stuttgart": "vfb stuttgart",
-    "koln": "fc koln",
-    "cologne": "fc koln",
-    "frankfurt": "eintracht frankfurt",
-    "gladbach": "borussia monchengladbach",
-    "monchengladbach": "borussia monchengladbach",
-    "leverkusen": "bayer leverkusen",
-    "leipzig": "rb leipzig",
-    "inter": "inter milan",
-    "internazionale": "inter milan",
-    "ac milan": "milan",
-    "psg": "paris saint germain",
+    "man utd": "manchester united", "man united": "manchester united", "man city": "manchester city",
+    "spurs": "tottenham hotspur", "tottenham": "tottenham hotspur",
+    "wolves": "wolverhampton wanderers", "wolverhampton": "wolverhampton wanderers",
+    "brighton": "brighton hove albion", "west ham": "west ham united", "newcastle": "newcastle united",
+    "nottm forest": "nottingham forest", "hoffenheim": "tsg hoffenheim", "stuttgart": "vfb stuttgart",
+    "koln": "fc koln", "cologne": "fc koln", "frankfurt": "eintracht frankfurt",
+    "gladbach": "borussia monchengladbach", "monchengladbach": "borussia monchengladbach",
+    "leverkusen": "bayer leverkusen", "leipzig": "rb leipzig", "inter": "inter milan",
+    "internazionale": "inter milan", "ac milan": "milan", "psg": "paris saint germain",
 }
 
 CANONICAL_SELECTION = {
@@ -125,11 +110,11 @@ def _line_value(market: Dict[str, Any], rendered_name: str) -> Optional[float]:
             return float(str(raw).replace(",", "."))
         except ValueError:
             pass
-    match = re.search(r"(?<!\d)(\d+[\.,]\d+)(?!\d)", rendered_name)
-    if not match:
+    m = re.search(r"(?<!\d)(\d+[\.,]\d+)(?!\d)", rendered_name)
+    if not m:
         return None
     try:
-        return float(match.group(1).replace(",", "."))
+        return float(m.group(1).replace(",", "."))
     except ValueError:
         return None
 
@@ -141,13 +126,12 @@ def classify_market(rendered_name: str, market: Dict[str, Any]) -> Optional[str]
         return None
     if "toplam korner sayisi" in n or "total corners" in n:
         return "corners_over_8_5" if line is not None and abs(line - 8.5) < 1e-9 else None
-    # Avoid combination markets such as result+BTTS or O/U+BTTS.
-    if (n == "karsilikli gol" or n == "both teams to score"):
+    if n in {"karsilikli gol", "both teams to score"}:
         return "btts"
     forbidden = ("mac sonucu", "match result", "karsilikli gol", "both teams", "ev sahibi", "deplasman", "home team", "away team", "korner")
     if any(token in n for token in forbidden):
         return None
-    if line is not None and abs(line - 2.5) < 1e-9 and ("alt ust" in n or "alti ustu" in n or "under over" in n or "toplam gol" in n or "total goals" in n):
+    if line is not None and abs(line - 2.5) < 1e-9 and any(x in n for x in ("alt ust", "alti ustu", "under over", "toplam gol", "total goals")):
         return "over_2_5"
     return None
 
@@ -155,10 +139,7 @@ def classify_market(rendered_name: str, market: Dict[str, Any]) -> Optional[str]
 def wanted_outcome(market_key: str, outcomes: Iterable[Dict[str, Any]]) -> Optional[float]:
     for outcome in outcomes or []:
         name = _ascii(outcome.get("n"))
-        if market_key == "btts":
-            wanted = name in {"var", "evet", "yes"}
-        else:
-            wanted = name in {"ust", "over"} or name.startswith("ust ") or name.startswith("over ")
+        wanted = name in {"var", "evet", "yes"} if market_key == "btts" else (name in {"ust", "over"} or name.startswith("ust ") or name.startswith("over "))
         if wanted and valid_price(outcome.get("odd")):
             return float(outcome["odd"])
     return None
@@ -179,25 +160,17 @@ def _event_time(event: Dict[str, Any]) -> Optional[datetime]:
         return None
 
 
-def _production_fixtures(conn) -> tuple[Optional[int], list[Dict[str, Any]], Dict[tuple[str, str], str]]:
-    row = conn.execute("SELECT MAX(run_id) FROM production_predictions").fetchone()
-    run_id = int(row[0]) if row and row[0] else None
-    if not run_id:
-        return None, [], {}
-    rows = conn.execute("""
-        SELECT DISTINCT event_id,match_date,home_team,away_team
-        FROM production_predictions
-        WHERE run_id=%s AND provisional_ready=TRUE
-          AND match_date>=NOW()-INTERVAL '2 hours' AND match_date<=NOW()+INTERVAL '8 days'
-    """, (run_id,)).fetchall()
-    fixtures = [{"event_id": str(r[0]), "match_date": r[1], "home": r[2], "away": r[3]} for r in rows]
-    selections = {}
-    for eid, market, selection in conn.execute("""
-        SELECT event_id,market,selection FROM production_predictions
-        WHERE run_id=%s AND provisional_ready=TRUE AND market=ANY(%s)
-    """, (run_id, list(TARGET_MARKETS))).fetchall():
-        selections[(str(eid), str(market))] = str(selection)
-    return run_id, fixtures, selections
+def _weekend_fixtures(conn) -> tuple[list[Dict[str, Any]], datetime, datetime]:
+    _, start, end = weekend_bounds()
+    rows = conn.execute(
+        """SELECT event_id,match_date,home_team,away_team
+             FROM espn_upcoming
+            WHERE is_current=TRUE AND match_date>=%s AND match_date<%s
+            ORDER BY match_date""",
+        (start, end),
+    ).fetchall()
+    fixtures = [{"event_id": str(r[0]), "match_date": r[1], "home": str(r[2]), "away": str(r[3])} for r in rows]
+    return fixtures, start, end
 
 
 def match_fixture(event: Dict[str, Any], fixtures: list[Dict[str, Any]]) -> tuple[Optional[Dict[str, Any]], bool]:
@@ -216,7 +189,6 @@ def match_fixture(event: Dict[str, Any], fixtures: list[Dict[str, Any]]) -> tupl
         aws = team_score(event.get("an"), fixture["away"])
         if hs < MATCH_SIDE_MIN or aws < MATCH_SIDE_MIN:
             continue
-        # Team identity dominates; kickoff proximity only breaks close matches.
         score = hs + aws + max(0.0, 0.08 * (1.0 - hours / max(1.0, FIXTURE_TOLERANCE_HOURS)))
         if hs + aws >= MATCH_SCORE_MIN:
             ranked.append((score, fixture))
@@ -243,20 +215,21 @@ def run_import(database_url: str = DATABASE_URL) -> Dict[str, Any]:
     started = datetime.now(timezone.utc)
     with psycopg.connect(database_url, autocommit=True) as conn:
         conn.execute(DDL)
-        run_row = conn.execute("INSERT INTO turkey_odds_import_runs(started_at) VALUES(%s) RETURNING id", (started,)).fetchone()
-        import_run_id = int(run_row[0])
+        import_run_id = int(conn.execute("INSERT INTO turkey_odds_import_runs(started_at) VALUES(%s) RETURNING id", (started,)).fetchone()[0])
         try:
-            production_run_id, fixtures, selections = _production_fixtures(conn)
+            fixtures, horizon_start, horizon_end = _weekend_fixtures(conn)
             if not fixtures:
-                raise RuntimeError("No current production fixtures available for safe İddaa matching")
+                raise RuntimeError("No current weekend ESPN fixtures available for safe İddaa matching")
+
             session = requests.Session()
-            session.headers.update({"Accept": "application/json", "User-Agent": "football-value-monitor/1.0"})
+            session.headers.update({"Accept": "application/json", "User-Agent": "football-thursday-value/2.0"})
             events_payload = _get_json(session, "events?st=1&type=0&version=0")
             config_payload = _get_json(session, "get_market_config")
             events = ((events_payload.get("data") or {}).get("events") or [])
             market_config = ((config_payload.get("data") or {}).get("m") or {})
-            matched = ambiguous = target_rows = stored = 0
+
             matched_event_ids = set()
+            ambiguous = target_rows = stored = 0
             for event in events:
                 fixture, is_ambiguous = match_fixture(event, fixtures)
                 if is_ambiguous:
@@ -273,30 +246,27 @@ def run_import(database_url: str = DATABASE_URL) -> Dict[str, Any]:
                     if price is None:
                         continue
                     target_rows += 1
-                    selection = selections.get((fixture["event_id"], key), CANONICAL_SELECTION[key])
-                    if store_price(conn, fixture["event_id"], key, selection, SOURCE, price):
+                    if store_price(conn, fixture["event_id"], key, CANONICAL_SELECTION[key], SOURCE, price):
                         stored += 1
+
             matched = len(matched_event_ids)
             result = {
-                "status": "success",
-                "import_run_id": import_run_id,
-                "production_run_id": production_run_id,
-                "official_events": len(events),
-                "production_fixtures": len(fixtures),
-                "matched_fixtures": matched,
-                "ambiguous_fixtures": ambiguous,
-                "target_market_rows": target_rows,
-                "stored_prices": stored,
-                "source": SOURCE,
+                "status": "success", "import_run_id": import_run_id, "official_events": len(events),
+                "production_fixtures": len(fixtures), "matched_fixtures": matched,
+                "fixture_coverage": round(matched / len(fixtures), 4) if fixtures else 0.0,
+                "ambiguous_fixtures": ambiguous, "target_market_rows": target_rows, "stored_prices": stored,
+                "source": SOURCE, "horizon_start": horizon_start, "horizon_end": horizon_end,
             }
-            conn.execute("""
-                UPDATE turkey_odds_import_runs SET finished_at=NOW(),status='success',official_events=%s,
-                production_fixtures=%s,matched_fixtures=%s,target_market_rows=%s,stored_prices=%s,
-                ambiguous_fixtures=%s,message=%s WHERE id=%s
-            """, (len(events), len(fixtures), matched, target_rows, stored, ambiguous, json.dumps(result, ensure_ascii=False), import_run_id))
+            conn.execute(
+                """UPDATE turkey_odds_import_runs SET finished_at=NOW(),status='success',official_events=%s,
+                          production_fixtures=%s,matched_fixtures=%s,target_market_rows=%s,stored_prices=%s,
+                          ambiguous_fixtures=%s,message=%s WHERE id=%s""",
+                (len(events), len(fixtures), matched, target_rows, stored, ambiguous, json.dumps(result, ensure_ascii=False, default=str), import_run_id),
+            )
+            print("TURKEY_IDDAA_ODDS_RESULT", json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":")), flush=True)
             return result
         except Exception as exc:
-            conn.execute("UPDATE turkey_odds_import_runs SET finished_at=NOW(),status='failed',message=%s WHERE id=%s", (str(exc)[:1000], import_run_id))
+            conn.execute("UPDATE turkey_odds_import_runs SET finished_at=NOW(),status='failed',message=%s WHERE id=%s", (str(exc)[:1200], import_run_id))
             raise
 
 
