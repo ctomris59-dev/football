@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Small control/read API for the Thursday-first football betting workflow.
+"""Small control/read API for the finalized Thursday betting workflow.
 
 Primary product surface:
-- Thursday model/context refresh
-- official Turkey opening-price watch
-- one frozen weekly decision containing exactly two lists
+- Thursday model/context refresh;
+- official Turkey opening-price watch;
+- international paired same-book no-vig validation;
+- one frozen weekly decision containing exactly two lists.
 
 Legacy research tables remain in Postgres for validation, but are not part of the
 weekly user-facing decision path.
@@ -43,9 +44,9 @@ refresh_state: dict[str, Any] = {
     "last_error": None,
 }
 
-# Only data that directly supports the Thursday decision is surfaced/exported here.
-# Older research/backtest tables are intentionally left in Postgres but hidden from
-# this operational API so they cannot create user-facing noise.
+# Only data directly supporting the Thursday decision is surfaced/exported. Raw
+# provider/research clutter stays hidden; the international layer exposes only its
+# de-vigged consensus/reference tables.
 ACTIVE_TABLES = [
     "football_data_matches",
     "espn_current_matches",
@@ -57,6 +58,10 @@ ACTIVE_TABLES = [
     "turkey_odds_snapshots",
     "turkey_opening_odds",
     "turkey_odds_import_runs",
+    "market_consensus_snapshots",
+    "market_consensus_runs",
+    "international_market_refs",
+    "international_market_ref_runs",
     "thursday_decision_runs",
     "thursday_watch_checks",
     "thursday_final_decisions",
@@ -117,15 +122,15 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Football Thursday Decision Service", version="5.0", lifespan=lifespan)
+app = FastAPI(title="Football Thursday Decision Service", version="5.1", lifespan=lifespan)
 
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
-        "version": "5.0",
-        "workflow": "Thursday -> two lists -> bet -> done",
+        "version": "5.1",
+        "workflow": "Thursday -> model + international no-vig + Turkey price -> two lists -> bet -> done",
         "auto_live_refresh": AUTO_LIVE_REFRESH,
         "refresh": dict(refresh_state),
     }
@@ -159,12 +164,7 @@ def validation_run(token: Optional[str] = Query(None)):
 
 @app.get("/opening-watch")
 def opening_watch():
-    """Public, rate-limited-by-DB check used by the small Render watcher cron.
-
-    It exposes no secrets and cannot change a finalized weekly decision. The watcher
-    itself refuses to run outside Thursday evening / Friday-morning fallback, and
-    duplicate calls within the same hour are ignored persistently.
-    """
+    """Public narrow endpoint used only to detect/freeze the Thursday opening list."""
     if not DATABASE_URL:
         raise HTTPException(500, "DATABASE_URL is not configured.")
     if not opening_lock.acquire(blocking=False):
@@ -179,7 +179,7 @@ def opening_watch():
 
 @app.get("/thursday-list")
 def thursday_list():
-    """Return only the frozen weekly betting decision; otherwise say it is pending."""
+    """Return only the immutable frozen weekly decision; otherwise report pending."""
     if not DATABASE_URL:
         raise HTTPException(500, "DATABASE_URL is not configured.")
     from thursday_opening_watch import latest_final
@@ -188,7 +188,7 @@ def thursday_list():
         return {
             "ok": True,
             "status": "pending",
-            "message": "This week's Turkish opening-price decision has not been finalized yet.",
+            "message": "This week's model + international + Turkey opening decision has not been finalized yet.",
         }
     payload = final.get("payload") or {}
     return {
@@ -196,6 +196,8 @@ def thursday_list():
         "status": "finalized",
         "week_key": final.get("week_key"),
         "finalized_at": final.get("finalized_at"),
+        "source": final.get("source"),
+        "sources": payload.get("sources") or {},
         "high_confidence": payload.get("high_confidence") or [],
         "high_confidence_value": payload.get("high_confidence_value") or [],
         "official_fixture_coverage": payload.get("official_fixture_coverage"),
@@ -233,12 +235,25 @@ def status(token: Optional[str] = Query(None), authorization: Optional[str] = He
         except Exception:
             conn.rollback()
             latest["thursday_decision"] = None
+        try:
+            row = conn.execute(
+                """SELECT started_at,finished_at,status,target_fixtures,matched_fixtures,reference_rows,message
+                   FROM international_market_ref_runs ORDER BY id DESC LIMIT 1"""
+            ).fetchone()
+            if row:
+                latest["international_reference"] = {
+                    "started_at": row[0], "finished_at": row[1], "status": row[2],
+                    "target_fixtures": row[3], "matched_fixtures": row[4], "reference_rows": row[5], "message": row[6],
+                }
+        except Exception:
+            conn.rollback()
+            latest["international_reference"] = None
     return {"ok": True, "refresh": dict(refresh_state), "counts": counts, "latest": latest}
 
 
 @app.get("/predictions")
 def predictions(token: Optional[str] = Query(None), authorization: Optional[str] = Header(None)):
-    """Compatibility endpoint: now returns only the frozen two-list decision."""
+    """Compatibility endpoint: returns only the immutable frozen two-list decision."""
     auth(token, authorization)
     if not DATABASE_URL:
         raise HTTPException(500, "DATABASE_URL is not configured.")
@@ -252,6 +267,8 @@ def predictions(token: Optional[str] = Query(None), authorization: Optional[str]
         "status": "finalized",
         "week_key": final.get("week_key"),
         "finalized_at": final.get("finalized_at"),
+        "source": final.get("source"),
+        "sources": payload.get("sources") or {},
         "high_confidence": payload.get("high_confidence") or [],
         "high_confidence_value": payload.get("high_confidence_value") or [],
     }
