@@ -89,13 +89,13 @@ def _run_live_refresh() -> None:
 
 
 def _validation_keepalive() -> None:
-    """Keep Render Free awake only while an explicitly enabled startup validation runs.
+    """Keep Render Free awake while an explicitly enabled startup validation runs.
 
-    Render may immediately re-apply an already-expired idle timer after deployment. An
-    external self-request counts as real HTTP traffic and prevents the validation
-    container from being suspended halfway through a resume-safe historical backfill.
-    This thread exists only when AUTO_LIVE_REFRESH is explicitly true; normal
-    production remains quota-safe and naturally sleepable.
+    Direct self-requests are visible in app logs but Render may exclude them from its
+    idle-traffic decision. Therefore every pulse also goes through Jina Reader, which
+    causes a genuine external-origin request back to this service. A unique query
+    string plus X-No-Cache prevents relay cache hits from replacing the inbound ping.
+    This is active only while AUTO_LIVE_REFRESH=true; normal production stays sleepable.
     """
     if not (AUTO_LIVE_REFRESH and VALIDATION_KEEPALIVE):
         return
@@ -103,23 +103,48 @@ def _validation_keepalive() -> None:
     if not base:
         name = os.getenv("RENDER_SERVICE_NAME", "football-dataset-export").strip()
         base = f"https://{name}.onrender.com"
-    url = base + "/health"
-    # Lifespan runs before the socket is announced ready. Give uvicorn a moment, then
-    # keep traffic alive until the refresh has definitely finished.
+    direct_url = base + "/health"
     time.sleep(4.0)
     failures = 0
     while True:
         if refresh_state.get("last_finished") and not refresh_state.get("running"):
             break
+        stamp = int(time.time() * 1000)
+        target = f"{direct_url}?ka={stamp}"
+        relay_url = "https://r.jina.ai/" + target
+        relay_status = None
+        direct_status = None
         try:
-            r = requests.get(url, timeout=10, headers={"User-Agent": "football-validation-keepalive/1.0"})
+            rr = requests.get(
+                relay_url,
+                timeout=20,
+                headers={"User-Agent": "football-validation-external-keepalive/1.0", "X-No-Cache": "true"},
+            )
+            relay_status = rr.status_code
+            # Also keep the direct route warm; this is not relied upon for idle reset.
+            try:
+                dr = requests.get(target, timeout=8, headers={"User-Agent": "football-validation-direct-keepalive/1.0"})
+                direct_status = dr.status_code
+            except Exception:
+                direct_status = None
             failures = 0
-            log.info("VALIDATION_KEEPALIVE status=%s running=%s", r.status_code, bool(refresh_state.get("running")))
+            log.info(
+                "VALIDATION_KEEPALIVE relay_status=%s direct_status=%s running=%s",
+                relay_status, direct_status, bool(refresh_state.get("running")),
+            )
         except Exception as exc:
             failures += 1
-            # Fail soft: keepalive must never make data validation fail.
+            # Direct fallback may still help while the relay is temporarily unavailable.
+            try:
+                dr = requests.get(target, timeout=8, headers={"User-Agent": "football-validation-direct-keepalive/1.0"})
+                direct_status = dr.status_code
+            except Exception:
+                pass
             if failures <= 3 or failures % 10 == 0:
-                log.warning("VALIDATION_KEEPALIVE_FAILED failures=%s error=%s", failures, str(exc)[:250])
+                log.warning(
+                    "VALIDATION_KEEPALIVE_FAILED failures=%s direct_status=%s error=%s",
+                    failures, direct_status, str(exc)[:250],
+                )
         time.sleep(KEEPALIVE_INTERVAL)
     log.info("VALIDATION_KEEPALIVE_STOP status=%s", refresh_state.get("last_status"))
 
@@ -187,7 +212,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Football Prediction Data Service", version="4.1", lifespan=lifespan)
+app = FastAPI(title="Football Prediction Data Service", version="4.2", lifespan=lifespan)
 
 
 def auth(token: Optional[str], authorization: Optional[str]) -> None:
@@ -215,7 +240,7 @@ def rowdict(cur, row) -> Optional[dict[str, Any]]:
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": "4.1", "auto_live_refresh": AUTO_LIVE_REFRESH, "refresh": dict(refresh_state)}
+    return {"ok": True, "version": "4.2", "auto_live_refresh": AUTO_LIVE_REFRESH, "refresh": dict(refresh_state)}
 
 
 @app.get("/")
