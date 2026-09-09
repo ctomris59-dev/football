@@ -179,8 +179,8 @@ def _run() -> Dict[str, Any]:
             from understat_xg_importer import run_import as fn
             run_step("understat", lambda: fn(DATABASE_URL), steps, optional=True)
     if RUN_ODDSPAPI:
-        if recent_success("oddspapi_allbooks_runs", ODSPAPI_REFRESH_HOURS) and recent_rows("asian_market_prices", ODSPAPI_REFRESH_HOURS):
-            skip(steps, "oddspapi_allbooks", f"allbooks+asian fresh<{ODSPAPI_REFRESH_HOURS}h")
+        if recent_success("oddspapi_allbooks_runs", ODDSPAPI_REFRESH_HOURS) and recent_rows("asian_market_prices", ODDSPAPI_REFRESH_HOURS):
+            skip(steps, "oddspapi_allbooks", f"allbooks+asian fresh<{ODDSPAPI_REFRESH_HOURS}h")
         else:
             from oddspapi_allbooks_importer_v4 import run_import as fn
             run_step("oddspapi_allbooks", lambda: fn(DATABASE_URL), steps, optional=True)
