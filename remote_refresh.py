@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Call the protected football refresh endpoint from a small Render cron.
+"""Call the protected Thursday football refresh endpoint from Render cron.
 
-Secrets stay on the web service; scheduled jobs only hold a dedicated bearer token.
-The script waits for the background refresh to finish so cron success means the
-pipeline really completed, not merely that the HTTP request was accepted.
+Legacy Friday cron jobs may still exist in Render; this client exits before making any
+HTTP request outside Thursday (Europe/Istanbul), so they no longer wake or rerun the
+betting system.
 """
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -18,6 +20,8 @@ REFRESH_URL = os.getenv("REMOTE_REFRESH_URL", "").strip()
 TOKEN = os.getenv("REMOTE_REFRESH_TOKEN", "").strip()
 POLL_SECONDS = int(os.getenv("REMOTE_REFRESH_POLL_SECONDS", "20"))
 MAX_WAIT_SECONDS = int(os.getenv("REMOTE_REFRESH_MAX_WAIT_SECONDS", "1800"))
+FORCE = os.getenv("REMOTE_REFRESH_FORCE", "false").lower() in {"1", "true", "yes"}
+ISTANBUL = ZoneInfo("Europe/Istanbul")
 
 
 def health_url(refresh_url: str) -> str:
@@ -27,6 +31,10 @@ def health_url(refresh_url: str) -> str:
 
 
 def main() -> int:
+    local = datetime.now(timezone.utc).astimezone(ISTANBUL)
+    if local.weekday() != 3 and not FORCE:  # Thursday=3
+        print("REMOTE_REFRESH_SKIPPED not_thursday", local.isoformat())
+        return 0
     if not REFRESH_URL or not TOKEN:
         print("REMOTE_REFRESH_SKIPPED missing REMOTE_REFRESH_URL/TOKEN")
         return 2
@@ -42,7 +50,6 @@ def main() -> int:
     except Exception:
         body = {}
 
-    # If another refresh is already running, wait for that one rather than failing.
     accepted = body.get("accepted")
     if accepted is False and body.get("reason") != "refresh_already_running":
         return 4
