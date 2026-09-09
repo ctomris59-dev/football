@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Call the protected Thursday football refresh endpoint from Render cron.
+"""Legacy remote refresh client.
 
-Legacy Friday cron jobs may still exist in Render; this client exits before making any
-HTTP request outside Thursday (Europe/Istanbul), so they no longer wake or rerun the
-betting system.
+The single direct Thursday live_refresh cron is now the canonical heavy preparation.
+Older duplicate Render cron services that still call this file intentionally do
+nothing unless REMOTE_REFRESH_ENABLED=true is set explicitly.
 """
 from __future__ import annotations
 
@@ -18,9 +18,10 @@ import requests
 
 REFRESH_URL = os.getenv("REMOTE_REFRESH_URL", "").strip()
 TOKEN = os.getenv("REMOTE_REFRESH_TOKEN", "").strip()
+ENABLED = os.getenv("REMOTE_REFRESH_ENABLED", "false").lower() in {"1", "true", "yes"}
+FORCE = os.getenv("REMOTE_REFRESH_FORCE", "false").lower() in {"1", "true", "yes"}
 POLL_SECONDS = int(os.getenv("REMOTE_REFRESH_POLL_SECONDS", "20"))
 MAX_WAIT_SECONDS = int(os.getenv("REMOTE_REFRESH_MAX_WAIT_SECONDS", "1800"))
-FORCE = os.getenv("REMOTE_REFRESH_FORCE", "false").lower() in {"1", "true", "yes"}
 ISTANBUL = ZoneInfo("Europe/Istanbul")
 
 
@@ -32,7 +33,10 @@ def health_url(refresh_url: str) -> str:
 
 def main() -> int:
     local = datetime.now(timezone.utc).astimezone(ISTANBUL)
-    if local.weekday() != 3 and not FORCE:  # Thursday=3
+    if not ENABLED and not FORCE:
+        print("REMOTE_REFRESH_SKIPPED legacy_duplicate_disabled", local.isoformat())
+        return 0
+    if local.weekday() != 3 and not FORCE:
         print("REMOTE_REFRESH_SKIPPED not_thursday", local.isoformat())
         return 0
     if not REFRESH_URL or not TOKEN:
@@ -44,12 +48,10 @@ def main() -> int:
     print("REMOTE_REFRESH_START", response.status_code, response.text[:1000])
     if response.status_code not in {200, 202}:
         return 3
-
     try:
         body = response.json()
     except Exception:
         body = {}
-
     accepted = body.get("accepted")
     if accepted is False and body.get("reason") != "refresh_already_running":
         return 4
@@ -59,8 +61,7 @@ def main() -> int:
     seen_running = False
     while time.time() < deadline:
         try:
-            health = requests.get(hurl, timeout=30).json()
-            state = health.get("refresh") or {}
+            state = (requests.get(hurl, timeout=30).json().get("refresh") or {})
             running = bool(state.get("running"))
             seen_running = seen_running or running
             if not running and (seen_running or state.get("last_finished")):
@@ -70,7 +71,6 @@ def main() -> int:
         except Exception as exc:
             print("REMOTE_REFRESH_POLL_WARNING", repr(exc))
         time.sleep(max(5, POLL_SECONDS))
-
     print("REMOTE_REFRESH_TIMEOUT", MAX_WAIT_SECONDS)
     return 6
 
