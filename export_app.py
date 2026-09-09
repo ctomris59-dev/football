@@ -19,6 +19,7 @@ from starlette.background import BackgroundTask
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DOWNLOAD_TOKEN = os.getenv("DOWNLOAD_TOKEN", "").strip()
+VALIDATION_TRIGGER_TOKEN = os.getenv("VALIDATION_TRIGGER_TOKEN", "").strip()
 
 
 def env_bool(name: str, default: str = "false") -> bool:
@@ -189,6 +190,21 @@ def refresh(token: Optional[str] = Query(None), authorization: Optional[str] = H
         return {"accepted": False, "reason": "refresh_already_running", "state": dict(refresh_state)}
     start_thread(_run_live_refresh, "manual-live-refresh")
     return {"accepted": True, "message": "Refresh started. Check /health or /status for completion."}
+
+
+@app.get("/validation-run")
+def validation_run(token: Optional[str] = Query(None)):
+    # Deliberately disabled unless a short-lived one-shot token is configured.
+    if not VALIDATION_TRIGGER_TOKEN:
+        raise HTTPException(404, "Validation trigger is disabled.")
+    if token != VALIDATION_TRIGGER_TOKEN:
+        raise HTTPException(401, "Invalid validation token.")
+    if not DATABASE_URL:
+        raise HTTPException(500, "DATABASE_URL is not configured.")
+    if refresh_lock.locked():
+        return {"accepted": False, "reason": "refresh_already_running", "state": dict(refresh_state)}
+    start_thread(_run_live_refresh, "validation-one-shot")
+    return {"accepted": True, "message": "Validation run started."}
 
 
 @app.get("/status")
