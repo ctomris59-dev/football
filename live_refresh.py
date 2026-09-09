@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Ordered live refresh pipeline for the Big Five prediction system.
+"""Ordered live refresh pipeline with cross-process serialization.
 
-Provider calls are freshness-gated. Optional/shadow providers fail soft; the core
-readiness/production path fails closed. DB-v3 player context is explicitly bridged
-into fixture enrichment and must produce player_mapped > 0 before coverage,
-leakage-safe V1/V5 validation, or production Top-10 may continue.
+Provider calls are freshness-gated. Optional sources fail soft; core mapping/readiness
+fails closed. A PostgreSQL advisory lock prevents the two legacy Thursday schedules
+(or a manual validation run) from executing provider refreshes concurrently.
 """
 from __future__ import annotations
 import json, logging, os
@@ -12,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict
 import psycopg
 
-DATABASE_URL=os.getenv("DATABASE_URL","").strip();LOG_LEVEL=os.getenv("LOG_LEVEL","INFO").upper()
+DATABASE_URL=os.getenv("DATABASE_URL","").strip();LOG_LEVEL=os.getenv("LOG_LEVEL","INFO").upper();REFRESH_LOCK_KEY=int(os.getenv("LIVE_REFRESH_ADVISORY_LOCK_KEY","856420261"))
 def envb(k,d="true"):return os.getenv(k,d).lower() in {"1","true","yes"}
 RUN_FD2324=envb("LIVE_REFRESH_FD2324");RUN_FOOTBALL_DATA=envb("LIVE_REFRESH_FOOTBALL_DATA");RUN_FD_ASIAN=envb("LIVE_REFRESH_FD_ASIAN");RUN_ESPN=envb("LIVE_REFRESH_ESPN");RUN_ESPN_CONTEXT=envb("LIVE_REFRESH_ESPN_CONTEXT");RUN_ESPN_TOTAL_ODDS=envb("LIVE_REFRESH_ESPN_TOTAL_ODDS");RUN_ESPN_TEAM_SCHEDULE=envb("LIVE_REFRESH_ESPN_TEAM_SCHEDULE");RUN_UNDERSTAT=envb("LIVE_REFRESH_UNDERSTAT");RUN_ODDSPAPI=envb("LIVE_REFRESH_ODDSPAPI");RUN_FOTMOB_AVAILABILITY=envb("LIVE_REFRESH_FOTMOB_AVAILABILITY");RUN_FOTMOB_LINEUPS=envb("LIVE_REFRESH_FOTMOB_LINEUPS");RUN_BBS=envb("LIVE_REFRESH_BBS","false");RUN_BBS_LINEUPS=envb("LIVE_REFRESH_BBS_LINEUPS","false");RUN_SOFASCORE=envb("LIVE_REFRESH_SOFASCORE","false");RUN_ADVANCED=envb("LIVE_REFRESH_ADVANCED");RUN_FOUR_LAYER=envb("LIVE_REFRESH_FOUR_LAYER");RUN_PREMATCH=envb("LIVE_REFRESH_PREMATCH");RUN_ODDS_MOVEMENT=envb("LIVE_REFRESH_ODDS_MOVEMENT");RUN_AVAILABILITY_ENRICH=envb("LIVE_REFRESH_AVAILABILITY_ENRICH");RUN_READINESS=envb("LIVE_REFRESH_READINESS");RUN_PREDICTIONS=envb("LIVE_REFRESH_PREDICTIONS")
 ESPN_CONTEXT_REFRESH_HOURS=float(os.getenv("ESPN_CONTEXT_REFRESH_HOURS","20"));TEAM_SCHEDULE_REFRESH_HOURS=float(os.getenv("TEAM_SCHEDULE_REFRESH_HOURS","120"));UNDERSTAT_REFRESH_HOURS=float(os.getenv("UNDERSTAT_REFRESH_HOURS","48"));ODDSPAPI_REFRESH_HOURS=float(os.getenv("ODDSPAPI_REFRESH_HOURS","20"));FOTMOB_REFRESH_HOURS=float(os.getenv("FOTMOB_REFRESH_HOURS","20"));FOTMOB_LINEUP_REFRESH_HOURS=float(os.getenv("FOTMOB_LINEUP_REFRESH_HOURS","0.5"))
@@ -29,18 +28,16 @@ def recent_success(table:str,hours:float)->bool:
  allowed={"espn_context_runs","espn_team_schedule_runs","oddspapi_import_runs","oddspapi_allbooks_runs","fotmob_availability_runs","fotmob_lineup_runs","understat_import_runs"}
  if table not in allowed:return False
  try:
-  with psycopg.connect(DATABASE_URL) as conn:row=conn.execute(f"SELECT 1 FROM {table} WHERE status='success' AND finished_at >= NOW()-(%s||' hours')::interval LIMIT 1",(hours,)).fetchone()
-  return bool(row)
+  with psycopg.connect(DATABASE_URL) as conn:return bool(conn.execute(f"SELECT 1 FROM {table} WHERE status='success' AND finished_at>=NOW()-(%s||' hours')::interval LIMIT 1",(hours,)).fetchone())
  except Exception:return False
 def recent_rows(table:str,hours:float)->bool:
  if table not in {"asian_market_prices"} or not DATABASE_URL:return False
  try:
-  with psycopg.connect(DATABASE_URL) as conn:row=conn.execute(f"SELECT 1 FROM {table} WHERE fetched_at>=NOW()-(%s||' hours')::interval LIMIT 1",(hours,)).fetchone()
-  return bool(row)
+  with psycopg.connect(DATABASE_URL) as conn:return bool(conn.execute(f"SELECT 1 FROM {table} WHERE fetched_at>=NOW()-(%s||' hours')::interval LIMIT 1",(hours,)).fetchone())
  except Exception:return False
 def skip(steps,name,reason):steps[name]={"status":"skipped","reason":reason};log.info("LIVE_REFRESH_STEP step=%s status=skipped reason=%s",name,reason)
-def main()->Dict[str,Any]:
- if not DATABASE_URL:raise RuntimeError("Missing DATABASE_URL")
+
+def _run()->Dict[str,Any]:
  started=utcnow();summary={"started_at":started.isoformat(),"steps":{}};steps=summary["steps"]
  if RUN_FD2324:
   from football_data_2324_importer import run_import as fn;run_step("football_data_2324",lambda:fn(DATABASE_URL),steps,optional=True)
@@ -67,7 +64,7 @@ def main()->Dict[str,Any]:
   else:
    from oddspapi_allbooks_importer_v4 import run_import as fn;run_step("oddspapi_allbooks",lambda:fn(DATABASE_URL),steps,optional=True)
  if RUN_FD_ASIAN:
-  from football_data_asian_bridge import run_import as fn;run_step("football_data_asian",lambda:fn(DATABASE_URL),steps,optional=True)
+  from football_data_asian_bridge_v2 import run_import as fn;run_step("football_data_asian",lambda:fn(DATABASE_URL),steps,optional=True)
  if RUN_FOTMOB_AVAILABILITY:
   if recent_success("fotmob_availability_runs",FOTMOB_REFRESH_HOURS):skip(steps,"fotmob_availability",f"fresh<{FOTMOB_REFRESH_HOURS}h")
   else:
@@ -106,4 +103,17 @@ def main()->Dict[str,Any]:
  if RUN_PREDICTIONS:
   from production_predictor_v5 import run_predictions as fn;run_step("production_predictions",lambda:fn(DATABASE_URL),steps)
  summary["finished_at"]=utcnow().isoformat();summary["status"]="success";log.info("LIVE_REFRESH_RESULT %s",json.dumps(summary,ensure_ascii=False,default=str,separators=(",",":")));return summary
+
+def main()->Dict[str,Any]:
+ if not DATABASE_URL:raise RuntimeError("Missing DATABASE_URL")
+ lock=psycopg.connect(DATABASE_URL,autocommit=True)
+ try:
+  got=bool(lock.execute("SELECT pg_try_advisory_lock(%s)",(REFRESH_LOCK_KEY,)).fetchone()[0])
+  if not got:
+   res={"status":"skipped_duplicate_refresh","reason":"postgres_advisory_lock_busy","lock_key":REFRESH_LOCK_KEY,"at":utcnow().isoformat()};log.warning("LIVE_REFRESH_DUPLICATE_SKIPPED %s",json.dumps(res,separators=(",",":")));return res
+  return _run()
+ finally:
+  try:lock.execute("SELECT pg_advisory_unlock(%s)",(REFRESH_LOCK_KEY,))
+  except Exception:pass
+  lock.close()
 if __name__=="__main__":print(json.dumps(main(),ensure_ascii=False,indent=2,default=str))
