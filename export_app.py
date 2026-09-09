@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Protected status/export/prediction control service for the football system."""
+"""Small control/read API for the Thursday-first football betting workflow.
+
+Primary product surface:
+- Thursday model/context refresh
+- official Turkey opening-price watch
+- one frozen weekly decision containing exactly two lists
+
+Legacy research tables remain in Postgres for validation, but are not part of the
+weekly user-facing decision path.
+"""
 from __future__ import annotations
 
 import json
@@ -7,14 +16,12 @@ import logging
 import os
 import tempfile
 import threading
-import time
 import zipfile
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from datetime import date, datetime, timezone
+from typing import Any, Optional
 
 import psycopg
-import requests
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
@@ -22,197 +29,45 @@ from starlette.background import BackgroundTask
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DOWNLOAD_TOKEN = os.getenv("DOWNLOAD_TOKEN", "").strip()
 VALIDATION_TRIGGER_TOKEN = os.getenv("VALIDATION_TRIGGER_TOKEN", "").strip()
-
-
-def env_bool(name: str, default: str = "false") -> bool:
-    return os.getenv(name, default).lower() in {"1", "true", "yes"}
-
-
-# Deploys must not consume provider quota by default. Refresh is explicit/scheduled.
-AUTO_LIVE_REFRESH = env_bool("AUTO_LIVE_REFRESH", "false")
-AUTO_RUN_BACKTEST = env_bool("AUTO_RUN_BACKTEST", "false")
-AUTO_BACKTEST_NEW_MODEL = env_bool("AUTO_BACKTEST_NEW_MODEL", "false")
-AUTO_BACKTEST_HYBRID = env_bool("AUTO_BACKTEST_HYBRID", "false")
-AUTO_BACKTEST_VALUE = env_bool("AUTO_BACKTEST_VALUE", "false")
-VALIDATION_KEEPALIVE = env_bool("VALIDATION_KEEPALIVE", "true")
-KEEPALIVE_INTERVAL = max(8.0, float(os.getenv("VALIDATION_KEEPALIVE_INTERVAL_SECONDS", "15")))
+AUTO_LIVE_REFRESH = os.getenv("AUTO_LIVE_REFRESH", "false").lower() in {"1", "true", "yes"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("football-export")
+log = logging.getLogger("football-thursday-service")
 refresh_lock = threading.Lock()
-refresh_state: dict[str, Any] = {"running": False, "last_started": None, "last_finished": None, "last_status": None, "last_error": None}
-validation_root_started = False
+opening_lock = threading.Lock()
+refresh_state: dict[str, Any] = {
+    "running": False,
+    "last_started": None,
+    "last_finished": None,
+    "last_status": None,
+    "last_error": None,
+}
 
-TABLES = [
-    "league_coverage", "fixtures", "fixture_details", "injuries", "season_players", "collection_runs", "api_call_log",
-    "football_data_matches", "football_data_upcoming", "football_data_source_state", "football_data_import_runs",
-    "second_tier_matches", "second_tier_import_runs",
-    "promotion_transfer_factors", "promotion_priors", "promotion_prior_runs", "promotion_prior_backtest_runs",
-    "espn_current_matches", "espn_upcoming", "espn_import_state", "espn_import_runs",
-    "espn_injury_snapshots", "espn_odds_snapshots", "espn_prematch_snapshots", "espn_advanced_match_stats", "espn_context_runs",
-    "espn_team_schedule_events", "espn_team_schedule_runs",
-    "understat_matches", "understat_team_seasons", "understat_source_state", "understat_import_runs",
-    "clubelo_daily_snapshots", "clubelo_team_map", "clubelo_history", "clubelo_import_runs",
-    "oddspapi_tournaments", "oddspapi_market_catalog", "oddspapi_fixture_snapshots", "oddspapi_market_prices", "oddspapi_import_runs", "oddspapi_allbooks_runs",
-    "market_consensus_snapshots", "market_consensus_runs",
-    "bbs_absence_snapshots", "bbs_availability_runs", "bbs_lineup_snapshots", "bbs_lineup_runs",
-    "sofascore_availability_snapshots", "sofascore_availability_runs",
-    "fotmob_team_availability_snapshots", "fotmob_fixture_availability_snapshots", "fotmob_availability_runs",
-    "fotmob_player_strength_snapshots", "fotmob_team_style_snapshots", "fotmob_strength_runs",
-    "score_state_adjusted_matches", "score_state_runs", "score_state_backtest_runs",
-    "fixture_enrichment_snapshots", "fixture_enrichment_runs",
-    "prematch_feature_snapshots", "prematch_context_runs",
-    "prediction_readiness_snapshots", "data_readiness_runs",
-    "model_backtest_runs", "model_policy_backtest_runs", "model_value_backtest_runs",
-    "production_prediction_runs", "production_predictions",
+# Only data that directly supports the Thursday decision is surfaced/exported here.
+# Older research/backtest tables are intentionally left in Postgres but hidden from
+# this operational API so they cannot create user-facing noise.
+ACTIVE_TABLES = [
+    "football_data_matches",
+    "espn_current_matches",
+    "espn_upcoming",
+    "espn_team_roster_snapshots",
+    "understat_player_seasons",
+    "player_team_context_snapshots",
+    "fotmob_fixture_availability_snapshots",
+    "turkey_odds_snapshots",
+    "turkey_opening_odds",
+    "turkey_odds_import_runs",
+    "thursday_decision_runs",
+    "thursday_watch_checks",
+    "thursday_final_decisions",
+    "live_refresh_runs",
 ]
 
 
-def _run_live_refresh() -> None:
-    if not refresh_lock.acquire(blocking=False):
-        log.info("Live refresh already running; duplicate request ignored")
-        return
-    refresh_state.update({"running": True, "last_started": datetime.now(timezone.utc).isoformat(), "last_error": None})
-    try:
-        from live_refresh import main
-        result = main()
-        refresh_state["last_status"] = "success"
-        log.info("LIVE_REFRESH_COMPLETED %s", json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":")))
-    except Exception as exc:
-        refresh_state["last_status"] = "failed"
-        refresh_state["last_error"] = str(exc)
-        log.exception("Ordered live refresh failed")
-    finally:
-        refresh_state["running"] = False
-        refresh_state["last_finished"] = datetime.now(timezone.utc).isoformat()
-        refresh_lock.release()
-
-
-def _validation_keepalive() -> None:
-    """Keep Render Free awake while an explicitly enabled startup validation runs.
-
-    Direct self-requests are visible in app logs but Render may exclude them from its
-    idle-traffic decision. Therefore every pulse also goes through Jina Reader, which
-    causes a genuine external-origin request back to this service. A unique query
-    string plus X-No-Cache prevents relay cache hits from replacing the inbound ping.
-    This is active only while AUTO_LIVE_REFRESH=true; normal production stays sleepable.
-    """
-    if not (AUTO_LIVE_REFRESH and VALIDATION_KEEPALIVE):
-        return
-    base = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
-    if not base:
-        name = os.getenv("RENDER_SERVICE_NAME", "football-dataset-export").strip()
-        base = f"https://{name}.onrender.com"
-    direct_url = base + "/health"
-    time.sleep(4.0)
-    failures = 0
-    while True:
-        if refresh_state.get("last_finished") and not refresh_state.get("running"):
-            break
-        stamp = int(time.time() * 1000)
-        target = f"{direct_url}?ka={stamp}"
-        relay_url = "https://r.jina.ai/" + target
-        relay_status = None
-        direct_status = None
-        try:
-            rr = requests.get(
-                relay_url,
-                timeout=20,
-                headers={"User-Agent": "football-validation-external-keepalive/1.0", "X-No-Cache": "true"},
-            )
-            relay_status = rr.status_code
-            # Also keep the direct route warm; this is not relied upon for idle reset.
-            try:
-                dr = requests.get(target, timeout=8, headers={"User-Agent": "football-validation-direct-keepalive/1.0"})
-                direct_status = dr.status_code
-            except Exception:
-                direct_status = None
-            failures = 0
-            log.info(
-                "VALIDATION_KEEPALIVE relay_status=%s direct_status=%s running=%s",
-                relay_status, direct_status, bool(refresh_state.get("running")),
-            )
-        except Exception as exc:
-            failures += 1
-            # Direct fallback may still help while the relay is temporarily unavailable.
-            try:
-                dr = requests.get(target, timeout=8, headers={"User-Agent": "football-validation-direct-keepalive/1.0"})
-                direct_status = dr.status_code
-            except Exception:
-                pass
-            if failures <= 3 or failures % 10 == 0:
-                log.warning(
-                    "VALIDATION_KEEPALIVE_FAILED failures=%s direct_status=%s error=%s",
-                    failures, direct_status, str(exc)[:250],
-                )
-        time.sleep(KEEPALIVE_INTERVAL)
-    log.info("VALIDATION_KEEPALIVE_STOP status=%s", refresh_state.get("last_status"))
-
-
-def _run_backtest() -> None:
-    try:
-        from backtest_model import run_backtest
-        run_backtest(DATABASE_URL)
-    except Exception:
-        log.exception("Model backtest failed")
-
-
-def _run_backtest_if_new() -> None:
-    try:
-        from backtest_model import MODEL_VERSION, run_backtest
-        with psycopg.connect(DATABASE_URL) as conn:
-            exists = conn.execute("SELECT 1 FROM model_backtest_runs WHERE model_version=%s AND status='success' LIMIT 1", (MODEL_VERSION,)).fetchone()
-        if not exists:
-            run_backtest(DATABASE_URL)
-    except Exception:
-        log.exception("New-model backtest failed")
-
-
-def _run_hybrid_if_new() -> None:
-    try:
-        from hybrid_policy_backtest import MODEL_VERSION, SCHEMA, run_backtest
-        with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
-            conn.execute(SCHEMA)
-            exists = conn.execute("SELECT 1 FROM model_policy_backtest_runs WHERE policy_version=%s AND status='success' LIMIT 1", (MODEL_VERSION,)).fetchone()
-        if not exists:
-            run_backtest(DATABASE_URL)
-    except Exception:
-        log.exception("Hybrid policy backtest failed")
-
-
-def _run_value_if_new() -> None:
-    try:
-        from value_backtest import VERSION, SCHEMA, run_backtest
-        with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
-            conn.execute(SCHEMA)
-            exists = conn.execute("SELECT 1 FROM model_value_backtest_runs WHERE version=%s AND status='success' LIMIT 1", (VERSION,)).fetchone()
-        if not exists:
-            run_backtest(DATABASE_URL)
-    except Exception:
-        log.exception("Value backtest failed")
-
-
-def start_thread(target: Callable[[], None], name: str) -> None:
-    threading.Thread(target=target, name=name, daemon=True).start()
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    if DATABASE_URL and AUTO_LIVE_REFRESH:
-        start_thread(_run_live_refresh, "ordered-live-refresh")
-        start_thread(_validation_keepalive, "validation-keepalive")
-    if DATABASE_URL and AUTO_RUN_BACKTEST:
-        start_thread(_run_backtest, "model-backtest")
-    elif DATABASE_URL and AUTO_BACKTEST_NEW_MODEL:
-        start_thread(_run_backtest_if_new, "model-backtest-new-version")
-    if DATABASE_URL and AUTO_BACKTEST_HYBRID:
-        start_thread(_run_hybrid_if_new, "hybrid-policy-backtest")
-    if DATABASE_URL and AUTO_BACKTEST_VALUE:
-        start_thread(_run_value_if_new, "value-backtest")
-    yield
-
-
-app = FastAPI(title="Football Prediction Data Service", version="4.2", lifespan=lifespan)
+def json_default(value: Any):
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return str(value)
 
 
 def auth(token: Optional[str], authorization: Optional[str]) -> None:
@@ -221,34 +76,63 @@ def auth(token: Optional[str], authorization: Optional[str]) -> None:
     bearer = None
     if authorization and authorization.lower().startswith("bearer "):
         bearer = authorization[7:].strip()
-    provided = bearer or token
-    if provided != DOWNLOAD_TOKEN:
+    if (bearer or token) != DOWNLOAD_TOKEN:
         raise HTTPException(401, "Invalid token.")
 
 
-def json_default(value: Any):
-    if isinstance(value, datetime):
-        return value.isoformat()
-    return str(value)
+def _run_live_refresh() -> None:
+    if not refresh_lock.acquire(blocking=False):
+        return
+    refresh_state.update({
+        "running": True,
+        "last_started": datetime.now(timezone.utc).isoformat(),
+        "last_error": None,
+    })
+    try:
+        from live_refresh import main
+        result = main()
+        refresh_state["last_status"] = "success"
+        log.info("THURSDAY_REFRESH_COMPLETED %s", json.dumps(result, ensure_ascii=False, default=json_default, separators=(",", ":")))
+    except Exception as exc:
+        refresh_state["last_status"] = "failed"
+        refresh_state["last_error"] = str(exc)
+        log.exception("Thursday refresh failed")
+    finally:
+        refresh_state["running"] = False
+        refresh_state["last_finished"] = datetime.now(timezone.utc).isoformat()
+        refresh_lock.release()
 
 
-def rowdict(cur, row) -> Optional[dict[str, Any]]:
-    if row is None:
-        return None
-    return dict(zip([d.name for d in cur.description], row))
+def _start_refresh_thread() -> bool:
+    if refresh_lock.locked():
+        return False
+    threading.Thread(target=_run_live_refresh, name="thursday-refresh", daemon=True).start()
+    return True
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if DATABASE_URL and AUTO_LIVE_REFRESH:
+        _start_refresh_thread()
+    yield
+
+
+app = FastAPI(title="Football Thursday Decision Service", version="5.0", lifespan=lifespan)
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": "4.2", "auto_live_refresh": AUTO_LIVE_REFRESH, "refresh": dict(refresh_state)}
+    return {
+        "ok": True,
+        "version": "5.0",
+        "workflow": "Thursday -> two lists -> bet -> done",
+        "auto_live_refresh": AUTO_LIVE_REFRESH,
+        "refresh": dict(refresh_state),
+    }
 
 
 @app.get("/")
 def root():
-    global validation_root_started
-    if VALIDATION_TRIGGER_TOKEN and not validation_root_started and not refresh_lock.locked():
-        validation_root_started = True
-        start_thread(_run_live_refresh, "validation-root-one-shot")
     return health()
 
 
@@ -257,24 +141,66 @@ def refresh(token: Optional[str] = Query(None), authorization: Optional[str] = H
     auth(token, authorization)
     if not DATABASE_URL:
         raise HTTPException(500, "DATABASE_URL is not configured.")
-    if refresh_lock.locked():
+    if not _start_refresh_thread():
         return {"accepted": False, "reason": "refresh_already_running", "state": dict(refresh_state)}
-    start_thread(_run_live_refresh, "manual-live-refresh")
-    return {"accepted": True, "message": "Refresh started. Check /health or /status for completion."}
+    return {"accepted": True, "message": "Thursday preparation started."}
 
 
 @app.get("/validation-run")
 def validation_run(token: Optional[str] = Query(None)):
-    if not VALIDATION_TRIGGER_TOKEN:
-        raise HTTPException(404, "Validation trigger is disabled.")
-    if token != VALIDATION_TRIGGER_TOKEN:
+    if not VALIDATION_TRIGGER_TOKEN or token != VALIDATION_TRIGGER_TOKEN:
         raise HTTPException(401, "Invalid validation token.")
     if not DATABASE_URL:
         raise HTTPException(500, "DATABASE_URL is not configured.")
-    if refresh_lock.locked():
+    if not _start_refresh_thread():
         return {"accepted": False, "reason": "refresh_already_running", "state": dict(refresh_state)}
-    start_thread(_run_live_refresh, "validation-one-shot")
-    return {"accepted": True, "message": "Validation run started."}
+    return {"accepted": True, "message": "Validation refresh started."}
+
+
+@app.get("/opening-watch")
+def opening_watch():
+    """Public, rate-limited-by-DB check used by the small Render watcher cron.
+
+    It exposes no secrets and cannot change a finalized weekly decision. The watcher
+    itself refuses to run outside Thursday evening / Friday-morning fallback, and
+    duplicate calls within the same hour are ignored persistently.
+    """
+    if not DATABASE_URL:
+        raise HTTPException(500, "DATABASE_URL is not configured.")
+    if not opening_lock.acquire(blocking=False):
+        return {"ok": True, "status": "opening_watch_already_running"}
+    try:
+        from thursday_opening_watch import main
+        result = main(DATABASE_URL)
+        return {"ok": True, **result}
+    finally:
+        opening_lock.release()
+
+
+@app.get("/thursday-list")
+def thursday_list():
+    """Return only the frozen weekly betting decision; otherwise say it is pending."""
+    if not DATABASE_URL:
+        raise HTTPException(500, "DATABASE_URL is not configured.")
+    from thursday_opening_watch import latest_final
+    final = latest_final(DATABASE_URL)
+    if not final:
+        return {
+            "ok": True,
+            "status": "pending",
+            "message": "This week's Turkish opening-price decision has not been finalized yet.",
+        }
+    payload = final.get("payload") or {}
+    return {
+        "ok": True,
+        "status": "finalized",
+        "week_key": final.get("week_key"),
+        "finalized_at": final.get("finalized_at"),
+        "high_confidence": payload.get("high_confidence") or [],
+        "high_confidence_value": payload.get("high_confidence_value") or [],
+        "official_fixture_coverage": payload.get("official_fixture_coverage"),
+        "policy": payload.get("policy") or {},
+    }
 
 
 @app.get("/status")
@@ -282,56 +208,67 @@ def status(token: Optional[str] = Query(None), authorization: Optional[str] = He
     auth(token, authorization)
     if not DATABASE_URL:
         raise HTTPException(500, "DATABASE_URL is not configured.")
-    out: dict[str, Any] = {}
-    details: dict[str, Any] = {}
+    counts: dict[str, Any] = {}
+    latest: dict[str, Any] = {}
     with psycopg.connect(DATABASE_URL) as conn:
-        for table in TABLES:
+        for table in ACTIVE_TABLES:
             try:
-                out[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             except Exception:
                 conn.rollback()
-                out[table] = None
-
-        def one(name: str, sql: str) -> None:
-            try:
-                cur = conn.execute(sql)
-                details[name] = rowdict(cur, cur.fetchone())
-            except Exception:
-                conn.rollback()
-                details[name] = None
-
-        one("collector", "SELECT run_id::text AS run_id,started_at,finished_at,status,api_calls,message FROM collection_runs ORDER BY started_at DESC LIMIT 1")
-        one("football_data", "SELECT started_at,finished_at,status,seasons_loaded,rows_loaded,message FROM football_data_import_runs ORDER BY id DESC LIMIT 1")
-        one("espn", "SELECT started_at,finished_at,status,api_calls,matches_seen,results_written,upcoming_written,message FROM espn_import_runs ORDER BY id DESC LIMIT 1")
-        one("understat", "SELECT started_at,finished_at,status,api_calls,matches_seen,results_written,message FROM understat_import_runs ORDER BY id DESC LIMIT 1")
-        one("oddspapi", "SELECT started_at,finished_at,status,api_calls,fixtures_seen,prices_written,message FROM oddspapi_import_runs ORDER BY id DESC LIMIT 1")
-        one("predictions", "SELECT id,started_at,finished_at,status,model_version,horizon_start,horizon_end,fixtures_scored,market_rows,top10_count,message FROM production_prediction_runs ORDER BY id DESC LIMIT 1")
-    return {"ok": True, "refresh": dict(refresh_state), "counts": out, "latest": details}
+                counts[table] = None
+        try:
+            row = conn.execute(
+                """SELECT week_key,started_at,finished_at,status,fixture_count,official_fixture_coverage,
+                          raw_high_candidates,priced_high_candidates,high_confidence_count,value_count,decision_ready,message
+                     FROM thursday_decision_runs ORDER BY id DESC LIMIT 1"""
+            ).fetchone()
+            if row:
+                latest["thursday_decision"] = {
+                    "week_key": row[0], "started_at": row[1], "finished_at": row[2], "status": row[3],
+                    "fixture_count": row[4], "official_fixture_coverage": row[5],
+                    "raw_high_candidates": row[6], "priced_high_candidates": row[7],
+                    "high_confidence_count": row[8], "value_count": row[9], "decision_ready": row[10], "message": row[11],
+                }
+        except Exception:
+            conn.rollback()
+            latest["thursday_decision"] = None
+    return {"ok": True, "refresh": dict(refresh_state), "counts": counts, "latest": latest}
 
 
 @app.get("/predictions")
-def predictions(token: Optional[str] = Query(None), authorization: Optional[str] = Header(None), limit: int = Query(10, ge=1, le=100)):
+def predictions(token: Optional[str] = Query(None), authorization: Optional[str] = Header(None)):
+    """Compatibility endpoint: now returns only the frozen two-list decision."""
     auth(token, authorization)
     if not DATABASE_URL:
         raise HTTPException(500, "DATABASE_URL is not configured.")
-    with psycopg.connect(DATABASE_URL) as conn:
-        cur = conn.execute("""SELECT * FROM production_predictions WHERE run_id=(SELECT MAX(id) FROM production_prediction_runs WHERE status='success') ORDER BY rank NULLS LAST,ranking_score DESC LIMIT %s""", (limit,))
-        cols = [d.name for d in cur.description]
-        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
-    return {"ok": True, "count": len(rows), "rows": rows}
+    from thursday_opening_watch import latest_final
+    final = latest_final(DATABASE_URL)
+    if not final:
+        return {"ok": True, "status": "pending", "high_confidence": [], "high_confidence_value": []}
+    payload = final.get("payload") or {}
+    return {
+        "ok": True,
+        "status": "finalized",
+        "week_key": final.get("week_key"),
+        "finalized_at": final.get("finalized_at"),
+        "high_confidence": payload.get("high_confidence") or [],
+        "high_confidence_value": payload.get("high_confidence_value") or [],
+    }
 
 
 @app.get("/download")
 def download(token: Optional[str] = Query(None), authorization: Optional[str] = Header(None)):
+    """Export only the active operational dataset, not legacy research clutter."""
     auth(token, authorization)
     if not DATABASE_URL:
         raise HTTPException(500, "DATABASE_URL is not configured.")
-    fd, path = tempfile.mkstemp(prefix="football_dataset_", suffix=".zip")
+    fd, path = tempfile.mkstemp(prefix="football_thursday_", suffix=".zip")
     os.close(fd)
     try:
         with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
             with psycopg.connect(DATABASE_URL) as conn:
-                for table in TABLES:
+                for table in ACTIVE_TABLES:
                     try:
                         cur = conn.execute(f"SELECT * FROM {table}")
                         cols = [d.name for d in cur.description]
@@ -339,7 +276,12 @@ def download(token: Optional[str] = Query(None), authorization: Optional[str] = 
                         zf.writestr(f"{table}.jsonl", "\n".join(lines))
                     except Exception:
                         conn.rollback()
-        return FileResponse(path, media_type="application/zip", filename="football_dataset.zip", background=BackgroundTask(lambda: os.path.exists(path) and os.unlink(path)))
+        return FileResponse(
+            path,
+            media_type="application/zip",
+            filename="football_thursday_dataset.zip",
+            background=BackgroundTask(lambda: os.path.exists(path) and os.unlink(path)),
+        )
     except Exception:
         if os.path.exists(path):
             os.unlink(path)
