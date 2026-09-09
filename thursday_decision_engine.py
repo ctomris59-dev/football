@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Thursday-only decision engine for early Turkish betting.
+"""Final Thursday decision engine: model + international fair market + Turkey price.
 
-User workflow:
-    Thursday -> two actionable lists -> place bets -> done.
+User workflow: Thursday -> two frozen lists -> place bets -> done.
 
-Production principles:
-- model confidence comes only from the validated V1 football model;
-- only O2.5 goals, BTTS Yes and O8.5 corners are considered;
-- foreign bookmaker prices never influence confidence or value;
-- an actionable pick must have a valid Turkish İddaa price;
-- known early uncertainty can exclude a pick;
-- T-1/T-3 and confirmed-XI gates are not part of the betting decision.
+Roles are deliberately separated:
+- validated V1 model = calibrated football probability/confidence;
+- international paired same-book no-vig market = sanity/fair-value reference only;
+- official Turkish İddaa price = the only executable price and the only price used for
+  the user's model EV.
+
+No T-1/T-3/confirmed-lineup re-selection exists in this decision path.
 """
 from __future__ import annotations
 
@@ -25,6 +24,7 @@ from zoneinfo import ZoneInfo
 import psycopg
 from psycopg.types.json import Jsonb
 
+from international_market_reference import latest_ref
 from model_engine_v1 import predict_match
 from production_predictor import canon
 from turkey_value_workflow import DDL as TURKEY_PRICE_DDL, latest_tr_price
@@ -36,13 +36,16 @@ HIGH_CONFIDENCE_MIN = float(os.getenv("HIGH_CONFIDENCE_MIN", "0.70"))
 VALUE_MIN_CONFIDENCE = float(os.getenv("VALUE_MIN_CONFIDENCE", "0.65"))
 VALUE_MIN_EDGE = float(os.getenv("VALUE_MIN_EDGE", "0.015"))
 VALUE_MIN_EV = float(os.getenv("VALUE_MIN_EV", "0.02"))
+INTERNATIONAL_MIN_TR_EDGE = float(os.getenv("INTERNATIONAL_MIN_TR_EDGE", "0.01"))
+INTERNATIONAL_MIN_TR_EV = float(os.getenv("INTERNATIONAL_MIN_TR_EV", "0.01"))
+INTERNATIONAL_MAX_MODEL_DIVERGENCE = float(os.getenv("INTERNATIONAL_MAX_MODEL_DIVERGENCE", "0.12"))
 MIN_MODEL_DATA_QUALITY = float(os.getenv("THURSDAY_MIN_MODEL_DATA_QUALITY", "0.80"))
 MIN_PLAYER_COVERAGE = float(os.getenv("THURSDAY_MIN_PLAYER_COVERAGE", "0.70"))
 MIN_STARTER_CONTINUITY = float(os.getenv("THURSDAY_MIN_STARTER_CONTINUITY", "0.50"))
 MAX_KNOWN_INJURY_IMPACT = float(os.getenv("THURSDAY_MAX_KNOWN_INJURY_IMPACT", "0.20"))
 MIN_REST_DAYS = float(os.getenv("THURSDAY_MIN_REST_DAYS", "2.5"))
-BULLETIN_FIXTURE_COVERAGE_MIN = float(os.getenv("THURSDAY_BULLETIN_COVERAGE_MIN", "0.85"))
-HIGH_PRICE_COVERAGE_MIN = float(os.getenv("THURSDAY_HIGH_PRICE_COVERAGE_MIN", "0.80"))
+CANDIDATE_COVERAGE_MIN = float(os.getenv("THURSDAY_CANDIDATE_COVERAGE_MIN", "0.75"))
+NO_CANDIDATE_BULLETIN_COVERAGE_MIN = float(os.getenv("THURSDAY_NO_CANDIDATE_BULLETIN_COVERAGE_MIN", "0.70"))
 LIST_LIMIT = int(os.getenv("THURSDAY_LIST_LIMIT", "10"))
 
 MARKETS = (
@@ -88,7 +91,7 @@ def json_default(v: Any):
 
 
 def weekend_bounds(now: Optional[datetime] = None) -> Tuple[date, datetime, datetime]:
-    """Friday 00:00 through Monday 00:00 Istanbul time (Fri-Sun matches)."""
+    """Friday 00:00 through Monday 00:00 Istanbul time (Fri-Sun fixtures)."""
     now = now or datetime.now(timezone.utc)
     local = now.astimezone(ISTANBUL)
     days_to_friday = (4 - local.weekday()) % 7
@@ -96,6 +99,19 @@ def weekend_bounds(now: Optional[datetime] = None) -> Tuple[date, datetime, date
     start_local = datetime.combine(friday, time.min, tzinfo=ISTANBUL)
     end_local = start_local + timedelta(days=3)
     return friday, start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+
+def market_metrics(model_p: float, tr_price: float, international_p: float) -> Dict[str, float]:
+    model_p, tr_price, international_p = float(model_p), float(tr_price), float(international_p)
+    tr_implied = 1.0 / tr_price
+    return {
+        "tr_implied_probability": tr_implied,
+        "model_edge_vs_tr": model_p - tr_implied,
+        "model_ev_vs_tr": model_p * tr_price - 1.0,
+        "international_edge_vs_tr": international_p - tr_implied,
+        "international_ev_vs_tr": international_p * tr_price - 1.0,
+        "model_market_gap": model_p - international_p,
+    }
 
 
 def _row_date(v: Any) -> date:
@@ -108,14 +124,12 @@ def _history_rows(conn, league: str, before: datetime) -> List[Dict[str, Any]]:
         """SELECT match_date,home_team,away_team,home_goals,away_goals,
                   home_shots_on_target,away_shots_on_target,home_corners,away_corners
              FROM football_data_matches
-            WHERE league_name=%s AND match_date<%s
-              AND home_goals IS NOT NULL AND away_goals IS NOT NULL
+            WHERE league_name=%s AND match_date<%s AND home_goals IS NOT NULL AND away_goals IS NOT NULL
             ORDER BY match_date""",
         """SELECT match_date,home_team,away_team,home_goals,away_goals,
                   home_shots_on_target,away_shots_on_target,home_corners,away_corners
              FROM espn_current_matches
-            WHERE league_name=%s AND match_date<%s
-              AND home_goals IS NOT NULL AND away_goals IS NOT NULL
+            WHERE league_name=%s AND match_date<%s AND home_goals IS NOT NULL AND away_goals IS NOT NULL
             ORDER BY match_date""",
     ]
     for sql in queries:
@@ -171,35 +185,29 @@ def _early_gate(pred, home_ctx: Dict[str, Any], away_ctx: Dict[str, Any], home_r
     quality = float(getattr(pred, "data_quality", 0.0) or 0.0)
     if quality < MIN_MODEL_DATA_QUALITY:
         blockers.append("thin_match_sample")
-
     covs = [float(x.get("player_coverage") or 0.0) for x in (home_ctx, away_ctx)]
     player_cov = sum(covs) / 2.0
     if player_cov < MIN_PLAYER_COVERAGE:
         blockers.append("player_context_coverage_low")
-
     continuities = [float(x["starter_continuity"]) for x in (home_ctx, away_ctx) if x.get("starter_continuity") is not None]
     min_cont = min(continuities) if continuities else None
     if min_cont is not None and min_cont < MIN_STARTER_CONTINUITY:
         blockers.append("starter_continuity_low")
-
     impacts = [float(x.get("injury_impact") or 0.0) for x in (home_ctx, away_ctx)]
     max_impact = max(impacts) if impacts else 0.0
     if max_impact >= MAX_KNOWN_INJURY_IMPACT:
         blockers.append("known_injury_impact_high")
     if bool(home_ctx.get("goalkeeper_injured")) or bool(away_ctx.get("goalkeeper_injured")):
         blockers.append("goalkeeper_injury")
-
     rests = [r for r in (home_rest, away_rest) if r is not None]
     min_rest = min(rests) if rests else None
     if min_rest is not None and min_rest < MIN_REST_DAYS:
         blockers.append("extreme_short_rest")
-
-    diagnostics = {
+    return not blockers, blockers, {
         "model_data_quality": quality, "player_coverage": player_cov,
         "min_starter_continuity": min_cont, "max_known_injury_impact": max_impact,
         "home_rest_days": home_rest, "away_rest_days": away_rest,
     }
-    return not blockers, blockers, diagnostics
 
 
 def _latest_import_coverage(conn, fixture_count: int) -> Dict[str, Any]:
@@ -234,6 +242,15 @@ def _price_payload(conn, event_id: str, market: str, selection: str) -> Optional
     }
 
 
+def _market_alignment(model_p: float, ref: Optional[Dict[str, Any]]) -> Tuple[bool, Optional[str]]:
+    if not ref:
+        return False, "international_reference_missing"
+    gap = abs(float(model_p) - float(ref["reference_p_yes"]))
+    if gap > INTERNATIONAL_MAX_MODEL_DIVERGENCE:
+        return False, "model_market_divergence_high"
+    return True, None
+
+
 def _one_per_fixture(rows: Iterable[Dict[str, Any]], key_fn):
     best: Dict[str, Dict[str, Any]] = {}
     for row in rows:
@@ -241,6 +258,37 @@ def _one_per_fixture(rows: Iterable[Dict[str, Any]], key_fn):
         if cur is None or key_fn(row) > key_fn(cur):
             best[row["event_id"]] = row
     return list(best.values())
+
+
+def _public_item(row: Dict[str, Any], *, include_value: bool) -> Dict[str, Any]:
+    pinfo, ref = row.get("price") or {}, row.get("international") or {}
+    item = {
+        "event_id": row["event_id"], "match_date": row["match_date"], "league": row["league"],
+        "home": row["home"], "away": row["away"], "market": row["market"], "selection": row["selection"],
+        "confidence": row["confidence"],
+        "tr_price": pinfo.get("tr_price"), "tr_opening_price": pinfo.get("tr_opening_price"),
+        "tr_source": pinfo.get("tr_source"),
+        "international_fair_probability": ref.get("reference_p_yes"),
+        "international_fair_odds": (1.0 / float(ref["reference_p_yes"])) if ref.get("reference_p_yes") else None,
+        "international_bookmakers": ref.get("bookmaker_count"),
+        "international_dispersion": ref.get("dispersion"),
+        "international_sharp_bookmaker": ref.get("sharp_bookmaker"),
+        "international_sharp_probability": ref.get("sharp_p_yes"),
+        "international_median_price": ref.get("median_price_yes"),
+        "international_quality": ref.get("quality"),
+        "model_market_gap": row.get("metrics", {}).get("model_market_gap"),
+        "early_context": row["early_context"],
+    }
+    if include_value:
+        metrics = row["metrics"]
+        item.update({
+            "tr_implied_probability": metrics["tr_implied_probability"],
+            "model_edge_vs_tr": metrics["model_edge_vs_tr"],
+            "model_ev_vs_tr": metrics["model_ev_vs_tr"],
+            "international_edge_vs_tr": metrics["international_edge_vs_tr"],
+            "international_ev_vs_tr": metrics["international_ev_vs_tr"],
+        })
+    return item
 
 
 def build_decision(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, limit: int = LIST_LIMIT) -> Dict[str, Any]:
@@ -265,7 +313,7 @@ def build_decision(database_url: str = DATABASE_URL, *, now: Optional[datetime] 
             excluded_counts: Dict[str, int] = defaultdict(int)
 
             for eid, match_date, league, home, away in fixtures:
-                if league not in histories:
+                if str(league) not in histories:
                     histories[str(league)] = _history_rows(conn, str(league), match_date)
                 history = histories[str(league)]
                 if not history:
@@ -284,119 +332,178 @@ def build_decision(database_url: str = DATABASE_URL, *, now: Optional[datetime] 
                     "p_corners_over_8_5": float(pred.p_corners_over_8_5),
                 }
                 for market, selection, attr in MARKETS:
+                    model_p = probs[attr]
+                    price = _price_payload(conn, str(eid), market, selection)
+                    ref = latest_ref(conn, str(eid), market)
+                    aligned, alignment_reason = _market_alignment(model_p, ref)
+                    metrics = market_metrics(model_p, price["tr_price"], ref["reference_p_yes"]) if price and ref else None
                     market_rows.append({
                         "event_id": str(eid), "match_date": match_date, "league": str(league),
                         "home": str(home), "away": str(away), "market": market, "selection": selection,
-                        "confidence": probs[attr], "eligible": bool(eligible), "blockers": blockers,
-                        "early_context": gate_diag, "price": _price_payload(conn, str(eid), market, selection),
+                        "confidence": model_p, "eligible": bool(eligible), "blockers": blockers,
+                        "early_context": gate_diag, "price": price, "international": ref,
+                        "international_aligned": aligned, "alignment_reason": alignment_reason,
+                        "metrics": metrics,
                     })
+
+            candidate_rows = [r for r in market_rows if r["eligible"] and r["confidence"] >= VALUE_MIN_CONFIDENCE]
+            tr_candidate_rows = [r for r in candidate_rows if r["price"]]
+            intl_candidate_rows = [r for r in tr_candidate_rows if r["international"]]
+            aligned_candidate_rows = [r for r in intl_candidate_rows if r["international_aligned"]]
 
             raw_high = [r for r in market_rows if r["eligible"] and r["confidence"] >= HIGH_CONFIDENCE_MIN]
             priced_high = [r for r in raw_high if r["price"]]
+            verified_high = [r for r in priced_high if r["international"] and r["international_aligned"]]
             raw_high_fixtures = _one_per_fixture(raw_high, lambda r: (r["confidence"],))
             priced_high_fixtures = _one_per_fixture(priced_high, lambda r: (r["confidence"],))
-            high_rows = sorted(priced_high_fixtures, key=lambda r: r["confidence"], reverse=True)
+            verified_high_fixtures = _one_per_fixture(verified_high, lambda r: (r["confidence"],))
+            verified_high_fixtures.sort(key=lambda r: r["confidence"], reverse=True)
 
-            high_list: List[Dict[str, Any]] = []
-            for r in high_rows[:limit]:
-                pinfo = r["price"] or {}
-                high_list.append({
-                    "event_id": r["event_id"], "match_date": r["match_date"], "league": r["league"],
-                    "home": r["home"], "away": r["away"], "market": r["market"], "selection": r["selection"],
-                    "confidence": r["confidence"], "tr_price": pinfo.get("tr_price"),
-                    "tr_opening_price": pinfo.get("tr_opening_price"), "tr_source": pinfo.get("tr_source"),
-                    "early_context": r["early_context"],
-                })
+            high_list = [_public_item(r, include_value=False) for r in verified_high_fixtures[:limit]]
 
             value_candidates: List[Dict[str, Any]] = []
-            for r in market_rows:
-                if not r["eligible"] or r["confidence"] < VALUE_MIN_CONFIDENCE or not r["price"]:
+            for r in aligned_candidate_rows:
+                metrics = r.get("metrics")
+                if not metrics:
                     continue
-                price = float(r["price"]["tr_price"])
-                market_p = 1.0 / price
-                edge = r["confidence"] - market_p
-                ev = r["confidence"] * price - 1.0
-                if edge >= VALUE_MIN_EDGE and ev >= VALUE_MIN_EV:
-                    item = dict(r)
-                    item.update({"market_implied_probability": market_p, "edge": edge, "ev": ev})
-                    value_candidates.append(item)
-            value_rows = _one_per_fixture(value_candidates, lambda r: (r["confidence"], r["ev"], r["edge"]))
-            value_rows.sort(key=lambda r: (r["confidence"], r["ev"], r["edge"]), reverse=True)
+                if (
+                    metrics["model_edge_vs_tr"] >= VALUE_MIN_EDGE
+                    and metrics["model_ev_vs_tr"] >= VALUE_MIN_EV
+                    and metrics["international_edge_vs_tr"] >= INTERNATIONAL_MIN_TR_EDGE
+                    and metrics["international_ev_vs_tr"] >= INTERNATIONAL_MIN_TR_EV
+                ):
+                    value_candidates.append(r)
+            value_rows = _one_per_fixture(
+                value_candidates,
+                lambda r: (
+                    min(r["metrics"]["model_ev_vs_tr"], r["metrics"]["international_ev_vs_tr"]),
+                    r["confidence"],
+                    r["metrics"]["model_edge_vs_tr"],
+                ),
+            )
+            value_rows.sort(
+                key=lambda r: (
+                    min(r["metrics"]["model_ev_vs_tr"], r["metrics"]["international_ev_vs_tr"]),
+                    r["confidence"],
+                ),
+                reverse=True,
+            )
+            value_list = [_public_item(r, include_value=True) for r in value_rows[:limit]]
 
-            value_list: List[Dict[str, Any]] = []
-            for r in value_rows[:limit]:
-                pinfo = r["price"] or {}
-                value_list.append({
-                    "event_id": r["event_id"], "match_date": r["match_date"], "league": r["league"],
-                    "home": r["home"], "away": r["away"], "market": r["market"], "selection": r["selection"],
-                    "confidence": r["confidence"], "tr_price": pinfo.get("tr_price"),
-                    "tr_opening_price": pinfo.get("tr_opening_price"), "tr_source": pinfo.get("tr_source"),
-                    "market_implied_probability": r["market_implied_probability"], "edge": r["edge"], "ev": r["ev"],
-                    "early_context": r["early_context"],
-                })
+            high_keys = {(x["event_id"], x["market"]) for x in high_list}
+            value_keys = {(x["event_id"], x["market"]) for x in value_list}
+            for x in high_list:
+                x["also_value"] = (x["event_id"], x["market"]) in value_keys
+            for x in value_list:
+                x["also_high_confidence"] = (x["event_id"], x["market"]) in high_keys
 
             coverage = _latest_import_coverage(conn, len(fixtures))
             official_coverage = float(coverage.get("fixture_coverage") or 0.0)
-            required_priced_high = math.ceil(len(raw_high_fixtures) * HIGH_PRICE_COVERAGE_MIN) if raw_high_fixtures else 0
-            high_price_coverage = (len(priced_high_fixtures) / len(raw_high_fixtures)) if raw_high_fixtures else 0.0
-            decision_ready = bool(
-                raw_high_fixtures
-                and official_coverage >= BULLETIN_FIXTURE_COVERAGE_MIN
-                and len(priced_high_fixtures) >= required_priced_high
-                and len(high_list) > 0
-            )
+            tr_candidate_coverage = len(tr_candidate_rows) / len(candidate_rows) if candidate_rows else 0.0
+            international_candidate_coverage = len(intl_candidate_rows) / len(tr_candidate_rows) if tr_candidate_rows else 0.0
+            aligned_candidate_coverage = len(aligned_candidate_rows) / len(tr_candidate_rows) if tr_candidate_rows else 0.0
+
+            if candidate_rows:
+                decision_ready = bool(
+                    tr_candidate_coverage >= CANDIDATE_COVERAGE_MIN
+                    and international_candidate_coverage >= CANDIDATE_COVERAGE_MIN
+                )
+            else:
+                # Only finalize an empty week after enough of the Turkish bulletin is
+                # visible to know that "no candidate" is a real conclusion.
+                decision_ready = bool(official_coverage >= NO_CANDIDATE_BULLETIN_COVERAGE_MIN)
+
+            alignment_rejections = defaultdict(int)
+            for r in tr_candidate_rows:
+                if r.get("alignment_reason"):
+                    alignment_rejections[r["alignment_reason"]] += 1
 
             diagnostics = {
                 "policy": {
-                    "markets": [m[0] for m in MARKETS], "high_confidence_min": HIGH_CONFIDENCE_MIN,
-                    "value_min_confidence": VALUE_MIN_CONFIDENCE, "value_min_edge": VALUE_MIN_EDGE,
-                    "value_min_ev": VALUE_MIN_EV, "min_model_data_quality": MIN_MODEL_DATA_QUALITY,
-                    "min_player_coverage": MIN_PLAYER_COVERAGE, "min_starter_continuity": MIN_STARTER_CONTINUITY,
-                    "max_known_injury_impact": MAX_KNOWN_INJURY_IMPACT, "min_rest_days": MIN_REST_DAYS,
-                    "bulletin_fixture_coverage_min": BULLETIN_FIXTURE_COVERAGE_MIN,
-                    "high_price_coverage_min": HIGH_PRICE_COVERAGE_MIN,
-                    "foreign_odds_used": False, "confirmed_lineup_required": False,
+                    "markets": [m[0] for m in MARKETS],
+                    "high_confidence_min": HIGH_CONFIDENCE_MIN,
+                    "value_min_confidence": VALUE_MIN_CONFIDENCE,
+                    "model_edge_vs_tr_min": VALUE_MIN_EDGE,
+                    "model_ev_vs_tr_min": VALUE_MIN_EV,
+                    "international_edge_vs_tr_min": INTERNATIONAL_MIN_TR_EDGE,
+                    "international_ev_vs_tr_min": INTERNATIONAL_MIN_TR_EV,
+                    "max_model_market_divergence": INTERNATIONAL_MAX_MODEL_DIVERGENCE,
+                    "min_model_data_quality": MIN_MODEL_DATA_QUALITY,
+                    "min_player_coverage": MIN_PLAYER_COVERAGE,
+                    "min_starter_continuity": MIN_STARTER_CONTINUITY,
+                    "max_known_injury_impact": MAX_KNOWN_INJURY_IMPACT,
+                    "min_rest_days": MIN_REST_DAYS,
+                    "candidate_coverage_min": CANDIDATE_COVERAGE_MIN,
+                    "no_candidate_bulletin_coverage_min": NO_CANDIDATE_BULLETIN_COVERAGE_MIN,
+                    "model_source": "validated_v1",
+                    "international_role": "paired_same-book_no-vig_reference_only",
+                    "executable_price_source": "iddaa_official_turkey",
+                    "confirmed_lineup_required": False,
+                    "t_minus_reselection": False,
                 },
-                "excluded_counts": dict(excluded_counts), "turkey_import": coverage,
-                "raw_high_market_candidates": len(raw_high), "priced_high_market_candidates": len(priced_high),
+                "excluded_counts": dict(excluded_counts),
+                "alignment_rejections": dict(alignment_rejections),
+                "turkey_import": coverage,
+                "candidate_market_rows": len(candidate_rows),
+                "tr_priced_candidate_rows": len(tr_candidate_rows),
+                "international_candidate_rows": len(intl_candidate_rows),
+                "aligned_candidate_rows": len(aligned_candidate_rows),
+                "tr_candidate_coverage": tr_candidate_coverage,
+                "international_candidate_coverage": international_candidate_coverage,
+                "aligned_candidate_coverage": aligned_candidate_coverage,
+                "raw_high_market_candidates": len(raw_high),
+                "priced_high_market_candidates": len(priced_high),
+                "verified_high_market_candidates": len(verified_high),
                 "raw_high_fixture_candidates": len(raw_high_fixtures),
                 "priced_high_fixture_candidates": len(priced_high_fixtures),
-                "high_price_coverage": high_price_coverage,
+                "verified_high_fixture_candidates": len(verified_high_fixtures),
             }
 
             result = {
                 "status": "success", "decision_run_id": run_id, "week_key": week_key,
                 "horizon_start": start, "horizon_end": end, "fixture_count": len(fixtures),
-                "model_market_rows": len(market_rows), "eligible_market_rows": sum(1 for r in market_rows if r["eligible"]),
+                "model_market_rows": len(market_rows),
+                "eligible_market_rows": sum(1 for r in market_rows if r["eligible"]),
                 "official_events": int(coverage.get("official_events") or 0),
                 "matched_fixtures": int(coverage.get("matched_fixtures") or 0),
                 "official_fixture_coverage": official_coverage,
-                "raw_high_candidates": len(raw_high_fixtures), "priced_high_candidates": len(priced_high_fixtures),
-                "decision_ready": decision_ready, "high_confidence": high_list,
-                "high_confidence_value": value_list, "diagnostics": diagnostics,
+                "raw_high_candidates": len(raw_high_fixtures),
+                "priced_high_candidates": len(priced_high_fixtures),
+                "verified_high_candidates": len(verified_high_fixtures),
+                "candidate_rows": len(candidate_rows),
+                "tr_candidate_coverage": tr_candidate_coverage,
+                "international_candidate_coverage": international_candidate_coverage,
+                "decision_ready": decision_ready,
+                "high_confidence": high_list,
+                "high_confidence_value": value_list,
+                "diagnostics": diagnostics,
                 "generated_at": datetime.now(timezone.utc),
             }
             conn.execute(
                 """UPDATE thursday_decision_runs SET finished_at=NOW(),status='success',fixture_count=%s,
-                          model_market_rows=%s,eligible_market_rows=%s,official_events=%s,matched_fixtures=%s,
-                          official_fixture_coverage=%s,raw_high_candidates=%s,priced_high_candidates=%s,
-                          high_confidence_count=%s,value_count=%s,decision_ready=%s,
-                          high_confidence=%s,high_confidence_value=%s,diagnostics=%s,message=%s WHERE id=%s""",
+                   model_market_rows=%s,eligible_market_rows=%s,official_events=%s,matched_fixtures=%s,
+                   official_fixture_coverage=%s,raw_high_candidates=%s,priced_high_candidates=%s,
+                   high_confidence_count=%s,value_count=%s,decision_ready=%s,high_confidence=%s,
+                   high_confidence_value=%s,diagnostics=%s,message=%s WHERE id=%s""",
                 (
                     len(fixtures), len(market_rows), sum(1 for r in market_rows if r["eligible"]),
                     int(coverage.get("official_events") or 0), int(coverage.get("matched_fixtures") or 0),
-                    official_coverage, len(raw_high_fixtures), len(priced_high_fixtures), len(high_list), len(value_list),
-                    decision_ready,
+                    official_coverage, len(raw_high_fixtures), len(priced_high_fixtures),
+                    len(high_list), len(value_list), decision_ready,
                     Jsonb(high_list, dumps=lambda x: json.dumps(x, default=json_default, ensure_ascii=False)),
                     Jsonb(value_list, dumps=lambda x: json.dumps(x, default=json_default, ensure_ascii=False)),
                     Jsonb(diagnostics, dumps=lambda x: json.dumps(x, default=json_default, ensure_ascii=False)),
-                    "Thursday early-play decision; Turkey price only; no T-1/T-3 gate", run_id,
+                    "model+international no-vig reference+Turkey executable price",
+                    run_id,
                 ),
             )
             print("THURSDAY_DECISION_RESULT", json.dumps(result, ensure_ascii=False, default=json_default, separators=(",", ":")), flush=True)
             return result
         except Exception as exc:
-            conn.execute("UPDATE thursday_decision_runs SET finished_at=NOW(),status='failed',message=%s WHERE id=%s", (str(exc)[:1500], run_id))
+            conn.execute(
+                "UPDATE thursday_decision_runs SET finished_at=NOW(),status='failed',message=%s WHERE id=%s",
+                (str(exc)[:1200], run_id),
+            )
             raise
 
 
