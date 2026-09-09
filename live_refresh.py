@@ -26,9 +26,7 @@ RUN_UNDERSTAT = os.getenv("LIVE_REFRESH_UNDERSTAT", "true").lower() in {"1", "tr
 RUN_ODDSPAPI = os.getenv("LIVE_REFRESH_ODDSPAPI", "true").lower() in {"1", "true", "yes"}
 RUN_FOTMOB_AVAILABILITY = os.getenv("LIVE_REFRESH_FOTMOB_AVAILABILITY", "true").lower() in {"1", "true", "yes"}
 RUN_BBS = os.getenv("LIVE_REFRESH_BBS", "false").lower() in {"1", "true", "yes"}
-# Match lineups are only useful shortly before kickoff and cost many calls; disabled in the standard refresh.
 RUN_BBS_LINEUPS = os.getenv("LIVE_REFRESH_BBS_LINEUPS", "false").lower() in {"1", "true", "yes"}
-# Render is currently blocked by Sofascore (403); keep it as an explicit opt-in diagnostic source.
 RUN_SOFASCORE = os.getenv("LIVE_REFRESH_SOFASCORE", "false").lower() in {"1", "true", "yes"}
 RUN_ADVANCED = os.getenv("LIVE_REFRESH_ADVANCED", "true").lower() in {"1", "true", "yes"}
 RUN_PREMATCH = os.getenv("LIVE_REFRESH_PREMATCH", "true").lower() in {"1", "true", "yes"}
@@ -174,7 +172,7 @@ def main() -> Dict[str, Any]:
         from data_readiness_audit_v4 import run_audit as fn
         run_step("data_readiness", lambda: fn(DATABASE_URL), steps)
     if RUN_PREDICTIONS:
-        from production_predictor_v3 import run_predictions as fn
+        from production_predictor_v4 import run_predictions as fn
         run_step("production_predictions", lambda: fn(DATABASE_URL), steps)
 
     summary["finished_at"] = utcnow().isoformat()
