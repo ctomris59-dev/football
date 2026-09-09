@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Minimal production refresh for Thursday -> two lists -> bet -> done.
 
-Active weekly inputs only:
+Active weekly preparation:
 - ESPN current results/upcoming fixtures;
 - current injury availability (freshness-gated, optional);
 - current rosters + real historical starts -> expected-XI/player context;
-- official Turkish İddaa opening prices;
+- official Turkish İddaa opening-price watch;
+- international paired same-book no-vig validation ONLY after Turkey target prices appear;
 - one frozen Thursday decision.
 
-Foreign odds, Asian lines, T-1/T-3 lineups, odds movement, shadow audits and weekly
-backtests are excluded from this live path. Historical research stays offline.
+International prices are never executable prices and never replace model confidence.
+They are fetched at freeze time only as a fair-market sanity/value reference. T-1/T-3,
+confirmed-lineup reselection, odds-movement rebets, shadow audits and weekly backtests
+remain outside the live user decision path.
 """
 from __future__ import annotations
 
@@ -67,7 +70,7 @@ def _fotmob_is_fresh() -> bool:
 
 
 def _run() -> Dict[str, Any]:
-    summary: Dict[str, Any] = {"started_at": utcnow().isoformat(), "workflow": "thursday-two-lists", "steps": {}}
+    summary: Dict[str, Any] = {"started_at": utcnow().isoformat(), "workflow": "thursday-two-lists-final", "steps": {}}
     steps = summary["steps"]
 
     from espn_current_importer import run_import as espn_current
@@ -86,9 +89,9 @@ def _run() -> Dict[str, Any]:
     from player_context_orchestrator import run as player_context
     run_step("player_context", lambda: player_context(DATABASE_URL), steps)
 
-    # At the scheduled Thursday evening run this both checks official Turkey prices
-    # and freezes the first sufficiently complete two-list decision. If the bulletin
-    # is not ready, it stays pending and the lightweight public watcher may retry.
+    # This single step owns all price logic. It checks official Turkey prices first.
+    # Only once playable target prices exist does it refresh the international paired
+    # no-vig reference and then freeze the first sufficiently complete two-list output.
     from thursday_opening_watch import main as opening_watch
     run_step("opening_watch", lambda: opening_watch(DATABASE_URL), steps)
 
@@ -103,7 +106,7 @@ def main() -> Dict[str, Any]:
         raise RuntimeError("Missing DATABASE_URL")
     local = utcnow().astimezone(ISTANBUL)
     if local.weekday() != 3 and not REFRESH_FORCE:
-        result = {"status": "skipped_not_thursday", "local_time": local.isoformat(), "workflow": "thursday-two-lists"}
+        result = {"status": "skipped_not_thursday", "local_time": local.isoformat(), "workflow": "thursday-two-lists-final"}
         log.info("THURSDAY_REFRESH_SKIP %s", json.dumps(result, separators=(",", ":")))
         return result
 
@@ -120,7 +123,7 @@ def main() -> Dict[str, Any]:
             return skipped
         try:
             result = _run()
-            guard_finish(lock, guard_id, "success", "Thursday prep/opening decision completed")
+            guard_finish(lock, guard_id, "success", "Thursday final decision preparation completed")
             return result
         except Exception as exc:
             guard_finish(lock, guard_id, "failed", str(exc))
