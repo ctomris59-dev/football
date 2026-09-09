@@ -28,27 +28,33 @@ jobs:
           import data_readiness_audit_v4
           import odds_movement_enricher
           import live_refresh
-          import advanced_features_pipeline
-          import second_tier_importer_v2
-          import promotion_prior_builder
-          import promotion_prior_backtest
-          import clubelo_importer
-          import fotmob_strength_style_importer
-          import fixture_enrichment_builder
-          import oddspapi_allbooks_importer
+          import advanced_features_pipeline_v2
+          import second_tier_importer_v3
+          import promotion_prior_builder_v2
+          import promotion_prior_backtest_v2
+          import internal_elo_builder
+          import internal_style_builder
+          import fotmob_strength_style_importer_v2
+          import availability_enricher_v3
+          import oddspapi_allbooks_importer_v2
           import market_consensus_builder
           import score_state_builder
           import score_state_backtest
           import export_app
           print('imports-ok')
           PY
-      - name: Model and market logic smoke test
+      - name: Model, market and fallback logic smoke test
         run: |
           python - <<'PY'
           from model_engine import predict_match
           from production_predictor import market_kind, outcome_side, no_vig_selected
           from market_consensus_builder import no_vig
           from oddspapi_allbooks_importer import market_kind as allbooks_market_kind
+          from oddspapi_allbooks_importer_v2 import redact, discover_bookmaker_slugs
+          from second_tier_importer_v3 import score_pair, openfootball_rows
+          from promotion_prior_builder_v2 import aggregate
+          from internal_elo_builder import expected
+          from fotmob_strength_style_importer_v2 import season_variants
 
           history=[]
           for i in range(20):
@@ -77,5 +83,17 @@ jobs:
           assert price == 1.90 and nv is not None and 0 < nv < 1
           nv_book = no_vig(1.90,2.00)
           assert nv_book is not None and 0 < nv_book < 1
+
+          assert score_pair({'ft':[2,1]}) == (2,1)
+          rows = openfootball_rows({'matches':[{'date':'2025-08-01','team1':'A','team2':'B','score':{'ft':[2,1]}}]})
+          assert len(rows) == 1 and rows[0]['FTHG'] == 2
+          stats, _ = aggregate([('X','A','B',2,1,None,None,None,None,None,None)])
+          assert stats['a']['goals_for'] == 2.0
+          assert stats['a']['corners_for'] is None
+          assert 0 < expected(1500,1500) < 1
+          assert '2627' in season_variants('2026/2027')
+          assert '[REDACTED_QUERY]' in redact('https://x.test/path?apiKey=secret')
+          books=discover_bookmaker_slugs([{'slug':'pinnacle'},{'slug':'betfair'},{'slug':'clone','cloneOf':'x'}])
+          assert books[:2] == ['pinnacle','betfair']
           print('logic-smoke-ok', p.as_dict(), nv_book)
           PY

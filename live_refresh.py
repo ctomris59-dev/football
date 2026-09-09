@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Ordered live refresh pipeline for the Big Five prediction system.
 
-Provider calls are freshness-gated. The scheduled Thursday/Friday refreshes build
-all current context, advanced feature layers and finally the quality-gated Top-10.
+Provider calls are freshness-gated. Optional providers fail soft; deterministic
+feature/readiness transforms fail closed so stale or malformed context cannot be
+silently promoted into the weekly Top-10.
 """
 from __future__ import annotations
 
@@ -25,8 +26,10 @@ RUN_UNDERSTAT = os.getenv("LIVE_REFRESH_UNDERSTAT", "true").lower() in {"1", "tr
 RUN_ODDSPAPI = os.getenv("LIVE_REFRESH_ODDSPAPI", "true").lower() in {"1", "true", "yes"}
 RUN_FOTMOB_AVAILABILITY = os.getenv("LIVE_REFRESH_FOTMOB_AVAILABILITY", "true").lower() in {"1", "true", "yes"}
 RUN_BBS = os.getenv("LIVE_REFRESH_BBS", "false").lower() in {"1", "true", "yes"}
-RUN_BBS_LINEUPS = os.getenv("LIVE_REFRESH_BBS_LINEUPS", "true").lower() in {"1", "true", "yes"}
-RUN_SOFASCORE = os.getenv("LIVE_REFRESH_SOFASCORE", "true").lower() in {"1", "true", "yes"}
+# Match lineups are only useful shortly before kickoff and cost many calls; disabled in the standard refresh.
+RUN_BBS_LINEUPS = os.getenv("LIVE_REFRESH_BBS_LINEUPS", "false").lower() in {"1", "true", "yes"}
+# Render is currently blocked by Sofascore (403); keep it as an explicit opt-in diagnostic source.
+RUN_SOFASCORE = os.getenv("LIVE_REFRESH_SOFASCORE", "false").lower() in {"1", "true", "yes"}
 RUN_ADVANCED = os.getenv("LIVE_REFRESH_ADVANCED", "true").lower() in {"1", "true", "yes"}
 RUN_PREMATCH = os.getenv("LIVE_REFRESH_PREMATCH", "true").lower() in {"1", "true", "yes"}
 RUN_ODDS_MOVEMENT = os.getenv("LIVE_REFRESH_ODDS_MOVEMENT", "true").lower() in {"1", "true", "yes"}
@@ -54,9 +57,10 @@ def run_step(name: str, fn: Callable[[], Any], summary: Dict[str, Any], *, optio
         summary[name] = {"status": "ok", "result": result}
         log.info("LIVE_REFRESH_STEP step=%s status=ok result=%s", name, result)
     except Exception as exc:
-        summary[name] = {"status": "failed", "error": str(exc)}
+        msg = str(exc)[:1000]
+        summary[name] = {"status": "failed", "error": msg}
         if optional:
-            log.warning("LIVE_REFRESH_STEP step=%s status=failed_optional error=%s", name, exc)
+            log.warning("LIVE_REFRESH_STEP step=%s status=failed_optional error=%s", name, msg)
         else:
             log.exception("LIVE_REFRESH_STEP step=%s status=failed", name)
             raise
@@ -129,7 +133,7 @@ def main() -> Dict[str, Any]:
         if recent_success("oddspapi_allbooks_runs", ODDSPAPI_REFRESH_HOURS):
             skip(steps, "oddspapi_allbooks", f"fresh<{ODDSPAPI_REFRESH_HOURS}h")
         else:
-            from oddspapi_allbooks_importer import run_import as fn
+            from oddspapi_allbooks_importer_v2 import run_import as fn
             run_step("oddspapi_allbooks", lambda: fn(DATABASE_URL), steps, optional=True)
 
     if RUN_FOTMOB_AVAILABILITY:
@@ -145,13 +149,17 @@ def main() -> Dict[str, Any]:
     if RUN_BBS_LINEUPS:
         from bbs_lineups_importer import run_import as fn
         run_step("bbs_lineups", lambda: fn(DATABASE_URL), steps, optional=True)
+    else:
+        skip(steps, "bbs_lineups", "disabled in standard refresh; use near-kickoff only")
     if RUN_SOFASCORE:
         from sofascore_availability_www import run_import as fn
         run_step("sofascore_availability", lambda: fn(DATABASE_URL), steps, optional=True)
+    else:
+        skip(steps, "sofascore_availability", "disabled after persistent Render 403")
 
     if RUN_ADVANCED:
-        from advanced_features_pipeline import run as fn
-        run_step("advanced_features", lambda: fn(DATABASE_URL), steps, optional=True)
+        from advanced_features_pipeline_v2 import run as fn
+        run_step("advanced_features", lambda: fn(DATABASE_URL), steps)
 
     if RUN_PREMATCH:
         from prematch_context_builder_fixed import run_build as fn
@@ -160,8 +168,8 @@ def main() -> Dict[str, Any]:
         from odds_movement_enricher import run_enrich as fn
         run_step("odds_movement", lambda: fn(DATABASE_URL), steps, optional=True)
     if RUN_AVAILABILITY_ENRICH:
-        from availability_enricher_v2 import run_enrich as fn
-        run_step("availability_enrich", lambda: fn(DATABASE_URL), steps, optional=True)
+        from availability_enricher_v3 import run_enrich as fn
+        run_step("availability_enrich", lambda: fn(DATABASE_URL), steps)
     if RUN_READINESS:
         from data_readiness_audit_v4 import run_audit as fn
         run_step("data_readiness", lambda: fn(DATABASE_URL), steps)
