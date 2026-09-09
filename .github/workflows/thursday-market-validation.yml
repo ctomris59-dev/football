@@ -1,0 +1,50 @@
+name: thursday-market-validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate-final-market-flow:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile final Thursday modules
+        run: |
+          python -m py_compile market_consensus_builder.py international_market_reference.py thursday_decision_engine.py thursday_opening_watch.py live_refresh.py
+      - name: Validate no-vig and Turkey-value separation
+        run: |
+          python - <<'PY'
+          from market_consensus_builder import no_vig, no_vig_pair
+          from international_market_reference import reference_quality
+          from thursday_decision_engine import market_metrics
+
+          fair = no_vig(1.90, 2.00)
+          assert fair is not None and 0 < fair < 1
+
+          # Old malformed central-market price patterns must fail closed.
+          assert no_vig(29.0, 1.03) is None
+          assert no_vig_pair(12.0, 1.04) is None
+
+          ok, quality = reference_quality(2, .69, .02, None, None)
+          assert ok and quality == 'multi_book_consensus'
+          ok, _ = reference_quality(1, .69, .02, None, None)
+          assert not ok
+          ok, quality = reference_quality(1, .69, 0.0, 'pinnacle', .69)
+          assert ok and quality == 'sharp_single_book'
+
+          m = market_metrics(.72, 1.55, .69)
+          assert abs(m['tr_implied_probability'] - 1/1.55) < 1e-12
+          assert m['model_ev_vs_tr'] > .11
+          assert m['international_ev_vs_tr'] > .06
+          assert m['model_edge_vs_tr'] > 0
+          assert m['international_edge_vs_tr'] > 0
+          print('thursday-market-validation-ok')
+          PY
