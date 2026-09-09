@@ -7,12 +7,14 @@ import logging
 import os
 import tempfile
 import threading
+import time
 import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 import psycopg
+import requests
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
@@ -32,6 +34,8 @@ AUTO_RUN_BACKTEST = env_bool("AUTO_RUN_BACKTEST", "false")
 AUTO_BACKTEST_NEW_MODEL = env_bool("AUTO_BACKTEST_NEW_MODEL", "false")
 AUTO_BACKTEST_HYBRID = env_bool("AUTO_BACKTEST_HYBRID", "false")
 AUTO_BACKTEST_VALUE = env_bool("AUTO_BACKTEST_VALUE", "false")
+VALIDATION_KEEPALIVE = env_bool("VALIDATION_KEEPALIVE", "true")
+KEEPALIVE_INTERVAL = max(8.0, float(os.getenv("VALIDATION_KEEPALIVE_INTERVAL_SECONDS", "15")))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("football-export")
@@ -82,6 +86,42 @@ def _run_live_refresh() -> None:
         refresh_state["running"] = False
         refresh_state["last_finished"] = datetime.now(timezone.utc).isoformat()
         refresh_lock.release()
+
+
+def _validation_keepalive() -> None:
+    """Keep Render Free awake only while an explicitly enabled startup validation runs.
+
+    Render may immediately re-apply an already-expired idle timer after deployment. An
+    external self-request counts as real HTTP traffic and prevents the validation
+    container from being suspended halfway through a resume-safe historical backfill.
+    This thread exists only when AUTO_LIVE_REFRESH is explicitly true; normal
+    production remains quota-safe and naturally sleepable.
+    """
+    if not (AUTO_LIVE_REFRESH and VALIDATION_KEEPALIVE):
+        return
+    base = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    if not base:
+        name = os.getenv("RENDER_SERVICE_NAME", "football-dataset-export").strip()
+        base = f"https://{name}.onrender.com"
+    url = base + "/health"
+    # Lifespan runs before the socket is announced ready. Give uvicorn a moment, then
+    # keep traffic alive until the refresh has definitely finished.
+    time.sleep(4.0)
+    failures = 0
+    while True:
+        if refresh_state.get("last_finished") and not refresh_state.get("running"):
+            break
+        try:
+            r = requests.get(url, timeout=10, headers={"User-Agent": "football-validation-keepalive/1.0"})
+            failures = 0
+            log.info("VALIDATION_KEEPALIVE status=%s running=%s", r.status_code, bool(refresh_state.get("running")))
+        except Exception as exc:
+            failures += 1
+            # Fail soft: keepalive must never make data validation fail.
+            if failures <= 3 or failures % 10 == 0:
+                log.warning("VALIDATION_KEEPALIVE_FAILED failures=%s error=%s", failures, str(exc)[:250])
+        time.sleep(KEEPALIVE_INTERVAL)
+    log.info("VALIDATION_KEEPALIVE_STOP status=%s", refresh_state.get("last_status"))
 
 
 def _run_backtest() -> None:
@@ -135,6 +175,7 @@ def start_thread(target: Callable[[], None], name: str) -> None:
 async def lifespan(app: FastAPI):
     if DATABASE_URL and AUTO_LIVE_REFRESH:
         start_thread(_run_live_refresh, "ordered-live-refresh")
+        start_thread(_validation_keepalive, "validation-keepalive")
     if DATABASE_URL and AUTO_RUN_BACKTEST:
         start_thread(_run_backtest, "model-backtest")
     elif DATABASE_URL and AUTO_BACKTEST_NEW_MODEL:
@@ -146,7 +187,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Football Prediction Data Service", version="4.0", lifespan=lifespan)
+app = FastAPI(title="Football Prediction Data Service", version="4.1", lifespan=lifespan)
 
 
 def auth(token: Optional[str], authorization: Optional[str]) -> None:
@@ -174,15 +215,12 @@ def rowdict(cur, row) -> Optional[dict[str, Any]]:
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": "4.0", "auto_live_refresh": AUTO_LIVE_REFRESH, "refresh": dict(refresh_state)}
+    return {"ok": True, "version": "4.1", "auto_live_refresh": AUTO_LIVE_REFRESH, "refresh": dict(refresh_state)}
 
 
 @app.get("/")
 def root():
     global validation_root_started
-    # One-shot validation hook: only active while the short-lived validation token exists.
-    # Render calls `/` after a healthy deploy, which lets us trigger exactly once without
-    # enabling startup refresh or exposing provider refreshes to deploy lifecycle events.
     if VALIDATION_TRIGGER_TOKEN and not validation_root_started and not refresh_lock.locked():
         validation_root_started = True
         start_thread(_run_live_refresh, "validation-root-one-shot")
@@ -238,76 +276,24 @@ def status(token: Optional[str] = Query(None), authorization: Optional[str] = He
                 details[name] = None
 
         one("collector", "SELECT run_id::text AS run_id,started_at,finished_at,status,api_calls,message FROM collection_runs ORDER BY started_at DESC LIMIT 1")
-        one("football_data", "SELECT * FROM football_data_import_runs ORDER BY id DESC LIMIT 1")
-        one("second_tier", "SELECT * FROM second_tier_import_runs ORDER BY id DESC LIMIT 1")
-        one("promotion_priors", "SELECT * FROM promotion_prior_runs ORDER BY id DESC LIMIT 1")
-        one("promotion_backtest", "SELECT * FROM promotion_prior_backtest_runs ORDER BY id DESC LIMIT 1")
-        one("espn_current", "SELECT * FROM espn_import_runs ORDER BY id DESC LIMIT 1")
-        one("espn_context", "SELECT * FROM espn_context_runs ORDER BY id DESC LIMIT 1")
-        one("team_schedule", "SELECT * FROM espn_team_schedule_runs ORDER BY id DESC LIMIT 1")
-        one("understat", "SELECT * FROM understat_import_runs ORDER BY id DESC LIMIT 1")
-        one("clubelo", "SELECT * FROM clubelo_import_runs ORDER BY id DESC LIMIT 1")
-        one("oddspapi", "SELECT * FROM oddspapi_import_runs ORDER BY id DESC LIMIT 1")
-        one("oddspapi_allbooks", "SELECT * FROM oddspapi_allbooks_runs ORDER BY id DESC LIMIT 1")
-        one("market_consensus", "SELECT * FROM market_consensus_runs ORDER BY id DESC LIMIT 1")
-        one("bbs_lineups", "SELECT * FROM bbs_lineup_runs ORDER BY id DESC LIMIT 1")
-        one("sofascore_availability", "SELECT * FROM sofascore_availability_runs ORDER BY id DESC LIMIT 1")
-        one("fotmob_availability", "SELECT * FROM fotmob_availability_runs ORDER BY id DESC LIMIT 1")
-        one("fotmob_strength", "SELECT * FROM fotmob_strength_runs ORDER BY id DESC LIMIT 1")
-        one("score_state", "SELECT * FROM score_state_runs ORDER BY id DESC LIMIT 1")
-        one("score_state_backtest", "SELECT * FROM score_state_backtest_runs ORDER BY id DESC LIMIT 1")
-        one("fixture_enrichment", "SELECT * FROM fixture_enrichment_runs ORDER BY id DESC LIMIT 1")
-        one("prematch_context", "SELECT * FROM prematch_context_runs ORDER BY id DESC LIMIT 1")
-        one("readiness", "SELECT * FROM data_readiness_runs ORDER BY id DESC LIMIT 1")
-        one("backtest", "SELECT * FROM model_backtest_runs ORDER BY id DESC LIMIT 1")
-        one("policy_backtest", "SELECT * FROM model_policy_backtest_runs ORDER BY id DESC LIMIT 1")
-        one("value_backtest", "SELECT * FROM model_value_backtest_runs ORDER BY id DESC LIMIT 1")
-        one("production_predictions", "SELECT * FROM production_prediction_runs ORDER BY id DESC LIMIT 1")
-        try:
-            season_counts = conn.execute("SELECT season_code,COUNT(*) FROM football_data_matches GROUP BY season_code ORDER BY season_code").fetchall()
-        except Exception:
-            conn.rollback()
-            season_counts = []
-    return {
-        "counts": out,
-        "season_counts": [[str(a), int(b)] for a,b in season_counts],
-        "latest": details,
-        "refresh": dict(refresh_state),
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-    }
+        one("football_data", "SELECT started_at,finished_at,status,seasons_loaded,rows_loaded,message FROM football_data_import_runs ORDER BY id DESC LIMIT 1")
+        one("espn", "SELECT started_at,finished_at,status,api_calls,matches_seen,results_written,upcoming_written,message FROM espn_import_runs ORDER BY id DESC LIMIT 1")
+        one("understat", "SELECT started_at,finished_at,status,api_calls,matches_seen,results_written,message FROM understat_import_runs ORDER BY id DESC LIMIT 1")
+        one("oddspapi", "SELECT started_at,finished_at,status,api_calls,fixtures_seen,prices_written,message FROM oddspapi_import_runs ORDER BY id DESC LIMIT 1")
+        one("predictions", "SELECT id,started_at,finished_at,status,model_version,horizon_start,horizon_end,fixtures_scored,market_rows,top10_count,message FROM production_prediction_runs ORDER BY id DESC LIMIT 1")
+    return {"ok": True, "refresh": dict(refresh_state), "counts": out, "latest": details}
 
 
 @app.get("/predictions")
-def predictions(token: Optional[str] = Query(None), authorization: Optional[str] = Header(None), top_only: bool = Query(True)):
+def predictions(token: Optional[str] = Query(None), authorization: Optional[str] = Header(None), limit: int = Query(10, ge=1, le=100)):
     auth(token, authorization)
     if not DATABASE_URL:
         raise HTTPException(500, "DATABASE_URL is not configured.")
     with psycopg.connect(DATABASE_URL) as conn:
-        try:
-            cur = conn.execute("SELECT * FROM production_prediction_runs WHERE status='success' ORDER BY id DESC LIMIT 1")
-            run = rowdict(cur, cur.fetchone())
-            if not run:
-                return {"run": None, "predictions": []}
-            sql = "SELECT * FROM production_predictions WHERE run_id=%s"
-            params: list[Any] = [run["id"]]
-            if top_only:
-                sql += " AND top10_rank IS NOT NULL ORDER BY top10_rank"
-            else:
-                sql += " ORDER BY match_date, event_id, market"
-            cur = conn.execute(sql, params)
-            cols = [d.name for d in cur.description]
-            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-            return {"run": run, "predictions": rows}
-        except Exception as exc:
-            conn.rollback()
-            raise HTTPException(503, f"Predictions are not ready: {exc}")
-
-
-def remove_file(path: str) -> None:
-    try:
-        os.remove(path)
-    except OSError:
-        pass
+        cur = conn.execute("""SELECT * FROM production_predictions WHERE run_id=(SELECT MAX(id) FROM production_prediction_runs WHERE status='success') ORDER BY rank NULLS LAST,ranking_score DESC LIMIT %s""", (limit,))
+        cols = [d.name for d in cur.description]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    return {"ok": True, "count": len(rows), "rows": rows}
 
 
 @app.get("/download")
@@ -315,26 +301,21 @@ def download(token: Optional[str] = Query(None), authorization: Optional[str] = 
     auth(token, authorization)
     if not DATABASE_URL:
         raise HTTPException(500, "DATABASE_URL is not configured.")
-    tmp = tempfile.NamedTemporaryFile(prefix="football_dataset_", suffix=".zip", delete=False)
-    tmp.close()
-    zip_path = tmp.name
-    manifest = {"generated_at": datetime.now(timezone.utc).isoformat(), "format": "JSON Lines", "tables": {}}
-    with psycopg.connect(DATABASE_URL) as conn, zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        for table in TABLES:
-            try:
-                with conn.cursor(name=f"export_{table}") as cur:
-                    cur.itersize = 1000
-                    cur.execute(f"SELECT * FROM {table}")
-                    columns = [d.name for d in cur.description]
-                    count = 0
-                    with zf.open(f"{table}.jsonl", "w") as out_file:
-                        for row in cur:
-                            out_file.write((json.dumps(dict(zip(columns,row)), ensure_ascii=False, default=json_default, separators=(",", ":")) + "\n").encode("utf-8"))
-                            count += 1
-                    manifest["tables"][table] = {"rows": count}
-            except Exception as exc:
-                conn.rollback()
-                manifest["tables"][table] = {"error": str(exc)}
-        zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2, default=json_default))
-    filename = f"football_big5_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.zip"
-    return FileResponse(zip_path, media_type="application/zip", filename=filename, background=BackgroundTask(remove_file, zip_path))
+    fd, path = tempfile.mkstemp(prefix="football_dataset_", suffix=".zip")
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            with psycopg.connect(DATABASE_URL) as conn:
+                for table in TABLES:
+                    try:
+                        cur = conn.execute(f"SELECT * FROM {table}")
+                        cols = [d.name for d in cur.description]
+                        lines = [json.dumps(dict(zip(cols, row)), ensure_ascii=False, default=json_default) for row in cur.fetchall()]
+                        zf.writestr(f"{table}.jsonl", "\n".join(lines))
+                    except Exception:
+                        conn.rollback()
+        return FileResponse(path, media_type="application/zip", filename="football_dataset.zip", background=BackgroundTask(lambda: os.path.exists(path) and os.unlink(path)))
+    except Exception:
+        if os.path.exists(path):
+            os.unlink(path)
+        raise
