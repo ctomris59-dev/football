@@ -14,7 +14,7 @@ import psycopg
 
 DATABASE_URL=os.getenv("DATABASE_URL","").strip();LOG_LEVEL=os.getenv("LOG_LEVEL","INFO").upper()
 def envb(k,d="true"):return os.getenv(k,d).lower() in {"1","true","yes"}
-RUN_FD2324=envb("LIVE_REFRESH_FD2324");RUN_FOOTBALL_DATA=envb("LIVE_REFRESH_FOOTBALL_DATA");RUN_ESPN=envb("LIVE_REFRESH_ESPN");RUN_ESPN_CONTEXT=envb("LIVE_REFRESH_ESPN_CONTEXT");RUN_ESPN_TEAM_SCHEDULE=envb("LIVE_REFRESH_ESPN_TEAM_SCHEDULE");RUN_UNDERSTAT=envb("LIVE_REFRESH_UNDERSTAT");RUN_ODDSPAPI=envb("LIVE_REFRESH_ODDSPAPI");RUN_FOTMOB_AVAILABILITY=envb("LIVE_REFRESH_FOTMOB_AVAILABILITY");RUN_FOTMOB_LINEUPS=envb("LIVE_REFRESH_FOTMOB_LINEUPS");RUN_BBS=envb("LIVE_REFRESH_BBS","false");RUN_BBS_LINEUPS=envb("LIVE_REFRESH_BBS_LINEUPS","false");RUN_SOFASCORE=envb("LIVE_REFRESH_SOFASCORE","false");RUN_ADVANCED=envb("LIVE_REFRESH_ADVANCED");RUN_FOUR_LAYER=envb("LIVE_REFRESH_FOUR_LAYER");RUN_PREMATCH=envb("LIVE_REFRESH_PREMATCH");RUN_ODDS_MOVEMENT=envb("LIVE_REFRESH_ODDS_MOVEMENT");RUN_AVAILABILITY_ENRICH=envb("LIVE_REFRESH_AVAILABILITY_ENRICH");RUN_READINESS=envb("LIVE_REFRESH_READINESS");RUN_PREDICTIONS=envb("LIVE_REFRESH_PREDICTIONS")
+RUN_FD2324=envb("LIVE_REFRESH_FD2324");RUN_FOOTBALL_DATA=envb("LIVE_REFRESH_FOOTBALL_DATA");RUN_FD_ASIAN=envb("LIVE_REFRESH_FD_ASIAN");RUN_ESPN=envb("LIVE_REFRESH_ESPN");RUN_ESPN_CONTEXT=envb("LIVE_REFRESH_ESPN_CONTEXT");RUN_ESPN_TOTAL_ODDS=envb("LIVE_REFRESH_ESPN_TOTAL_ODDS");RUN_ESPN_TEAM_SCHEDULE=envb("LIVE_REFRESH_ESPN_TEAM_SCHEDULE");RUN_UNDERSTAT=envb("LIVE_REFRESH_UNDERSTAT");RUN_ODDSPAPI=envb("LIVE_REFRESH_ODDSPAPI");RUN_FOTMOB_AVAILABILITY=envb("LIVE_REFRESH_FOTMOB_AVAILABILITY");RUN_FOTMOB_LINEUPS=envb("LIVE_REFRESH_FOTMOB_LINEUPS");RUN_BBS=envb("LIVE_REFRESH_BBS","false");RUN_BBS_LINEUPS=envb("LIVE_REFRESH_BBS_LINEUPS","false");RUN_SOFASCORE=envb("LIVE_REFRESH_SOFASCORE","false");RUN_ADVANCED=envb("LIVE_REFRESH_ADVANCED");RUN_FOUR_LAYER=envb("LIVE_REFRESH_FOUR_LAYER");RUN_PREMATCH=envb("LIVE_REFRESH_PREMATCH");RUN_ODDS_MOVEMENT=envb("LIVE_REFRESH_ODDS_MOVEMENT");RUN_AVAILABILITY_ENRICH=envb("LIVE_REFRESH_AVAILABILITY_ENRICH");RUN_READINESS=envb("LIVE_REFRESH_READINESS");RUN_PREDICTIONS=envb("LIVE_REFRESH_PREDICTIONS")
 ESPN_CONTEXT_REFRESH_HOURS=float(os.getenv("ESPN_CONTEXT_REFRESH_HOURS","20"));TEAM_SCHEDULE_REFRESH_HOURS=float(os.getenv("TEAM_SCHEDULE_REFRESH_HOURS","120"));UNDERSTAT_REFRESH_HOURS=float(os.getenv("UNDERSTAT_REFRESH_HOURS","48"));ODDSPAPI_REFRESH_HOURS=float(os.getenv("ODDSPAPI_REFRESH_HOURS","20"));FOTMOB_REFRESH_HOURS=float(os.getenv("FOTMOB_REFRESH_HOURS","20"));FOTMOB_LINEUP_REFRESH_HOURS=float(os.getenv("FOTMOB_LINEUP_REFRESH_HOURS","0.5"))
 logging.basicConfig(level=getattr(logging,LOG_LEVEL,logging.INFO),format="%(asctime)s | %(levelname)s | %(message)s");log=logging.getLogger("live-refresh")
 def utcnow():return datetime.now(timezone.utc)
@@ -52,6 +52,8 @@ def main()->Dict[str,Any]:
   if recent_success("espn_context_runs",ESPN_CONTEXT_REFRESH_HOURS):skip(steps,"espn_context",f"fresh<{ESPN_CONTEXT_REFRESH_HOURS}h")
   else:
    from espn_prematch_refresh import run_import as fn;run_step("espn_context",lambda:fn(DATABASE_URL),steps,optional=True)
+ if RUN_ESPN_TOTAL_ODDS:
+  from espn_total_odds_bridge import run_import as fn;run_step("espn_total_odds",lambda:fn(DATABASE_URL),steps,optional=True)
  if RUN_ESPN_TEAM_SCHEDULE:
   if recent_success("espn_team_schedule_runs",TEAM_SCHEDULE_REFRESH_HOURS):skip(steps,"espn_team_schedule",f"fresh<{TEAM_SCHEDULE_REFRESH_HOURS}h")
   else:
@@ -64,6 +66,8 @@ def main()->Dict[str,Any]:
   if recent_success("oddspapi_allbooks_runs",ODDSPAPI_REFRESH_HOURS) and recent_rows("asian_market_prices",ODDSPAPI_REFRESH_HOURS):skip(steps,"oddspapi_allbooks",f"allbooks+asian fresh<{ODDSPAPI_REFRESH_HOURS}h")
   else:
    from oddspapi_allbooks_importer_v4 import run_import as fn;run_step("oddspapi_allbooks",lambda:fn(DATABASE_URL),steps,optional=True)
+ if RUN_FD_ASIAN:
+  from football_data_asian_bridge import run_import as fn;run_step("football_data_asian",lambda:fn(DATABASE_URL),steps,optional=True)
  if RUN_FOTMOB_AVAILABILITY:
   if recent_success("fotmob_availability_runs",FOTMOB_REFRESH_HOURS):skip(steps,"fotmob_availability",f"fresh<{FOTMOB_REFRESH_HOURS}h")
   else:
