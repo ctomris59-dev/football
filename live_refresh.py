@@ -79,8 +79,7 @@ def main()->Dict[str,Any]:
  if RUN_ADVANCED:
   from advanced_features_pipeline_v2 import run as fn;run_step("advanced_features",lambda:fn(DATABASE_URL),steps)
  if RUN_FOUR_LAYER:
-  from season_players_context_bridge import run_bridge as fn;run_step("season_players_context_bridge",lambda:fn(DATABASE_URL),steps,optional=True)
-  from player_context_db_v3 import run_import as fn;run_step("player_context_db_v3",lambda:fn(DATABASE_URL),steps)
+  from player_context_orchestrator import run as fn;run_step("player_context_db_v3",lambda:fn(DATABASE_URL),steps)
   from player_context_enrichment_bridge import run_bridge as fn;run_step("player_context_bridge",lambda:fn(DATABASE_URL),steps)
   from pressure_features_builder import build as fn;run_step("pressure_features",lambda:fn(DATABASE_URL),steps,optional=True)
  if RUN_PREMATCH:
