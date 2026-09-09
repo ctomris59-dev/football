@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """Leakage-safe V1 vs V5 ranking-policy validation.
 
-Historically safe activation candidates:
-- pressure/style signal from matches strictly before target fixture;
-- squad continuity from previous-season starters and current-season lineups observed before target fixture.
-
-Asian multi-line movement and Expected-XI injury impact remain diagnostic because historical Friday snapshots were not archived leakage-safely.
+Safe continuity for a 2025/26 test fixture uses only: (a) 2024/25 explicit starters
+and (b) 2025/26 lineups whose match date is strictly before the target fixture.
+Current 2026/27 roster/FBref continuity is NEVER fed backwards into this backtest.
+The validation cache is invalidated whenever the archived lineup fingerprint changes.
 """
 from __future__ import annotations
 import json, os, re, unicodedata
 from collections import Counter, defaultdict
 from datetime import date, datetime
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import psycopg
 from psycopg.types.json import Jsonb
 from model_engine_v1 import best_market, predict_match
 
 DATABASE_URL=os.getenv("DATABASE_URL","").strip();TRAIN=os.getenv("V5_BACKTEST_TRAIN_SEASON","2425");TEST=os.getenv("V5_BACKTEST_TEST_SEASON","2526")
-VERSION="v1-v5-four-layer-safe-validation-v2";MIN_IMPROVEMENT=float(os.getenv("V5_MIN_HIT_RATE_IMPROVEMENT","0.005"))
+VERSION="v1-v5-four-layer-safe-validation-v3-espn-lineups";MIN_IMPROVEMENT=float(os.getenv("V5_MIN_HIT_RATE_IMPROVEMENT","0.005"))
 SCHEMA="""
 CREATE TABLE IF NOT EXISTS v5_policy_validation_runs(id BIGSERIAL PRIMARY KEY,started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),finished_at TIMESTAMPTZ,policy_version TEXT NOT NULL,train_season TEXT NOT NULL,test_season TEXT NOT NULL,status TEXT NOT NULL,matches_scored INTEGER NOT NULL DEFAULT 0,lineup_matches INTEGER NOT NULL DEFAULT 0,results JSONB,activation_mode TEXT,message TEXT);
 CREATE TABLE IF NOT EXISTS policy_activation_registry(policy_key TEXT PRIMARY KEY,policy_version TEXT NOT NULL,active_mode TEXT NOT NULL,validated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),metrics JSONB NOT NULL DEFAULT '{}'::jsonb,reason TEXT);
@@ -44,20 +43,48 @@ def starter_names(lineup:Dict[str,Any])->List[str]:
   p=item.get("player") if isinstance(item.get("player"),dict) else item;name=p.get("name") if isinstance(p,dict) else None
   if name:out.append(canon(name))
  return [x for x in out if x]
-def lineup_history(conn)->Tuple[Dict[str,set[str]],Dict[str,List[Tuple[date,List[str]]]],int]:
- prev_counts=defaultdict(Counter);current_events=defaultdict(list);used=0
- try:rows=conn.execute("""SELECT f.season,f.fixture_date,d.lineups FROM fixtures f JOIN fixture_details d ON d.fixture_id=f.fixture_id WHERE f.season IN (2024,2025) AND d.lineups IS NOT NULL AND f.status_short IN ('FT','AET','PEN') ORDER BY f.fixture_date""").fetchall()
- except Exception:return {},{},0
- for season,dt,raw in rows:
-  for lu in extract_lineup_objects(raw):
-   t=(lu.get("team") or {}).get("name");names=starter_names(lu)
-   if not t or len(names)<7:continue
-   used+=1;ct=canon(t);d=as_date(dt)
-   if int(season)==2024:prev_counts[ct].update(names)
-   else:current_events[ct].append((d,names))
+
+def lineup_fingerprint(conn)->Dict[str,int]:
+ out={"espn_2024":0,"espn_2025":0,"api_lineup_objects":0}
+ try:
+  for season,n in conn.execute("SELECT season,COUNT(*) FROM espn_historical_events WHERE season IN (2024,2025) AND summary_status='success' GROUP BY season").fetchall():out[f"espn_{int(season)}"]=int(n)
+ except Exception:pass
+ try:out["api_lineup_objects"]=int(conn.execute("SELECT COUNT(*) FROM fixture_details d JOIN fixtures f ON f.fixture_id=d.fixture_id WHERE f.season IN (2024,2025) AND d.lineups IS NOT NULL").fetchone()[0] or 0)
+ except Exception:pass
+ return out
+
+def lineup_history(conn)->Tuple[Dict[str,set[str]],Dict[str,List[Tuple[date,List[str]]]],int,Dict[str,int]]:
+ prev_counts=defaultdict(Counter);current_events=defaultdict(list);used=0;seen=set();fp=lineup_fingerprint(conn)
+ def accept(season:int,d:date,team:str,names:List[str],identity:str):
+  nonlocal used
+  names=[canon(x) for x in names if canon(x)]
+  if not team or len(names)<7:return
+  key=(int(season),str(identity),canon(team))
+  if key in seen:return
+  seen.add(key);used+=1;ct=canon(team)
+  if int(season)==2024:prev_counts[ct].update(names)
+  elif int(season)==2025:current_events[ct].append((d,names))
+ # Preferred free archive: explicit ESPN starter flags.
+ try:
+  rows=conn.execute("""SELECT e.season,e.event_id,e.match_date,p.team_name,p.player_name
+    FROM espn_historical_events e JOIN espn_historical_lineup_players p ON p.event_id=e.event_id
+    WHERE e.season IN (2024,2025) AND e.summary_status='success' AND p.starter=TRUE ORDER BY e.season,e.match_date,e.event_id,p.team_name""").fetchall()
+  grouped=defaultdict(list)
+  for season,eid,dt,team,name in rows:grouped[(int(season),str(eid),as_date(dt),str(team))].append(str(name))
+  for (season,eid,d,team),names in grouped.items():accept(season,d,team,names,"espn:"+eid)
+ except Exception:pass
+ # API-Football archive remains a fallback/second validator where already cached.
+ try:
+  rows=conn.execute("""SELECT f.season,f.fixture_id,f.fixture_date,d.lineups FROM fixtures f JOIN fixture_details d ON d.fixture_id=f.fixture_id
+    WHERE f.season IN (2024,2025) AND d.lineups IS NOT NULL AND f.status_short IN ('FT','AET','PEN') ORDER BY f.fixture_date""").fetchall()
+  for season,fid,dt,raw in rows:
+   for lu in extract_lineup_objects(raw):
+    t=(lu.get("team") or {}).get("name");names=starter_names(lu);accept(int(season),as_date(dt),str(t or ""),names,f"api:{fid}")
+ except Exception:pass
  prev_top={t:set(x for x,_ in counts.most_common(11)) for t,counts in prev_counts.items() if counts}
  for t in current_events:current_events[t].sort(key=lambda x:x[0])
- return prev_top,current_events,used
+ return prev_top,current_events,used,fp
+
 def continuity_at(team:str,dt:date,prev_top,current_events)->Optional[float]:
  ct=canon(team);prev=prev_top.get(ct)
  if not prev:return None
@@ -115,16 +142,17 @@ def summarize_weekly(weekly,score_key,split_date):
  def sm(rows):
   hits=sum(bool(x["correct"]) for x in rows);return {"picks":len(rows),"hits":hits,"hit_rate":round(hits/len(rows),4) if rows else None,"avg_confidence":round(sum(x["confidence"] for x in rows)/len(rows),4) if rows else None}
  return {**sm(picks),"first_half":sm(pre),"second_half":sm(post)}
+
 def run_backtest(database_url:Optional[str]=None)->Dict[str,Any]:
  db=(database_url or DATABASE_URL).strip()
  if not db:raise RuntimeError("Missing DATABASE_URL")
  with psycopg.connect(db,autocommit=True) as c:
   c.execute(SCHEMA);rid=c.execute("INSERT INTO v5_policy_validation_runs(policy_version,train_season,test_season,status) VALUES(%s,%s,%s,'running') RETURNING id",(VERSION,TRAIN,TEST)).fetchone()[0]
   try:
-   allm=load_matches(c);prev_top,current_events,lineup_used=lineup_history(c);test_dates=sorted({as_date(m["match_date"]) for m in allm if m["season_code"]==TEST});split=test_dates[len(test_dates)//2] if test_dates else date(2026,1,1);by_div=defaultdict(list)
+   allm=load_matches(c);prev_top,current_events,lineup_used,fp=lineup_history(c);test_dates=sorted({as_date(m["match_date"]) for m in allm if m["season_code"]==TEST});split=test_dates[len(test_dates)//2] if test_dates else date(2026,1,1);by_div=defaultdict(list)
    for m in allm:by_div[str(m["division"])].append(m)
    weekly=defaultdict(list);scored=cont_available=pressure_available=market_available=0
-   for division,matches in by_div.items():
+   for _division,matches in by_div.items():
     history=[m for m in matches if m["season_code"]==TRAIN];tests=[m for m in matches if m["season_code"]==TEST];history.sort(key=lambda m:(m["match_date"],m["home_team"],m["away_team"]));tests.sort(key=lambda m:(m["match_date"],m["home_team"],m["away_team"]))
     for match in tests:
      pred=predict_match(history,match["home_team"],match["away_team"]);bm=best_market(pred);y=outcome(match,bm["market"])
@@ -136,14 +164,15 @@ def run_backtest(database_url:Optional[str]=None)->Dict[str,Any]:
     if x["picks"]>=300 and full_gain>=MIN_IMPROVEMENT and second_gain>=0 and first_gain>=-.015:eligible.append((mode,full_gain,second_gain))
    if eligible:eligible.sort(key=lambda z:(z[1],z[2]),reverse=True);active=eligible[0][0];reason=f"{active} beat V1 by {eligible[0][1]:.4f} full-season and did not regress second-half"
    else:active="v1_only";reason="No leakage-safe V5 subset cleared the improvement gate; four-layer extras remain shadow"
-   results={"version":VERSION,"split_date":split.isoformat(),"matches_scored":scored,"lineup_objects":lineup_used,"coverage":{"continuity_matches":cont_available,"pressure_matches":pressure_available,"market_stress_matches":market_available},"variants":variants,"activation_mode":active,"unvalidated_for_activation":["expected_xi_injury_impact","asian_multiline_open_to_latest"],"note":"market_stress uses historical final/average O/U2.5 prices and is diagnostic only"}
-   c.execute("UPDATE v5_policy_validation_runs SET finished_at=NOW(),status='success',matches_scored=%s,lineup_matches=%s,results=%s,activation_mode=%s,message=%s WHERE id=%s",(scored,lineup_used,Jsonb(results),active,reason,rid));c.execute("""INSERT INTO policy_activation_registry(policy_key,policy_version,active_mode,metrics,reason) VALUES('four-layer-v5',%s,%s,%s,%s) ON CONFLICT(policy_key) DO UPDATE SET policy_version=EXCLUDED.policy_version,active_mode=EXCLUDED.active_mode,validated_at=NOW(),metrics=EXCLUDED.metrics,reason=EXCLUDED.reason""",(VERSION,active,Jsonb(results),reason));print("V1_V5_POLICY_BACKTEST_RESULT",json.dumps(results,ensure_ascii=False,separators=(",",":")));return results
+   results={"version":VERSION,"split_date":split.isoformat(),"matches_scored":scored,"lineup_objects":lineup_used,"lineup_fingerprint":fp,"coverage":{"continuity_matches":cont_available,"pressure_matches":pressure_available,"market_stress_matches":market_available},"variants":variants,"activation_mode":active,"unvalidated_for_activation":["expected_xi_injury_impact","asian_multiline_open_to_latest"],"note":"continuity uses prior-season explicit XI plus strictly pre-target current-season lineups; market_stress remains diagnostic"}
+   c.execute("UPDATE v5_policy_validation_runs SET finished_at=NOW(),status='success',matches_scored=%s,lineup_matches=%s,results=%s,activation_mode=%s,message=%s WHERE id=%s",(scored,lineup_used,Jsonb(results),active,reason,rid));c.execute("""INSERT INTO policy_activation_registry(policy_key,policy_version,active_mode,metrics,reason) VALUES('four-layer-v5',%s,%s,%s,%s) ON CONFLICT(policy_key) DO UPDATE SET policy_version=EXCLUDED.policy_version,active_mode=EXCLUDED.active_mode,validated_at=NOW(),metrics=EXCLUDED.metrics,reason=EXCLUDED.reason""",(VERSION,active,Jsonb(results),reason));print("V1_V5_POLICY_BACKTEST_RESULT",json.dumps(results,ensure_ascii=False,separators=(",",":")),flush=True);return results
   except Exception as exc:c.execute("UPDATE v5_policy_validation_runs SET finished_at=NOW(),status='failed',message=%s WHERE id=%s",(str(exc)[:1000],rid));raise
+
 def ensure_validation(database_url:Optional[str]=None)->Dict[str,Any]:
  db=(database_url or DATABASE_URL).strip()
  if not db:raise RuntimeError("Missing DATABASE_URL")
  with psycopg.connect(db,autocommit=True) as c:
-  c.execute(SCHEMA);row=c.execute("SELECT activation_mode,results FROM v5_policy_validation_runs WHERE policy_version=%s AND status='success' ORDER BY id DESC LIMIT 1",(VERSION,)).fetchone()
-  if row:return {"status":"fresh","activation_mode":row[0],"results":row[1]}
+  c.execute(SCHEMA);row=c.execute("SELECT activation_mode,results FROM v5_policy_validation_runs WHERE policy_version=%s AND status='success' ORDER BY id DESC LIMIT 1",(VERSION,)).fetchone();current=lineup_fingerprint(c)
+  if row and isinstance(row[1],dict) and row[1].get("lineup_fingerprint")==current:return {"status":"fresh","activation_mode":row[0],"results":row[1]}
  res=run_backtest(db);return {"status":"ran","activation_mode":res["activation_mode"],"results":res}
 if __name__=="__main__":print(json.dumps(run_backtest(),ensure_ascii=False,indent=2))
