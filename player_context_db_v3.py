@@ -3,8 +3,9 @@
 
 DB-v3 reuses cached Understat player rows first, fetches only missing league/season
 pages in parallel with bounded timeouts, preloads injury data once, and batch-writes
-team context snapshots. Validation runs are deliberately cache-only so a provider
-network stall can never block the V1/V5 safety gate. It never activates V5 itself.
+team context snapshots. A validation run is normally cache-first, but an empty cache
+is allowed one bounded bootstrap fetch so the fail-closed safety gate can actually be
+proven on a fresh database. This module never activates V5 itself.
 """
 from __future__ import annotations
 
@@ -28,7 +29,7 @@ LOOKAHEAD_DAYS=int(os.getenv("PLAYER_CONTEXT_LOOKAHEAD_DAYS","8"))
 HTTP_TIMEOUT=float(os.getenv("PLAYER_CONTEXT_HTTP_TIMEOUT_SECONDS","8"))
 MAX_WORKERS=max(1,min(10,int(os.getenv("PLAYER_CONTEXT_FETCH_WORKERS","5"))))
 VALIDATION_MODE=bool(os.getenv("VALIDATION_TRIGGER_TOKEN","").strip())
-ALLOW_NETWORK=(os.getenv("PLAYER_CONTEXT_ALLOW_NETWORK","true").lower() in {"1","true","yes"}) and not VALIDATION_MODE
+NETWORK_CONFIGURED=os.getenv("PLAYER_CONTEXT_ALLOW_NETWORK","true").lower() in {"1","true","yes"}
 LEAGUES=v2.LEAGUES
 
 
@@ -66,6 +67,22 @@ def fetch_memory(code:str,season:int)->Dict[str,Tuple[str,List[Dict[str,Any]]]]:
     return {k:(labels[k],vals) for k,vals in buckets.items() if vals}
 
 
+def persist_cache(conn,season:int,available:Dict[str,Tuple[str,List[Dict[str,Any]]]])->int:
+    rows=[]
+    for _key,(label,players) in available.items():
+        slug=v2.team_slug(label)
+        for p in players:
+            rows.append((season,label,slug,p["player_id"],p.get("player_name"),p.get("games"),p.get("starts"),p.get("minutes"),p.get("goals"),p.get("xg"),p.get("assists"),p.get("xa"),p.get("xgchain"),p.get("xgbuildup"),Jsonb(p.get("raw") or {})))
+    if not rows:return 0
+    sql="""INSERT INTO understat_player_seasons(season,team_name,team_slug,player_id,player_name,games,starts,minutes,goals,xg,assists,xa,xgchain,xgbuildup,raw)
+           VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+           ON CONFLICT(season,team_slug,player_id) DO UPDATE SET team_name=EXCLUDED.team_name,player_name=EXCLUDED.player_name,
+             games=EXCLUDED.games,starts=EXCLUDED.starts,minutes=EXCLUDED.minutes,goals=EXCLUDED.goals,xg=EXCLUDED.xg,
+             assists=EXCLUDED.assists,xa=EXCLUDED.xa,xgchain=EXCLUDED.xgchain,xgbuildup=EXCLUDED.xgbuildup,raw=EXCLUDED.raw,fetched_at=NOW()"""
+    with conn.cursor() as cur:cur.executemany(sql,rows)
+    return len(rows)
+
+
 def all_mapped(names:set[str],available:Dict[str,Tuple[str,List[Dict[str,Any]]]])->bool:
     return bool(names) and all(v2.match_team(name,available) is not None for name in names)
 
@@ -76,8 +93,7 @@ def injury_map(conn)->Dict[str,List[Dict[str,Any]]]:
         rows=conn.execute("""SELECT home_team,away_team,home_injured_players,away_injured_players
                            FROM fotmob_fixture_availability_snapshots
                            WHERE snapshot_hour=(SELECT MAX(snapshot_hour) FROM fotmob_fixture_availability_snapshots)""").fetchall()
-    except Exception:
-        return {}
+    except Exception:return {}
     for h,a,hi,ai in rows:
         if isinstance(hi,list):out[v2.canon(h)].extend(x for x in hi if isinstance(x,dict))
         if isinstance(ai,list):out[v2.canon(a)].extend(x for x in ai if isinstance(x,dict))
@@ -109,7 +125,7 @@ def build_context(team:str,cur:List[Dict[str,Any]],prev:List[Dict[str,Any]],inju
 def run_import(database_url:Optional[str]=None)->Dict[str,Any]:
     db=(database_url or DATABASE_URL).strip()
     if not db:raise RuntimeError("Missing DATABASE_URL")
-    progress("connect",validation_mode=VALIDATION_MODE,allow_network=ALLOW_NETWORK)
+    progress("connect",validation_mode=VALIDATION_MODE,network_configured=NETWORK_CONFIGURED)
     with psycopg.connect(db,autocommit=True) as conn:
         conn.execute(v2.SCHEMA);rid=conn.execute("INSERT INTO player_context_runs(status) VALUES('running') RETURNING id").fetchone()[0]
         try:
@@ -120,7 +136,9 @@ def run_import(database_url:Optional[str]=None)->Dict[str,Any]:
             for league,home,away in upcoming:by_league[str(league)].update((str(home),str(away)))
             progress("upcoming_loaded",fixtures_teams=sum(len(v) for v in by_league.values()),leagues=len(by_league))
             current_cache=load_cached(conn,CURRENT_SEASON);previous_cache=load_cached(conn,PREVIOUS_SEASON);code_by_name={name:code for code,name in LEAGUES};errors={};sources={}
-            progress("cache_loaded",current_cache_teams=len(current_cache),previous_cache_teams=len(previous_cache))
+            bootstrap=not current_cache and not previous_cache
+            allow_network=NETWORK_CONFIGURED and (not VALIDATION_MODE or bootstrap)
+            progress("cache_loaded",current_cache_teams=len(current_cache),previous_cache_teams=len(previous_cache),bootstrap=bootstrap,allow_network=allow_network)
             jobs=[]
             for league,names in by_league.items():
                 code=code_by_name.get(league)
@@ -129,18 +147,20 @@ def run_import(database_url:Optional[str]=None)->Dict[str,Any]:
                 else:sources[f"{league}:{CURRENT_SEASON}"]="postgres-cache"
                 if not all_mapped(names,previous_cache):jobs.append((league,code,PREVIOUS_SEASON))
                 else:sources[f"{league}:{PREVIOUS_SEASON}"]="postgres-cache"
-            progress("fetch_plan",jobs=len(jobs),network_enabled=ALLOW_NETWORK)
-            if jobs and ALLOW_NETWORK:
+            progress("fetch_plan",jobs=len(jobs),network_enabled=allow_network)
+            fetched_by_season:Dict[int,Dict[str,Tuple[str,List[Dict[str,Any]]]]]={CURRENT_SEASON:{},PREVIOUS_SEASON:{}}
+            if jobs and allow_network:
                 with ThreadPoolExecutor(max_workers=min(MAX_WORKERS,len(jobs))) as ex:
                     futs={ex.submit(fetch_memory,code,season):(league,season) for league,code,season in jobs}
                     for fut in as_completed(futs):
                         league,season=futs[fut]
                         try:
-                            fresh=fut.result();(current_cache if season==CURRENT_SEASON else previous_cache).update(fresh);sources[f"{league}:{season}"]="network-memory"
+                            fresh=fut.result();(current_cache if season==CURRENT_SEASON else previous_cache).update(fresh);fetched_by_season[season].update(fresh);sources[f"{league}:{season}"]="network-memory"
                         except Exception as exc:errors[f"{league}:{season}"]=str(exc)[:300];sources[f"{league}:{season}"]="failed-network"
+                persisted=persist_cache(conn,CURRENT_SEASON,fetched_by_season[CURRENT_SEASON])+persist_cache(conn,PREVIOUS_SEASON,fetched_by_season[PREVIOUS_SEASON])
+                progress("cache_persisted",player_rows=persisted)
             elif jobs:
-                for league,_code,season in jobs:
-                    sources[f"{league}:{season}"]="cache-miss-network-disabled"
+                for league,_code,season in jobs:sources[f"{league}:{season}"]="cache-miss-network-disabled"
             progress("fetch_complete",errors=len(errors),current_cache_teams=len(current_cache),previous_cache_teams=len(previous_cache))
             injuries=injury_map(conn);hour=datetime.now(timezone.utc).replace(minute=0,second=0,microsecond=0);params=[];teams=current=previous=mapped=current_only=0;coverages=[]
             sql="""INSERT INTO player_team_context_snapshots(team_name,snapshot_hour,current_season,previous_season,expected_xi_strength,top11_strength,injury_impact,goalkeeper_injured,retained_minutes_share,starter_continuity,player_coverage,key_absences,source_meta)
@@ -153,11 +173,11 @@ def run_import(database_url:Optional[str]=None)->Dict[str,Any]:
                     params.append((team,hour,CURRENT_SEASON,PREVIOUS_SEASON,ctx["expected"],ctx["top11"],ctx["impact"],ctx["gk"],ctx["retained"],ctx["continuity"],ctx["coverage"],Jsonb(ctx["key"]),Jsonb(meta)))
             progress("contexts_built",teams=teams,current=current,previous=previous,mapped=mapped,rows=len(params))
             if params:
-                with conn.transaction():conn.executemany(sql,params)
+                with conn.cursor() as cur:cur.executemany(sql,params)
             progress("contexts_written",rows=len(params))
-            avg=round(sum(coverages)/len(coverages),4) if coverages else 0.0;status="success" if current>0 and mapped>0 else "failed";message={"source":"db-v3-fast-cache-first","mapped":mapped,"current_only":current_only,"avg_coverage":avg,"errors":errors,"sources":sources}
-            conn.execute("""UPDATE player_context_runs SET finished_at=NOW(),status=%s,teams=%s,teams_with_current=%s,teams_with_previous=%s,http_calls=%s,message=%s WHERE id=%s""",(status,teams,current,previous,(len(jobs) if ALLOW_NETWORK else 0),json.dumps(message,separators=(",",":")),rid))
-            result={"status":status,"teams":teams,"mapped":mapped,"current":current,"previous":previous,"current_only":current_only,"http_calls":len(jobs) if ALLOW_NETWORK else 0,"avg_coverage":avg,"errors":errors,"validation_cache_only":VALIDATION_MODE}
+            avg=round(sum(coverages)/len(coverages),4) if coverages else 0.0;status="success" if current>0 and mapped>0 else "failed";message={"source":"db-v3-fast-cache-first","mapped":mapped,"current_only":current_only,"avg_coverage":avg,"errors":errors,"sources":sources,"bootstrap":bootstrap}
+            conn.execute("""UPDATE player_context_runs SET finished_at=NOW(),status=%s,teams=%s,teams_with_current=%s,teams_with_previous=%s,http_calls=%s,message=%s WHERE id=%s""",(status,teams,current,previous,(len(jobs) if allow_network else 0),json.dumps(message,separators=(",",":")),rid))
+            result={"status":status,"teams":teams,"mapped":mapped,"current":current,"previous":previous,"current_only":current_only,"http_calls":len(jobs) if allow_network else 0,"avg_coverage":avg,"errors":errors,"validation_mode":VALIDATION_MODE,"bootstrap":bootstrap}
             print("PLAYER_CONTEXT_DB_V3_RESULT",json.dumps(result,ensure_ascii=False,separators=(",",":")),flush=True)
             if status!="success":raise RuntimeError(f"DB-v3 player context failed closed: mapped={mapped}, current={current}")
             return result
