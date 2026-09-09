@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """Fast cache-first DB-v3 Expected-XI and squad-continuity context builder.
 
-DB-v3 reuses cached Understat player rows first, fetches only missing league/season
-pages in parallel with bounded timeouts, preloads injury data once, and batch-writes
-team context snapshots. A validation run is normally cache-first, but an empty cache
-is allowed one bounded bootstrap fetch so the fail-closed safety gate can actually be
-proven on a fresh database. This module never activates V5 itself.
+Priority order:
+1. persisted Understat player cache;
+2. DB-only historical lineup proxy (no provider/network dependency);
+3. bounded parallel Understat fetch only for teams still missing.
+
+The DB-only proxy turns archived starting-XI appearances into conservative player
+rows (start frequency/minutes only). This keeps the V1/V5 safety gate reproducible on
+Render even when Understat is unavailable. Understat remains enrichment, not a hard
+dependency. This module never activates V5 itself.
 """
 from __future__ import annotations
 
 import json
 import os
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,6 +25,7 @@ import requests
 from psycopg.types.json import Jsonb
 
 import understat_player_continuity_v2 as v2
+from v1_v5_policy_backtest import extract_lineup_objects
 
 DATABASE_URL=os.getenv("DATABASE_URL","").strip()
 CURRENT_SEASON=int(os.getenv("PLAYER_CONTEXT_CURRENT_SEASON","2026"))
@@ -42,8 +47,7 @@ def load_cached(conn,season:int)->Dict[str,Tuple[str,List[Dict[str,Any]]]]:
     try:
         rows=conn.execute("""SELECT team_name,player_id,player_name,games,starts,minutes,goals,xg,assists,xa,xgchain,xgbuildup,raw
                            FROM understat_player_seasons WHERE season=%s""",(season,)).fetchall()
-    except Exception:
-        return {}
+    except Exception:return {}
     for r in rows:
         label=str(r[0]);key=v2.canon(label);labels[key]=label
         grouped[key].append({"player_id":str(r[1]),"player_name":r[2],"games":r[3],"starts":r[4],"minutes":r[5],
@@ -52,9 +56,51 @@ def load_cached(conn,season:int)->Dict[str,Tuple[str,List[Dict[str,Any]]]]:
     return {k:(labels[k],vals) for k,vals in grouped.items() if vals}
 
 
+def _starter_labels(lineup:Dict[str,Any])->List[str]:
+    out=[]
+    for item in lineup.get("startXI") or []:
+        if not isinstance(item,dict):continue
+        p=item.get("player") if isinstance(item.get("player"),dict) else item
+        name=p.get("name") if isinstance(p,dict) else None
+        if name:out.append(str(name))
+    return out
+
+
+def lineup_proxy_cache(conn,fixture_season:int)->Dict[str,Tuple[str,List[Dict[str,Any]]]]:
+    """Build conservative player rows from archived starting XIs in local Postgres."""
+    counts:Dict[str,Counter[str]]=defaultdict(Counter);labels:Dict[str,str]={};games:Counter[str]=Counter();display:Dict[Tuple[str,str],str]={}
+    try:
+        rows=conn.execute("""SELECT d.lineups FROM fixtures f JOIN fixture_details d ON d.fixture_id=f.fixture_id
+                           WHERE f.season=%s AND d.lineups IS NOT NULL AND f.status_short IN ('FT','AET','PEN')""",(fixture_season,)).fetchall()
+    except Exception:return {}
+    for (raw,) in rows:
+        seen_teams=set()
+        for lu in extract_lineup_objects(raw):
+            team=(lu.get("team") or {}).get("name") if isinstance(lu.get("team"),dict) else None
+            starters=_starter_labels(lu)
+            if not team or len(starters)<7:continue
+            tk=v2.canon(team);labels[tk]=str(team)
+            if tk not in seen_teams:games[tk]+=1;seen_teams.add(tk)
+            for name in starters:
+                pk=v2.canon(name)
+                if not pk:continue
+                counts[tk][pk]+=1;display[(tk,pk)]=name
+    out={}
+    for tk,c in counts.items():
+        team_games=max(1,int(games[tk] or max(c.values(),default=1)))
+        players=[]
+        for pk,starts in c.items():
+            players.append({"player_id":f"lineup:{fixture_season}:{tk}:{pk}","player_name":display.get((tk,pk),pk),
+                            "games":float(team_games),"starts":float(starts),"minutes":float(starts*90),
+                            "goals":0.0,"xg":0.0,"assists":0.0,"xa":0.0,"xgchain":0.0,"xgbuildup":0.0,
+                            "raw":{"source":"db-lineup-proxy","fixture_season":fixture_season,"starts":starts}})
+        if players:out[tk]=(labels[tk],players)
+    return out
+
+
 def fetch_memory(code:str,season:int)->Dict[str,Tuple[str,List[Dict[str,Any]]]]:
     s=requests.Session();s.headers.update({"User-Agent":"Mozilla/5.0 Chrome/152 Safari/537.36","Accept":"text/html,application/xhtml+xml"})
-    r=s.get(f"{v2.BASE}/league/{code}/{season}",timeout=HTTP_TIMEOUT)
+    r=s.get(f"{v2.BASE}/league/{code}/{season}",timeout=(4.0,HTTP_TIMEOUT))
     if r.status_code!=200:raise RuntimeError(f"Understat HTTP {r.status_code}: {code}/{season}")
     raw_rows=v2.extract_players_data(r.text)
     if not raw_rows:raise RuntimeError(f"Understat playersData empty: {code}/{season}")
@@ -136,17 +182,23 @@ def run_import(database_url:Optional[str]=None)->Dict[str,Any]:
             for league,home,away in upcoming:by_league[str(league)].update((str(home),str(away)))
             progress("upcoming_loaded",fixtures_teams=sum(len(v) for v in by_league.values()),leagues=len(by_league))
             current_cache=load_cached(conn,CURRENT_SEASON);previous_cache=load_cached(conn,PREVIOUS_SEASON);code_by_name={name:code for code,name in LEAGUES};errors={};sources={}
-            bootstrap=not current_cache and not previous_cache
-            allow_network=NETWORK_CONFIGURED and (not VALIDATION_MODE or bootstrap)
-            progress("cache_loaded",current_cache_teams=len(current_cache),previous_cache_teams=len(previous_cache),bootstrap=bootstrap,allow_network=allow_network)
+            understat_current=len(current_cache);understat_previous=len(previous_cache)
+            # DB-only bootstrap/fallback: 2025 fixture season proxies 2026 context; 2024 proxies 2025.
+            lineup_current=lineup_proxy_cache(conn,2025);lineup_previous=lineup_proxy_cache(conn,2024)
+            for k,v in lineup_current.items():current_cache.setdefault(k,v)
+            for k,v in lineup_previous.items():previous_cache.setdefault(k,v)
+            progress("cache_loaded",understat_current=understat_current,understat_previous=understat_previous,
+                     lineup_current=len(lineup_current),lineup_previous=len(lineup_previous),current_cache_teams=len(current_cache),previous_cache_teams=len(previous_cache))
             jobs=[]
             for league,names in by_league.items():
                 code=code_by_name.get(league)
                 if not code:errors[f"{league}:league"]="unsupported";continue
                 if not all_mapped(names,current_cache):jobs.append((league,code,CURRENT_SEASON))
-                else:sources[f"{league}:{CURRENT_SEASON}"]="postgres-cache"
+                else:sources[f"{league}:{CURRENT_SEASON}"]="db-cache-or-lineup"
                 if not all_mapped(names,previous_cache):jobs.append((league,code,PREVIOUS_SEASON))
-                else:sources[f"{league}:{PREVIOUS_SEASON}"]="postgres-cache"
+                else:sources[f"{league}:{PREVIOUS_SEASON}"]="db-cache-or-lineup"
+            # Validation should remain deterministic once DB lineage exists. Only ordinary refresh may enrich residual misses from network.
+            allow_network=NETWORK_CONFIGURED and not VALIDATION_MODE
             progress("fetch_plan",jobs=len(jobs),network_enabled=allow_network)
             fetched_by_season:Dict[int,Dict[str,Tuple[str,List[Dict[str,Any]]]]]={CURRENT_SEASON:{},PREVIOUS_SEASON:{}}
             if jobs and allow_network:
@@ -160,7 +212,7 @@ def run_import(database_url:Optional[str]=None)->Dict[str,Any]:
                 persisted=persist_cache(conn,CURRENT_SEASON,fetched_by_season[CURRENT_SEASON])+persist_cache(conn,PREVIOUS_SEASON,fetched_by_season[PREVIOUS_SEASON])
                 progress("cache_persisted",player_rows=persisted)
             elif jobs:
-                for league,_code,season in jobs:sources[f"{league}:{season}"]="cache-miss-network-disabled"
+                for league,_code,season in jobs:sources[f"{league}:{season}"]="db-miss-network-disabled"
             progress("fetch_complete",errors=len(errors),current_cache_teams=len(current_cache),previous_cache_teams=len(previous_cache))
             injuries=injury_map(conn);hour=datetime.now(timezone.utc).replace(minute=0,second=0,microsecond=0);params=[];teams=current=previous=mapped=current_only=0;coverages=[]
             sql="""INSERT INTO player_team_context_snapshots(team_name,snapshot_hour,current_season,previous_season,expected_xi_strength,top11_strength,injury_impact,goalkeeper_injured,retained_minutes_share,starter_continuity,player_coverage,key_absences,source_meta)
@@ -169,15 +221,17 @@ def run_import(database_url:Optional[str]=None)->Dict[str,Any]:
             for league,names in by_league.items():
                 for team in sorted(names):
                     teams+=1;cm=v2.match_team(team,current_cache);pm=v2.match_team(team,previous_cache);cur=cm[1] if cm else [];prev=pm[1] if pm else [];current+=int(bool(cur));previous+=int(bool(prev));mapped+=int(bool(cur or prev));current_only+=int(bool(cur and not prev));ctx=build_context(team,cur,prev,injuries);coverages.append(float(ctx["coverage"] or 0))
-                    meta={"source":"db-v3-fast-cache-first","league":league,"current_source":sources.get(f"{league}:{CURRENT_SEASON}"),"previous_source":sources.get(f"{league}:{PREVIOUS_SEASON}"),"current_match_score":round(cm[2],4) if cm else None,"previous_match_score":round(pm[2],4) if pm else None,"current_players":ctx["current_players"],"previous_players":ctx["previous_players"],"current_weight":ctx["current_weight"]}
+                    csrc="understat-cache" if cm and v2.canon(cm[0]) in set(load_cached(conn,CURRENT_SEASON).keys()) else ("db-lineup-proxy" if cm else None)
+                    psrc="understat-cache" if pm and v2.canon(pm[0]) in set(load_cached(conn,PREVIOUS_SEASON).keys()) else ("db-lineup-proxy" if pm else None)
+                    meta={"source":"db-v3-cache-lineup-fallback","league":league,"current_source":csrc or sources.get(f"{league}:{CURRENT_SEASON}"),"previous_source":psrc or sources.get(f"{league}:{PREVIOUS_SEASON}"),"current_match_score":round(cm[2],4) if cm else None,"previous_match_score":round(pm[2],4) if pm else None,"current_players":ctx["current_players"],"previous_players":ctx["previous_players"],"current_weight":ctx["current_weight"]}
                     params.append((team,hour,CURRENT_SEASON,PREVIOUS_SEASON,ctx["expected"],ctx["top11"],ctx["impact"],ctx["gk"],ctx["retained"],ctx["continuity"],ctx["coverage"],Jsonb(ctx["key"]),Jsonb(meta)))
             progress("contexts_built",teams=teams,current=current,previous=previous,mapped=mapped,rows=len(params))
             if params:
                 with conn.cursor() as cur:cur.executemany(sql,params)
             progress("contexts_written",rows=len(params))
-            avg=round(sum(coverages)/len(coverages),4) if coverages else 0.0;status="success" if current>0 and mapped>0 else "failed";message={"source":"db-v3-fast-cache-first","mapped":mapped,"current_only":current_only,"avg_coverage":avg,"errors":errors,"sources":sources,"bootstrap":bootstrap}
+            avg=round(sum(coverages)/len(coverages),4) if coverages else 0.0;status="success" if current>0 and mapped>0 else "failed";message={"source":"db-v3-cache-lineup-fallback","mapped":mapped,"current_only":current_only,"avg_coverage":avg,"errors":errors,"sources":sources,"lineup_current":len(lineup_current),"lineup_previous":len(lineup_previous)}
             conn.execute("""UPDATE player_context_runs SET finished_at=NOW(),status=%s,teams=%s,teams_with_current=%s,teams_with_previous=%s,http_calls=%s,message=%s WHERE id=%s""",(status,teams,current,previous,(len(jobs) if allow_network else 0),json.dumps(message,separators=(",",":")),rid))
-            result={"status":status,"teams":teams,"mapped":mapped,"current":current,"previous":previous,"current_only":current_only,"http_calls":len(jobs) if allow_network else 0,"avg_coverage":avg,"errors":errors,"validation_mode":VALIDATION_MODE,"bootstrap":bootstrap}
+            result={"status":status,"teams":teams,"mapped":mapped,"current":current,"previous":previous,"current_only":current_only,"http_calls":len(jobs) if allow_network else 0,"avg_coverage":avg,"errors":errors,"validation_mode":VALIDATION_MODE,"lineup_current":len(lineup_current),"lineup_previous":len(lineup_previous)}
             print("PLAYER_CONTEXT_DB_V3_RESULT",json.dumps(result,ensure_ascii=False,separators=(",",":")),flush=True)
             if status!="success":raise RuntimeError(f"DB-v3 player context failed closed: mapped={mapped}, current={current}")
             return result
