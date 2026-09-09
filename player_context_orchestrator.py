@@ -3,10 +3,11 @@
 
 Priority:
 1) static ESPN 2024/25 + 2025/26 explicit-XI archive (real starts, leakage-safe);
-2) FBref 2025/26 Starts+Minutes only when the real previous-season cache is incomplete;
-3) FotMob previous-season deep stats only as an optional fallback;
-4) resilient current ESPN roster bridge;
-5) data-informed expected-XI proxy.
+2) targeted second-tier exact-XI history for promoted Big-Five clubs;
+3) FBref 2025/26 Starts+Minutes only when the real previous-season cache is incomplete;
+4) FotMob previous-season deep stats only as an optional fallback;
+5) resilient current ESPN roster bridge;
+6) data-informed expected-XI proxy.
 
 Legacy DB-v3 is never allowed to replace a missing current roster with previous-only
 context. No source failure may turn a neutral placeholder into apparent real coverage.
@@ -44,16 +45,19 @@ def run(database_url:Optional[str]=None)->Dict[str,Any]:
     except Exception as exc:
         seed_res={"status":"failed_optional","error":str(exc)[:400]}
 
-    # Complete the static exact-XI archive first. Once >=95% complete the backfill
-    # self-skips, so regular refreshes stop paying this historical cost.
     if RUN_HISTORICAL_LINEUPS:
         try:
             from espn_historical_lineups_backfill_v2 import run_import as historical_lineups
             historical_res=historical_lineups(db)
         except Exception as exc:
             historical_res={"status":"failed_optional","error":str(exc)[:500]}
+        try:
+            from espn_promoted_continuity_backfill import run_import as promoted_backfill
+            promoted_res=promoted_backfill(db)
+        except Exception as exc:
+            promoted_res={"status":"failed_optional","error":str(exc)[:500]}
     else:
-        historical_res={"status":"disabled"}
+        historical_res={"status":"disabled"};promoted_res={"status":"disabled"}
 
     cache_before=previous_cache_state(db)
     # Real ESPN exact starts are sufficient for continuity/expected-XI ranking. FBref
@@ -91,7 +95,7 @@ def run(database_url:Optional[str]=None)->Dict[str,Any]:
             expected_res=expected_xi(db)
         except Exception as exc:
             expected_res={"status":"failed_optional","error":str(exc)[:500]}
-        result={"status":"success","source":"espn-current-roster+real-previous-activity","seed":seed_res,"historical_lineups":historical_res,"previous_cache_before":cache_before,"fbref_previous":fbref_res,"previous_fallback":previous_res,"previous_cache_after":cache_after,"roster":roster_res,"expected_xi":expected_res}
+        result={"status":"success","source":"espn-current-roster+real-previous-activity","seed":seed_res,"historical_lineups":historical_res,"promoted_history":promoted_res,"previous_cache_before":cache_before,"fbref_previous":fbref_res,"previous_fallback":previous_res,"previous_cache_after":cache_after,"roster":roster_res,"expected_xi":expected_res}
         print("PLAYER_CONTEXT_ORCHESTRATOR_RESULT",json.dumps(result,separators=(",",":")),flush=True)
         return result
 
@@ -101,7 +105,7 @@ def run(database_url:Optional[str]=None)->Dict[str,Any]:
     except Exception as exc:
         prematch_res={"status":"failed_optional","error":str(exc)[:500]}
     if int(prematch_res.get("teams_written") or 0)>0 and int(prematch_res.get("expected_xi_ready") or 0)>0:
-        result={"status":"success","source":"espn-prematch","seed":seed_res,"historical_lineups":historical_res,"previous_cache":cache_after,"prematch":prematch_res,"roster":roster_res}
+        result={"status":"success","source":"espn-prematch","seed":seed_res,"historical_lineups":historical_res,"promoted_history":promoted_res,"previous_cache":cache_after,"prematch":prematch_res,"roster":roster_res}
         print("PLAYER_CONTEXT_ORCHESTRATOR_RESULT",json.dumps(result,separators=(",",":")),flush=True)
         return result
     raise RuntimeError(f"No real current roster/player source available; roster={roster_res}, prematch={prematch_res}")
