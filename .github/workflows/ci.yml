@@ -37,6 +37,7 @@ jobs:
           import fotmob_strength_style_importer_v2
           import availability_enricher_v3
           import oddspapi_allbooks_importer_v2
+          import oddspapi_allbooks_importer_v3
           import market_consensus_builder
           import score_state_builder
           import score_state_backtest
@@ -51,10 +52,12 @@ jobs:
           from market_consensus_builder import no_vig
           from oddspapi_allbooks_importer import market_kind as allbooks_market_kind
           from oddspapi_allbooks_importer_v2 import redact, discover_bookmaker_slugs
+          from oddspapi_allbooks_importer_v3 import MAX_BOOKS
           from second_tier_importer_v3 import score_pair, openfootball_rows
           from promotion_prior_builder_v2 import aggregate
           from internal_elo_builder import expected
           from fotmob_strength_style_importer_v2 import season_variants
+          import advanced_features_pipeline_v2 as adv
 
           history=[]
           for i in range(20):
@@ -93,7 +96,9 @@ jobs:
           assert 0 < expected(1500,1500) < 1
           assert '2627' in season_variants('2026/2027')
           assert '[REDACTED_QUERY]' in redact('https://x.test/path?apiKey=secret')
-          books=discover_bookmaker_slugs([{'slug':'pinnacle'},{'slug':'betfair'},{'slug':'clone','cloneOf':'x'}])
+          books=discover_bookmaker_slugs([{'slug':'pinnacle'},{'slug':'betfair'},{'slug':'clone','cloneOf':'x'}], limit=3)
           assert books[:2] == ['pinnacle','betfair']
+          assert 1 <= MAX_BOOKS <= 5
+          assert adv.RUN_FOTMOB_DEEP is False
           print('logic-smoke-ok', p.as_dict(), nv_book)
           PY

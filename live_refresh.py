@@ -133,7 +133,7 @@ def main() -> Dict[str, Any]:
         if recent_success("oddspapi_allbooks_runs", ODDSPAPI_REFRESH_HOURS):
             skip(steps, "oddspapi_allbooks", f"fresh<{ODDSPAPI_REFRESH_HOURS}h")
         else:
-            from oddspapi_allbooks_importer_v2 import run_import as fn
+            from oddspapi_allbooks_importer_v3 import run_import as fn
             run_step("oddspapi_allbooks", lambda: fn(DATABASE_URL), steps, optional=True)
 
     if RUN_FOTMOB_AVAILABILITY:

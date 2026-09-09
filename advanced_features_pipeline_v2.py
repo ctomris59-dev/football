@@ -14,7 +14,9 @@ SECOND_TIER_REFRESH_HOURS = float(os.getenv("SECOND_TIER_REFRESH_HOURS", str(24 
 FOTMOB_STRENGTH_REFRESH_HOURS = float(os.getenv("FOTMOB_STRENGTH_REFRESH_HOURS", "24"))
 SCORE_STATE_REFRESH_HOURS = float(os.getenv("SCORE_STATE_REFRESH_HOURS", str(24 * 30)))
 RUN_EXTERNAL_CLUBELO = os.getenv("ADVANCED_EXTERNAL_CLUBELO", "false").lower() in {"1", "true", "yes"}
-RUN_FOTMOB_DEEP = os.getenv("ADVANCED_FOTMOB_DEEP_STATS", "true").lower() in {"1", "true", "yes"}
+# Current FotMob deep-stat endpoint resolves seasons but returns zero usable rows on Render.
+# Keep it opt-in and use the deterministic DB style fallback in standard production refreshes.
+RUN_FOTMOB_DEEP = os.getenv("ADVANCED_FOTMOB_DEEP_STATS", "false").lower() in {"1", "true", "yes"}
 
 EXPECTED_SECOND_TIER = {
     (season, division)
