@@ -37,6 +37,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger("football-export")
 refresh_lock = threading.Lock()
 refresh_state: dict[str, Any] = {"running": False, "last_started": None, "last_finished": None, "last_status": None, "last_error": None}
+validation_root_started = False
 
 TABLES = [
     "league_coverage", "fixtures", "fixture_details", "injuries", "season_players", "collection_runs", "api_call_log",
@@ -178,6 +179,13 @@ def health():
 
 @app.get("/")
 def root():
+    global validation_root_started
+    # One-shot validation hook: only active while the short-lived validation token exists.
+    # Render calls `/` after a healthy deploy, which lets us trigger exactly once without
+    # enabling startup refresh or exposing provider refreshes to deploy lifecycle events.
+    if VALIDATION_TRIGGER_TOKEN and not validation_root_started and not refresh_lock.locked():
+        validation_root_started = True
+        start_thread(_run_live_refresh, "validation-root-one-shot")
     return health()
 
 
@@ -194,7 +202,6 @@ def refresh(token: Optional[str] = Query(None), authorization: Optional[str] = H
 
 @app.get("/validation-run")
 def validation_run(token: Optional[str] = Query(None)):
-    # Deliberately disabled unless a short-lived one-shot token is configured.
     if not VALIDATION_TRIGGER_TOKEN:
         raise HTTPException(404, "Validation trigger is disabled.")
     if token != VALIDATION_TRIGGER_TOKEN:
