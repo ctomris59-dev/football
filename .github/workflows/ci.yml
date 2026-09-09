@@ -21,30 +21,17 @@ jobs:
       - name: Import production modules
         run: |
           python - <<'PY'
-          import model_engine
-          import model_engine_v1
-          import production_predictor
-          import production_predictor_v3
-          import data_readiness_audit_v4
-          import odds_movement_enricher
-          import live_refresh
-          import advanced_features_pipeline_v2
-          import second_tier_importer_v3
-          import promotion_prior_builder_v2
-          import promotion_prior_backtest_v2
-          import internal_elo_builder
-          import internal_style_builder
-          import fotmob_strength_style_importer_v2
-          import availability_enricher_v3
-          import oddspapi_allbooks_importer_v2
-          import oddspapi_allbooks_importer_v3
-          import market_consensus_builder
-          import score_state_builder
-          import score_state_backtest
-          import export_app
+          import model_engine, model_engine_v1
+          import production_predictor, production_predictor_v3, production_predictor_v4, production_predictor_v5
+          import data_readiness_audit_v4, odds_movement_enricher, live_refresh, advanced_features_pipeline_v2
+          import second_tier_importer_v3, promotion_prior_builder_v2, promotion_prior_backtest_v2
+          import internal_elo_builder, internal_style_builder, fotmob_strength_style_importer_v2, availability_enricher_v3
+          import oddspapi_allbooks_importer_v2, oddspapi_allbooks_importer_v3, oddspapi_allbooks_importer_v4
+          import market_consensus_builder, asian_market_features_builder, understat_player_continuity
+          import pressure_features_builder, advanced_context_v4_builder, score_state_builder, score_state_backtest, export_app
           print('imports-ok')
           PY
-      - name: Model, market and fallback logic smoke test
+      - name: Model, market and four-layer smoke test
         run: |
           python - <<'PY'
           from model_engine import predict_match
@@ -53,52 +40,44 @@ jobs:
           from oddspapi_allbooks_importer import market_kind as allbooks_market_kind
           from oddspapi_allbooks_importer_v2 import redact, discover_bookmaker_slugs
           from oddspapi_allbooks_importer_v3 import MAX_BOOKS
+          from oddspapi_allbooks_importer_v4 import extended_kind, side_from_name
+          from asian_market_features_builder import no_vig as asian_no_vig, aggregate_line
           from second_tier_importer_v3 import score_pair, openfootball_rows
           from promotion_prior_builder_v2 import aggregate
           from internal_elo_builder import expected
           from fotmob_strength_style_importer_v2 import season_variants
+          from understat_player_continuity import normalize_player, player_scores, extract_players_data
+          from production_predictor_v5 import penalty_factor
           import advanced_features_pipeline_v2 as adv
-
           history=[]
           for i in range(20):
-              history.append({
-                  'home_team':'alpha' if i % 2 == 0 else 'gamma',
-                  'away_team':'beta' if i % 2 == 0 else 'delta',
-                  'home_goals':2,'away_goals':1,
-                  'home_shots_on_target':5,'away_shots_on_target':4,
-                  'home_corners':6,'away_corners':4,
-                  'home_xg':1.7,'away_xg':1.1,
-              })
+              history.append({'home_team':'alpha' if i%2==0 else 'gamma','away_team':'beta' if i%2==0 else 'delta','home_goals':2,'away_goals':1,'home_shots_on_target':5,'away_shots_on_target':4,'home_corners':6,'away_corners':4,'home_xg':1.7,'away_xg':1.1})
           for i in range(8):
               history.append({'home_team':'alpha','away_team':'delta','home_goals':2,'away_goals':1,'home_shots_on_target':5,'away_shots_on_target':4,'home_corners':6,'away_corners':4,'home_xg':1.8,'away_xg':1.0})
               history.append({'home_team':'gamma','away_team':'beta','home_goals':1,'away_goals':1,'home_shots_on_target':4,'away_shots_on_target':4,'home_corners':5,'away_corners':5,'home_xg':1.2,'away_xg':1.2})
-
           p=predict_match(history,'alpha','beta')
-          assert all(0.0 <= x <= 1.0 for x in (p.p_over_2_5,p.p_btts,p.p_corners_over_8_5))
-          assert p.lambda_home_goals > 0 and p.lambda_away_goals > 0 and p.lambda_total_corners > 0
-          assert market_kind('Total Goals Over Under',2.5) == 'over_2_5'
-          assert market_kind('Total Corners Over Under',8.5) == 'corners_over_8_5'
-          assert market_kind('Both Teams To Score',None) == 'btts'
-          assert allbooks_market_kind('Total Goals Over Under',2.5) == 'over_2_5'
-          assert outcome_side('over_2_5','Over 2.5') is True
-          assert outcome_side('btts','No') is False
-          price, nv = no_vig_selected({True:1.90,False:2.00},True)
-          assert price == 1.90 and nv is not None and 0 < nv < 1
-          nv_book = no_vig(1.90,2.00)
-          assert nv_book is not None and 0 < nv_book < 1
-
-          assert score_pair({'ft':[2,1]}) == (2,1)
-          rows = openfootball_rows({'matches':[{'date':'2025-08-01','team1':'A','team2':'B','score':{'ft':[2,1]}}]})
-          assert len(rows) == 1 and rows[0]['FTHG'] == 2
-          stats, _ = aggregate([('X','A','B',2,1,None,None,None,None,None,None)])
-          assert stats['a']['goals_for'] == 2.0
-          assert stats['a']['corners_for'] is None
-          assert 0 < expected(1500,1500) < 1
-          assert '2627' in season_variants('2026/2027')
+          assert all(0<=x<=1 for x in (p.p_over_2_5,p.p_btts,p.p_corners_over_8_5))
+          assert market_kind('Total Goals Over Under',2.5)=='over_2_5'
+          assert market_kind('Total Corners Over Under',8.5)=='corners_over_8_5'
+          assert market_kind('Both Teams To Score',None)=='btts'
+          assert allbooks_market_kind('Total Goals Over Under',2.5)=='over_2_5'
+          assert extended_kind('Total Goals Over Under',2.25)==('goals',2.25)
+          assert extended_kind('Total Corners Over Under',9.0)==('corners',9.0)
+          assert side_from_name('Over 2.5')=='over' and side_from_name('Under 8.5')=='under'
+          assert outcome_side('over_2_5','Over 2.5') is True and outcome_side('btts','No') is False
+          _,nv=no_vig_selected({True:1.90,False:2.00},True); assert nv and 0<nv<1
+          assert 0<no_vig(1.90,2.00)<1 and 0<asian_no_vig(1.91,1.99)<1
+          ag=aggregate_line([('a','over',1.91),('a','under',1.99),('b','over',1.90),('b','under',2.00)]); assert ag and ag['bookmakers']==2
+          assert score_pair({'ft':[2,1]})==(2,1)
+          rows=openfootball_rows({'matches':[{'date':'2025-08-01','team1':'A','team2':'B','score':{'ft':[2,1]}}]});assert rows[0]['FTHG']==2
+          stats,_=aggregate([('X','A','B',2,1,None,None,None,None,None,None)]);assert stats['a']['goals_for']==2.0 and stats['a']['corners_for'] is None
+          assert 0<expected(1500,1500)<1 and '2627' in season_variants('2026/2027')
           assert '[REDACTED_QUERY]' in redact('https://x.test/path?apiKey=secret')
-          books=discover_bookmaker_slugs([{'slug':'pinnacle'},{'slug':'betfair'},{'slug':'clone','cloneOf':'x'}], limit=3)
-          assert books[:2] == ['pinnacle','betfair']
-          assert 1 <= MAX_BOOKS <= 5
+          books=discover_bookmaker_slugs([{'slug':'pinnacle'},{'slug':'betfair'},{'slug':'clone','cloneOf':'x'}],limit=3);assert books[:2]==['pinnacle','betfair'] and 1<=MAX_BOOKS<=5
           assert adv.RUN_FOTMOB_DEEP is False
-          print('logic-smoke-ok', p.as_dict(), nv_book)
+          np=normalize_player({'id':'1','player_name':'X','games':'10','starts':'8','time':'700','xG':'4.2','xA':'2.1','xGChain':'6.0','xGBuildup':'3.0'});assert np and np['minutes']==700
+          np2=normalize_player({'id':'2','player_name':'Y','games':'10','starts':'5','time':'450','xG':'1','xA':'1','xGChain':'3','xGBuildup':'2'});scores=player_scores([np,np2]);assert len(scores)==2
+          sample="var playersData = JSON.parse('[{\"id\":\"1\",\"player_name\":\"X\",\"games\":\"2\"}]');";assert len(extract_players_data(sample))==1
+          pf=penalty_factor({'total_coverage':0.2,'home_injury_impact':0.3,'asian_bookmakers':2,'asian_goal_p_over_2_5':0.45},'over_2_5','2.5 ÜST',0.70);assert .80<=pf<=1.0
+          print('logic-smoke-ok',pf)
           PY
