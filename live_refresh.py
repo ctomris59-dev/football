@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """Ordered live refresh pipeline for the Big Five prediction system.
 
-Provider calls are freshness-gated. Optional/shadow providers fail soft; the core readiness/production path fails closed. New four-layer context is archived first, coverage-audited, and only leakage-safe backtest-approved subsets may alter Top-10 ranking.
+Provider calls are freshness-gated. Optional/shadow providers fail soft; the core
+readiness/production path fails closed. DB-v3 player context is explicitly bridged
+into fixture enrichment and must produce player_mapped > 0 before coverage,
+leakage-safe V1/V5 validation, or production Top-10 may continue.
 """
 from __future__ import annotations
 import json, logging, os
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict
 import psycopg
+
 DATABASE_URL=os.getenv("DATABASE_URL","").strip();LOG_LEVEL=os.getenv("LOG_LEVEL","INFO").upper()
 def envb(k,d="true"):return os.getenv(k,d).lower() in {"1","true","yes"}
 RUN_FD2324=envb("LIVE_REFRESH_FD2324");RUN_FOOTBALL_DATA=envb("LIVE_REFRESH_FOOTBALL_DATA");RUN_ESPN=envb("LIVE_REFRESH_ESPN");RUN_ESPN_CONTEXT=envb("LIVE_REFRESH_ESPN_CONTEXT");RUN_ESPN_TEAM_SCHEDULE=envb("LIVE_REFRESH_ESPN_TEAM_SCHEDULE");RUN_UNDERSTAT=envb("LIVE_REFRESH_UNDERSTAT");RUN_ODDSPAPI=envb("LIVE_REFRESH_ODDSPAPI");RUN_FOTMOB_AVAILABILITY=envb("LIVE_REFRESH_FOTMOB_AVAILABILITY");RUN_BBS=envb("LIVE_REFRESH_BBS","false");RUN_BBS_LINEUPS=envb("LIVE_REFRESH_BBS_LINEUPS","false");RUN_SOFASCORE=envb("LIVE_REFRESH_SOFASCORE","false");RUN_ADVANCED=envb("LIVE_REFRESH_ADVANCED");RUN_FOUR_LAYER=envb("LIVE_REFRESH_FOUR_LAYER");RUN_PREMATCH=envb("LIVE_REFRESH_PREMATCH");RUN_ODDS_MOVEMENT=envb("LIVE_REFRESH_ODDS_MOVEMENT");RUN_AVAILABILITY_ENRICH=envb("LIVE_REFRESH_AVAILABILITY_ENRICH");RUN_READINESS=envb("LIVE_REFRESH_READINESS");RUN_PREDICTIONS=envb("LIVE_REFRESH_PREDICTIONS")
-ESPN_CONTEXT_REFRESH_HOURS=float(os.getenv("ESPN_CONTEXT_REFRESH_HOURS","20"));TEAM_SCHEDULE_REFRESH_HOURS=float(os.getenv("TEAM_SCHEDULE_REFRESH_HOURS","120"));UNDERSTAT_REFRESH_HOURS=float(os.getenv("UNDERSTAT_REFRESH_HOURS","48"));ODDSPAPI_REFRESH_HOURS=float(os.getenv("ODDSPAPI_REFRESH_HOURS","20"));FOTMOB_REFRESH_HOURS=float(os.getenv("FOTMOB_REFRESH_HOURS","20"));PLAYER_CONTEXT_REFRESH_HOURS=float(os.getenv("PLAYER_CONTEXT_REFRESH_HOURS","72"))
+ESPN_CONTEXT_REFRESH_HOURS=float(os.getenv("ESPN_CONTEXT_REFRESH_HOURS","20"));TEAM_SCHEDULE_REFRESH_HOURS=float(os.getenv("TEAM_SCHEDULE_REFRESH_HOURS","120"));UNDERSTAT_REFRESH_HOURS=float(os.getenv("UNDERSTAT_REFRESH_HOURS","48"));ODDSPAPI_REFRESH_HOURS=float(os.getenv("ODDSPAPI_REFRESH_HOURS","20"));FOTMOB_REFRESH_HOURS=float(os.getenv("FOTMOB_REFRESH_HOURS","20"))
 logging.basicConfig(level=getattr(logging,LOG_LEVEL,logging.INFO),format="%(asctime)s | %(levelname)s | %(message)s");log=logging.getLogger("live-refresh")
 def utcnow():return datetime.now(timezone.utc)
 def run_step(name:str,fn:Callable[[],Any],summary:Dict[str,Any],*,optional:bool=False)->None:
@@ -22,11 +26,10 @@ def run_step(name:str,fn:Callable[[],Any],summary:Dict[str,Any],*,optional:bool=
   else:log.exception("LIVE_REFRESH_STEP step=%s status=failed",name);raise
 def recent_success(table:str,hours:float)->bool:
  if not DATABASE_URL or hours<=0:return False
- allowed={"espn_context_runs","espn_team_schedule_runs","oddspapi_import_runs","oddspapi_allbooks_runs","fotmob_availability_runs","understat_import_runs","player_context_runs"}
+ allowed={"espn_context_runs","espn_team_schedule_runs","oddspapi_import_runs","oddspapi_allbooks_runs","fotmob_availability_runs","understat_import_runs"}
  if table not in allowed:return False
  try:
-  with psycopg.connect(DATABASE_URL) as conn:
-   extra=" AND teams_with_current>0" if table=="player_context_runs" else "";row=conn.execute(f"SELECT 1 FROM {table} WHERE status='success'{extra} AND finished_at >= NOW()-(%s||' hours')::interval LIMIT 1",(hours,)).fetchone()
+  with psycopg.connect(DATABASE_URL) as conn:row=conn.execute(f"SELECT 1 FROM {table} WHERE status='success' AND finished_at >= NOW()-(%s||' hours')::interval LIMIT 1",(hours,)).fetchone()
   return bool(row)
  except Exception:return False
 def recent_rows(table:str,hours:float)->bool:
@@ -76,16 +79,15 @@ def main()->Dict[str,Any]:
  if RUN_ADVANCED:
   from advanced_features_pipeline_v2 import run as fn;run_step("advanced_features",lambda:fn(DATABASE_URL),steps)
  if RUN_FOUR_LAYER:
-  if recent_success("player_context_runs",PLAYER_CONTEXT_REFRESH_HOURS):skip(steps,"player_context",f"fresh+mapped<{PLAYER_CONTEXT_REFRESH_HOURS}h")
-  else:
-   from understat_player_continuity_v2 import run_import as fn;run_step("player_context",lambda:fn(DATABASE_URL),steps,optional=True)
+  from player_context_db_v3 import run_import as fn;run_step("player_context_db_v3",lambda:fn(DATABASE_URL),steps)
+  from player_context_enrichment_bridge import run_bridge as fn;run_step("player_context_bridge",lambda:fn(DATABASE_URL),steps)
   from pressure_features_builder import build as fn;run_step("pressure_features",lambda:fn(DATABASE_URL),steps,optional=True)
  if RUN_PREMATCH:
   from prematch_context_builder_fixed import run_build as fn;run_step("prematch_context",lambda:fn(DATABASE_URL),steps)
  if RUN_FOUR_LAYER:
   from asian_market_features_builder import run_build as fn;run_step("asian_market_features",lambda:fn(DATABASE_URL),steps,optional=True)
   from advanced_context_v4_builder import run_build as fn;run_step("advanced_context_v4",lambda:fn(DATABASE_URL),steps,optional=True)
-  from four_layer_coverage_audit import run_audit as fn;run_step("four_layer_coverage",lambda:fn(DATABASE_URL),steps,optional=True)
+  from four_layer_coverage_audit import run_audit as fn;run_step("four_layer_coverage",lambda:fn(DATABASE_URL),steps)
   from v1_v5_policy_backtest import ensure_validation as fn;run_step("v1_v5_policy_validation",lambda:fn(DATABASE_URL),steps)
  if RUN_ODDS_MOVEMENT:
   from odds_movement_enricher import run_enrich as fn;run_step("odds_movement",lambda:fn(DATABASE_URL),steps,optional=True)
