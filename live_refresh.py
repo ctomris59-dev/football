@@ -14,8 +14,8 @@ import psycopg
 
 DATABASE_URL=os.getenv("DATABASE_URL","").strip();LOG_LEVEL=os.getenv("LOG_LEVEL","INFO").upper()
 def envb(k,d="true"):return os.getenv(k,d).lower() in {"1","true","yes"}
-RUN_FD2324=envb("LIVE_REFRESH_FD2324");RUN_FOOTBALL_DATA=envb("LIVE_REFRESH_FOOTBALL_DATA");RUN_ESPN=envb("LIVE_REFRESH_ESPN");RUN_ESPN_CONTEXT=envb("LIVE_REFRESH_ESPN_CONTEXT");RUN_ESPN_TEAM_SCHEDULE=envb("LIVE_REFRESH_ESPN_TEAM_SCHEDULE");RUN_UNDERSTAT=envb("LIVE_REFRESH_UNDERSTAT");RUN_ODDSPAPI=envb("LIVE_REFRESH_ODDSPAPI");RUN_FOTMOB_AVAILABILITY=envb("LIVE_REFRESH_FOTMOB_AVAILABILITY");RUN_BBS=envb("LIVE_REFRESH_BBS","false");RUN_BBS_LINEUPS=envb("LIVE_REFRESH_BBS_LINEUPS","false");RUN_SOFASCORE=envb("LIVE_REFRESH_SOFASCORE","false");RUN_ADVANCED=envb("LIVE_REFRESH_ADVANCED");RUN_FOUR_LAYER=envb("LIVE_REFRESH_FOUR_LAYER");RUN_PREMATCH=envb("LIVE_REFRESH_PREMATCH");RUN_ODDS_MOVEMENT=envb("LIVE_REFRESH_ODDS_MOVEMENT");RUN_AVAILABILITY_ENRICH=envb("LIVE_REFRESH_AVAILABILITY_ENRICH");RUN_READINESS=envb("LIVE_REFRESH_READINESS");RUN_PREDICTIONS=envb("LIVE_REFRESH_PREDICTIONS")
-ESPN_CONTEXT_REFRESH_HOURS=float(os.getenv("ESPN_CONTEXT_REFRESH_HOURS","20"));TEAM_SCHEDULE_REFRESH_HOURS=float(os.getenv("TEAM_SCHEDULE_REFRESH_HOURS","120"));UNDERSTAT_REFRESH_HOURS=float(os.getenv("UNDERSTAT_REFRESH_HOURS","48"));ODDSPAPI_REFRESH_HOURS=float(os.getenv("ODDSPAPI_REFRESH_HOURS","20"));FOTMOB_REFRESH_HOURS=float(os.getenv("FOTMOB_REFRESH_HOURS","20"))
+RUN_FD2324=envb("LIVE_REFRESH_FD2324");RUN_FOOTBALL_DATA=envb("LIVE_REFRESH_FOOTBALL_DATA");RUN_ESPN=envb("LIVE_REFRESH_ESPN");RUN_ESPN_CONTEXT=envb("LIVE_REFRESH_ESPN_CONTEXT");RUN_ESPN_TEAM_SCHEDULE=envb("LIVE_REFRESH_ESPN_TEAM_SCHEDULE");RUN_UNDERSTAT=envb("LIVE_REFRESH_UNDERSTAT");RUN_ODDSPAPI=envb("LIVE_REFRESH_ODDSPAPI");RUN_FOTMOB_AVAILABILITY=envb("LIVE_REFRESH_FOTMOB_AVAILABILITY");RUN_FOTMOB_LINEUPS=envb("LIVE_REFRESH_FOTMOB_LINEUPS");RUN_BBS=envb("LIVE_REFRESH_BBS","false");RUN_BBS_LINEUPS=envb("LIVE_REFRESH_BBS_LINEUPS","false");RUN_SOFASCORE=envb("LIVE_REFRESH_SOFASCORE","false");RUN_ADVANCED=envb("LIVE_REFRESH_ADVANCED");RUN_FOUR_LAYER=envb("LIVE_REFRESH_FOUR_LAYER");RUN_PREMATCH=envb("LIVE_REFRESH_PREMATCH");RUN_ODDS_MOVEMENT=envb("LIVE_REFRESH_ODDS_MOVEMENT");RUN_AVAILABILITY_ENRICH=envb("LIVE_REFRESH_AVAILABILITY_ENRICH");RUN_READINESS=envb("LIVE_REFRESH_READINESS");RUN_PREDICTIONS=envb("LIVE_REFRESH_PREDICTIONS")
+ESPN_CONTEXT_REFRESH_HOURS=float(os.getenv("ESPN_CONTEXT_REFRESH_HOURS","20"));TEAM_SCHEDULE_REFRESH_HOURS=float(os.getenv("TEAM_SCHEDULE_REFRESH_HOURS","120"));UNDERSTAT_REFRESH_HOURS=float(os.getenv("UNDERSTAT_REFRESH_HOURS","48"));ODDSPAPI_REFRESH_HOURS=float(os.getenv("ODDSPAPI_REFRESH_HOURS","20"));FOTMOB_REFRESH_HOURS=float(os.getenv("FOTMOB_REFRESH_HOURS","20"));FOTMOB_LINEUP_REFRESH_HOURS=float(os.getenv("FOTMOB_LINEUP_REFRESH_HOURS","0.5"))
 logging.basicConfig(level=getattr(logging,LOG_LEVEL,logging.INFO),format="%(asctime)s | %(levelname)s | %(message)s");log=logging.getLogger("live-refresh")
 def utcnow():return datetime.now(timezone.utc)
 def run_step(name:str,fn:Callable[[],Any],summary:Dict[str,Any],*,optional:bool=False)->None:
@@ -26,7 +26,7 @@ def run_step(name:str,fn:Callable[[],Any],summary:Dict[str,Any],*,optional:bool=
   else:log.exception("LIVE_REFRESH_STEP step=%s status=failed",name);raise
 def recent_success(table:str,hours:float)->bool:
  if not DATABASE_URL or hours<=0:return False
- allowed={"espn_context_runs","espn_team_schedule_runs","oddspapi_import_runs","oddspapi_allbooks_runs","fotmob_availability_runs","understat_import_runs"}
+ allowed={"espn_context_runs","espn_team_schedule_runs","oddspapi_import_runs","oddspapi_allbooks_runs","fotmob_availability_runs","fotmob_lineup_runs","understat_import_runs"}
  if table not in allowed:return False
  try:
   with psycopg.connect(DATABASE_URL) as conn:row=conn.execute(f"SELECT 1 FROM {table} WHERE status='success' AND finished_at >= NOW()-(%s||' hours')::interval LIMIT 1",(hours,)).fetchone()
@@ -68,6 +68,10 @@ def main()->Dict[str,Any]:
   if recent_success("fotmob_availability_runs",FOTMOB_REFRESH_HOURS):skip(steps,"fotmob_availability",f"fresh<{FOTMOB_REFRESH_HOURS}h")
   else:
    from fotmob_availability_importer import run_import as fn;run_step("fotmob_availability",lambda:fn(DATABASE_URL),steps,optional=True)
+ if RUN_FOTMOB_LINEUPS:
+  if recent_success("fotmob_lineup_runs",FOTMOB_LINEUP_REFRESH_HOURS):skip(steps,"fotmob_lineups",f"fresh<{FOTMOB_LINEUP_REFRESH_HOURS}h")
+  else:
+   from fotmob_lineups_importer import run_import as fn;run_step("fotmob_lineups",lambda:fn(DATABASE_URL),steps,optional=True)
  if RUN_BBS:
   from bbs_availability_canonical import run_import as fn;run_step("bbs_availability",lambda:fn(DATABASE_URL),steps,optional=True)
  if RUN_BBS_LINEUPS:
@@ -92,7 +96,7 @@ def main()->Dict[str,Any]:
  if RUN_ODDS_MOVEMENT:
   from odds_movement_enricher import run_enrich as fn;run_step("odds_movement",lambda:fn(DATABASE_URL),steps,optional=True)
  if RUN_AVAILABILITY_ENRICH:
-  from availability_enricher_v3 import run_enrich as fn;run_step("availability_enrich",lambda:fn(DATABASE_URL),steps)
+  from availability_enricher_v4 import run_enrich as fn;run_step("availability_enrich",lambda:fn(DATABASE_URL),steps)
  if RUN_READINESS:
   from data_readiness_audit_v4 import run_audit as fn;run_step("data_readiness",lambda:fn(DATABASE_URL),steps)
  if RUN_PREDICTIONS:
