@@ -2,7 +2,7 @@ name: weekly-reliable-unit
 
 on:
   push:
-    branches: ['weekly-reliable-output']
+    branches: ['weekly-reliable-output', 'fix/**']
   pull_request:
     branches: [main]
 
@@ -15,5 +15,5 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install -r requirements.txt pytest
-      - run: python -m py_compile turkey_two_sided_odds.py weekly_trusted_predictions.py thursday_opening_watch.py thursday_page.py
+      - run: python -m py_compile schedule_context.py espn_team_schedule_importer.py turkey_two_sided_odds.py weekly_trusted_predictions.py multiline_corner_upgrade.py live_refresh.py thursday_opening_watch.py thursday_page.py
       - run: pytest -q test_weekly_reliable_output.py
