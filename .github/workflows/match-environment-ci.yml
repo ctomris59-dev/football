@@ -2,7 +2,7 @@ name: match-environment-ci
 
 on:
   push:
-    branches: ['feature/**']
+    branches: ['feature/**', 'research/**']
   pull_request:
     branches: [main]
 
@@ -26,16 +26,21 @@ jobs:
             weekly_trusted_predictions.py
       - name: Run deterministic feature tests
         run: pytest -q test_match_environment_features.py test_weekly_reliable_output.py
-      - name: Prove shadow-only integration contract
+      - name: Prove guarded integration contract
         run: |
           python - <<'PY'
           from pathlib import Path
           weekly = Path('weekly_trusted_predictions.py').read_text()
           env = Path('match_environment_builder.py').read_text()
-          assert 'shadow_only_no_ranking_effect' in weekly
-          assert 'ranking_score = confidence * (0.75 + 0.25 * data_quality) * schedule_factor' in weekly
+          # Environment remains shadow by default; only a registry-gated lineup V2
+          # factor may alter ranking, never the frozen V1 probability itself.
+          assert 'shadow_unless_guarded_policy_activated' in weekly
+          assert 'registry_activation_mode' in weekly
+          assert 'lineup_v2_active' in weekly
+          assert 'ranking_score = confidence * (0.75 + 0.25 * data_quality) * schedule_factor * float(lineup_factor)' in weekly
+          assert 'model_probability_estimate' in weekly and 'row["confidence"]' in weekly
           assert 'production_probability_changed' in env
           assert 'not DataGaffer proprietary XoG' in env
           assert 'dixon_coles' in env and 'not_active' in env
-          print('match-environment-shadow-contract-ok')
+          print('match-environment-guarded-contract-ok')
           PY
