@@ -8,13 +8,54 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - name: Read live health
+      - name: Read live health before
         run: |
-          echo '=== HEALTH ==='
+          echo '=== HEALTH BEFORE ==='
           curl -fsS --retry 3 --retry-delay 2 https://football-dataset-export.onrender.com/health
           echo
-      - name: Read live Thursday list
+
+      - name: Trigger refresh using repository secrets
+        env:
+          DOWNLOAD_TOKEN: ${{ secrets.DOWNLOAD_TOKEN }}
+          VALIDATION_TRIGGER_TOKEN: ${{ secrets.VALIDATION_TRIGGER_TOKEN }}
         run: |
-          echo '=== THURSDAY LIST ==='
+          set +e
+          echo '=== REFRESH TRIGGER ==='
+          code=$(curl -sS -o /tmp/refresh.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${DOWNLOAD_TOKEN}" \
+            https://football-dataset-export.onrender.com/refresh)
+          cat /tmp/refresh.json || true
+          echo
+          echo "refresh_http=${code}"
+          if [ "$code" != "200" ] && [ -n "$VALIDATION_TRIGGER_TOKEN" ]; then
+            code2=$(curl -sS -o /tmp/validation.json -w '%{http_code}' \
+              "https://football-dataset-export.onrender.com/validation-run?token=${VALIDATION_TRIGGER_TOKEN}")
+            cat /tmp/validation.json || true
+            echo
+            echo "validation_http=${code2}"
+          fi
+          exit 0
+
+      - name: Wait for refresh completion
+        run: |
+          echo '=== WAITING FOR REFRESH ==='
+          for i in $(seq 1 24); do
+            body=$(curl -fsS https://football-dataset-export.onrender.com/health || true)
+            echo "$body"
+            if echo "$body" | grep -q '"last_status":"success"'; then
+              echo 'refresh completed successfully'
+              exit 0
+            fi
+            if echo "$body" | grep -q '"last_status":"failed"'; then
+              echo 'refresh failed'
+              exit 0
+            fi
+            sleep 10
+          done
+          echo 'refresh completion not observed within probe window'
+
+      - name: Read live Thursday list after
+        run: |
+          echo '=== THURSDAY LIST AFTER ==='
           curl -fsS --retry 3 --retry-delay 2 https://football-dataset-export.onrender.com/thursday-list
           echo
