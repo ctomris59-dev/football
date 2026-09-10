@@ -1,21 +1,9 @@
 #!/usr/bin/env python3
 """Build the mandatory weekly reliability-ranked list from the frozen V1 model.
 
-This is not a new model and does not alter V1 probabilities. It guarantees an
-operational weekly *ranking* when sufficient Friday-Monday Turkish bulletin coverage
-exists. A pick is called strict high confidence only when its selected-side V1
-probability is >= the existing HIGH_CONFIDENCE_MIN. Lower-ranked entries are exposed
-as "Haftanın En Güvenilirleri", never relabelled as 70%+.
-
-International market data is a safety check when available: a strong contradiction
-rejects the pick; missing international reference does not erase a model forecast.
-Value remains a separate, stricter list.
-
-Schedule context is operational only: the latest official club fixture is read across
-domestic + UEFA competitions. Raw V1 probabilities stay frozen; short-rest context
-only adjusts ranking and a still-unplayed official match before the target fixture
-keeps that candidate pending until the next refresh. The richer match-environment
-snapshot is exposed for audit/research only and does not affect ranking.
+V1 probabilities remain frozen. Operational schedule context may de-rank/block a
+candidate. Lineup Stability V2 may affect ranking only when its dedicated registry
+row contains holdout-safe two-fold evidence accepted by research_change_control.
 """
 from __future__ import annotations
 
@@ -28,9 +16,15 @@ from typing import Any, Dict, List, Optional
 import psycopg
 
 from international_market_reference import latest_ref
+from lineup_stability_v2_policy import (
+    ACTIVE_MODE as LINEUP_V2_ACTIVE_MODE,
+    POLICY_KEY as LINEUP_V2_POLICY_KEY,
+    factor_from_live_environment as lineup_v2_factor_from_environment,
+)
 from match_environment_builder import latest_environment
 from model_engine_v1 import predict_match
 from production_predictor import canon
+from research_change_control import registry_activation_mode
 from schedule_context import SCHEDULE_CONTEXT_VERSION, team_schedule_context
 from thursday_decision_engine import (
     DATABASE_URL,
@@ -81,6 +75,9 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
         "strict_high_confidence": row["confidence"] >= HIGH_CONFIDENCE_MIN,
         "ranking_score": row["ranking_score"],
         "schedule_rank_factor": row.get("schedule_rank_factor", 1.0),
+        "lineup_v2_active": row.get("lineup_v2_active", False),
+        "lineup_v2_available": row.get("lineup_v2_available", False),
+        "lineup_v2_factor": row.get("lineup_v2_factor", 1.0),
         "tr_price": row["price"].get("tr_price"),
         "tr_opening_price": row["price"].get("tr_opening_price"),
         "tr_source": row["price"].get("tr_source"),
@@ -101,6 +98,8 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
     week_key, start, end = weekend_bounds(as_of)
     with psycopg.connect(database_url) as conn:
         conn.execute(TURKEY_PRICE_DDL)
+        lineup_v2_mode = registry_activation_mode(conn, LINEUP_V2_POLICY_KEY)
+        lineup_v2_active = lineup_v2_mode == LINEUP_V2_ACTIVE_MODE
         fixtures = conn.execute(
             """SELECT event_id,match_date,league_name,home_team,away_team
                  FROM espn_upcoming
@@ -143,6 +142,9 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
 
             schedule_factor = min(float(home_sched.get("rank_factor") or 0.0), float(away_sched.get("rank_factor") or 0.0))
             environment = latest_environment(conn, str(eid))
+            lineup_factor, lineup_available = (1.0, False)
+            if lineup_v2_active:
+                lineup_factor, lineup_available = lineup_v2_factor_from_environment(environment)
             gate_diag.update({
                 "schedule_context_version": SCHEDULE_CONTEXT_VERSION,
                 "schedule_scope": "all_competitions_with_domestic_fallback",
@@ -150,7 +152,12 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                 "home_schedule": home_sched,
                 "away_schedule": away_sched,
                 "match_environment": environment,
-                "match_environment_semantics": "shadow_only_no_ranking_effect",
+                "match_environment_semantics": "shadow_unless_guarded_policy_activated",
+                "lineup_v2_policy_key": LINEUP_V2_POLICY_KEY,
+                "lineup_v2_mode": lineup_v2_mode,
+                "lineup_v2_active": lineup_v2_active,
+                "lineup_v2_available": lineup_available,
+                "lineup_v2_factor": lineup_factor,
             })
 
             for market, attr, yes_selection, no_selection in MARKETS:
@@ -170,11 +177,13 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                     continue
                 market_check = "aligned" if ref_selected is not None else "reference_unavailable"
                 data_quality = float(gate_diag.get("model_data_quality") or 0.0)
-                ranking_score = confidence * (0.75 + 0.25 * data_quality) * schedule_factor
+                ranking_score = confidence * (0.75 + 0.25 * data_quality) * schedule_factor * float(lineup_factor)
                 rows.append({
                     "event_id": str(eid), "match_date": match_date, "league": league_s,
                     "home": str(home), "away": str(away), "market": market, "selection": selection,
                     "confidence": confidence, "ranking_score": ranking_score, "schedule_rank_factor": schedule_factor,
+                    "lineup_v2_active": lineup_v2_active, "lineup_v2_available": lineup_available,
+                    "lineup_v2_factor": lineup_factor,
                     "price": price, "international": ref, "international_selected_probability": ref_selected,
                     "market_check": market_check, "early_context": gate_diag,
                 })
@@ -195,10 +204,12 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
             "policy": {
                 "list_semantics": "weekly_reliability_ranking_not_guaranteed_70pct",
                 "strict_high_confidence_min": HIGH_CONFIDENCE_MIN,
-                "ranking": "existing_v1_probability_x_data_quality_x_operational_schedule_factor",
+                "ranking": "frozen_v1_probability_x_data_quality_x_operational_schedule_factor_x_guarded_lineup_v2_factor",
                 "schedule_context_version": SCHEDULE_CONTEXT_VERSION,
                 "schedule_scope": "all_competitions_with_domestic_fallback",
-                "match_environment": "shadow_only_no_ranking_effect",
+                "lineup_v2_policy_key": LINEUP_V2_POLICY_KEY,
+                "lineup_v2_mode": lineup_v2_mode,
+                "lineup_v2_active": lineup_v2_active,
                 "pending_intervening_official_match": "exclude_until_next_refresh",
                 "turkey_price_required": True,
                 "international_reference": "reject strong contradiction when available; missing reference allowed for reliability list",
