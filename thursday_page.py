@@ -37,7 +37,7 @@ def render_page() -> str:
   <section class="status">
     <div class="statusTop"><div><div class="statusTitle" id="statusTitle">Haftalık karar kontrol ediliyor</div><div style="color:var(--muted);font-size:13px;margin-top:5px" id="statusText">Veri okunuyor…</div></div><div style="display:flex;gap:8px;align-items:center"><button class="refresh" onclick="loadData()">Yenile</button><div class="badge pending" id="badge"><span class="dot"></span><span id="badgeText">BEKLENİYOR</span></div></div></div>
     <div class="flow">
-      <div class="step"><b>1. Model</b><span>Form + oyuncu + kadro bağlamı</span></div>
+      <div class="step"><b>1. Model</b><span>V1 tahmini + erken kadro bağlamı</span></div>
       <div class="step"><b>2. Türkiye oranı</b><span>Gerçek oynanabilir açılış fiyatı</span></div>
       <div class="step"><b>3. Dünya piyasası</b><span>Paired same-book no-vig kontrolü</span></div>
       <div class="step"><b>4. Dondur</b><span>Haftanın iki listesi kilitlenir</span></div>
@@ -45,10 +45,10 @@ def render_page() -> str:
   </section>
 
   <div class="grid">
-    <section class="section"><div class="sectionHead"><h2>🛡️ Yüksek Güven</h2><p>Modelin en güçlü ve Perşembe günü oynanabilir seçimleri.</p></div><div class="list" id="highList"><div class="empty">Liste henüz kesinleşmedi.</div></div></section>
-    <section class="section"><div class="sectionHead"><h2>💰 Yüksek Güven + Value</h2><p>Yüksek güven + dünya piyasası doğrulaması + Türkiye fiyat avantajı.</p></div><div class="list" id="valueList"><div class="empty">Liste henüz kesinleşmedi.</div></div></section>
+    <section class="section"><div class="sectionHead"><h2>🛡️ Yüksek Güven</h2><p>V1'in güçlü gördüğü, dünya piyasasıyla makul uyumlu ve Türkiye'de oynanabilir seçimler.</p></div><div class="list" id="highList"><div class="empty">Liste henüz kesinleşmedi.</div></div></section>
+    <section class="section"><div class="sectionHead"><h2>💰 Yüksek Güven + Value</h2><p>V1 tahmini + dünya piyasası doğrulaması + Türkiye fiyat avantajı.</p></div><div class="list" id="valueList"><div class="empty">Liste henüz kesinleşmedi.</div></div></section>
   </div>
-  <div class="footer">Bu sayfa yalnızca haftalık dondurulmuş kararı gösterir. T−1/T−3 yeni bahis listesi üretilmez. Sayfayı tarayıcı favorilerine veya ana ekrana sabitleyebilirsin.</div>
+  <div class="footer">V1 yüzdesi model tahminidir; kusursuz kalibre edilmiş gerçek olasılık olarak yorumlanmaz. Dünya fair değeri ayrı gösterilir. Bu sayfa yalnızca haftalık dondurulmuş kararı gösterir; T−1/T−3 yeni bahis listesi üretilmez.</div>
 </main>
 <script>
 const $=id=>document.getElementById(id);
@@ -57,7 +57,7 @@ const odd=x=>x===null||x===undefined?'—':Number(x).toFixed(2).replace('.',',')
 const marketName=x=>({over_2_5:'2.5 ÜST',btts:'KG VAR',corners_over_8_5:'8.5 KORNER ÜST'}[x]||x||'—');
 function clear(el){while(el.firstChild)el.removeChild(el.firstChild)}
 function metric(label,value,good=false){const d=document.createElement('div');d.className='metric'+(good?' good':'');const s=document.createElement('span');s.textContent=label;const b=document.createElement('b');b.textContent=value;d.append(s,b);return d}
-function pickCard(p,isValue){const card=document.createElement('article');card.className='pick';const t=document.createElement('div');t.className='teams';t.textContent=`${p.home||''} – ${p.away||''}`;const m=document.createElement('div');m.className='market';m.textContent=marketName(p.market||p.selection);const ms=document.createElement('div');ms.className='metrics';ms.append(metric('Model güveni',pct(p.confidence),true));ms.append(metric('Türkiye oranı',odd(p.tr_price||p.tr_opening_price)));if(isValue){ms.append(metric('Dünya fair',pct(p.international_fair_probability||p.international_probability||p.market_reference_probability)));ms.append(metric('Model EV',pct(p.model_ev_vs_tr||p.ev),true));}card.append(t,m,ms);return card}
+function pickCard(p,isValue){const card=document.createElement('article');card.className='pick';const t=document.createElement('div');t.className='teams';t.textContent=`${p.home||''} – ${p.away||''}`;const m=document.createElement('div');m.className='market';m.textContent=marketName(p.market||p.selection);const ms=document.createElement('div');ms.className='metrics';ms.append(metric('V1 model tahmini',pct(p.model_probability_estimate??p.confidence),true));ms.append(metric('Dünya fair',pct(p.international_fair_probability||p.international_probability||p.market_reference_probability)));ms.append(metric('Türkiye oranı',odd(p.tr_price||p.tr_opening_price)));if(isValue){ms.append(metric('Model EV',pct(p.model_ev_vs_tr||p.ev),true));}card.append(t,m,ms);return card}
 function renderList(id,items,isValue){const el=$(id);clear(el);if(!items||!items.length){const d=document.createElement('div');d.className='empty';d.textContent=isValue?'Uygun value bahis yok.':'Bu hafta kriterleri geçen seçim yok.';el.appendChild(d);return}items.forEach(p=>el.appendChild(pickCard(p,isValue)))}
 async function loadData(){try{const r=await fetch('/thursday-list',{cache:'no-store'});const d=await r.json();$('updated').textContent='Son kontrol: '+new Date().toLocaleString('tr-TR');const finalized=d.status==='finalized';$('badge').className='badge '+(finalized?'final':'pending');$('badgeText').textContent=finalized?'LİSTE DONDURULDU':'BÜLTEN BEKLENİYOR';$('statusTitle').textContent=finalized?'Bu haftanın bahis listesi hazır':'Haftalık karar henüz hazır değil';$('statusText').textContent=finalized?`Liste ${d.finalized_at?new Date(d.finalized_at).toLocaleString('tr-TR'):''} tarihinde kilitlendi. Sonradan değiştirilmez.`:'Türkiye hedef oranları ve uluslararası doğrulama tamamlanınca liste otomatik burada görünecek.';if(finalized){renderList('highList',d.high_confidence,false);renderList('valueList',d.high_confidence_value,true)}}catch(e){$('statusTitle').textContent='Bağlantı hatası';$('statusText').textContent='Sayfayı yenileyerek tekrar dene.'}}
 loadData();setInterval(loadData,60000);
