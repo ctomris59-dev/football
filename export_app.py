@@ -181,6 +181,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Football Thursday Decision Service", version="5.3", lifespan=lifespan)
+from over25_research_endpoint import router as over25_research_router
+app.include_router(over25_research_router)
 
 
 @app.get("/health")
