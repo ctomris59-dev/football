@@ -18,7 +18,7 @@ jobs:
         run: pip install -r requirements.txt
       - name: Compile final Thursday modules
         run: |
-          python -m py_compile market_consensus_builder.py international_market_reference.py thursday_decision_engine.py thursday_opening_watch.py thursday_schedule_tick.py live_refresh.py turkey_value_workflow.py
+          python -m py_compile export_app.py market_consensus_builder.py international_market_reference.py thursday_decision_engine.py thursday_opening_watch.py thursday_schedule_tick.py live_refresh.py turkey_value_workflow.py
       - name: Validate no-vig and Turkey-value separation
         run: |
           python - <<'PY'
@@ -48,17 +48,28 @@ jobs:
           assert m['international_edge_vs_tr'] > 0
           print('thursday-market-validation-ok')
           PY
-      - name: Validate Thursday scheduler window
+      - name: Validate Thursday scheduler window and auth
         run: |
           python - <<'PY'
           from datetime import datetime
           from zoneinfo import ZoneInfo
+          from fastapi import HTTPException
           from thursday_schedule_tick import in_decision_window
+          import export_app
 
           tr = ZoneInfo('Europe/Istanbul')
           assert not in_decision_window(datetime(2026, 9, 10, 17, 59, tzinfo=tr))
           assert in_decision_window(datetime(2026, 9, 10, 18, 0, tzinfo=tr))
           assert in_decision_window(datetime(2026, 9, 11, 12, 0, tzinfo=tr))
           assert not in_decision_window(datetime(2026, 9, 11, 12, 1, tzinfo=tr))
-          print('thursday-scheduler-window-ok')
+
+          export_app.THURSDAY_SCHEDULER_KEY = 'ci-secret'
+          for bad in (None, '', 'wrong'):
+              try:
+                  export_app.scheduler_auth(bad)
+                  raise AssertionError('scheduler auth should reject missing/wrong key')
+              except HTTPException as exc:
+                  assert exc.status_code == 401
+          export_app.scheduler_auth('ci-secret')
+          print('thursday-scheduler-window-auth-ok')
           PY
