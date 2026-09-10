@@ -1,0 +1,39 @@
+name: advanced-goal-ci
+
+on:
+  push:
+    branches: ['research/**', 'feature/**']
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate-advanced-goal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+      - name: Compile
+        run: |
+          python -m py_compile advanced_goal_models.py advanced_goal_audit.py advanced_goal_audit_once.py weekly_trusted_predictions.py
+      - name: Deterministic unit tests
+        run: pytest -q test_advanced_goal_models.py test_weekly_reliable_output.py
+      - name: Prove fail-closed production contract
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          weekly = Path('weekly_trusted_predictions.py').read_text()
+          audit = Path('advanced_goal_audit.py').read_text()
+          models = Path('advanced_goal_models.py').read_text()
+          assert 'registry_activation_mode(conn, ADVANCED_GOAL_POLICY_KEY)' in weekly
+          assert 'advanced_goal_fail_closed' in weekly
+          assert 'within_week_history_frozen' in audit
+          assert '2627 outcomes are never read' in audit
+          assert 'MIN_POOLED_HIT_GAIN' in audit and '0.005' in audit
+          assert 'MODE_DC' in models and 'MODE_OPP' in models
+          assert 'OPPONENT_BLEND_WEIGHT = 0.30' in models
+          print('advanced-goal-contract-ok')
+          PY
