@@ -1,0 +1,22 @@
+name: read-weekly-now
+
+on:
+  push:
+    branches: ['ops/read-weekly-now']
+
+jobs:
+  read:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read public production status
+        run: |
+          python - <<'PY'
+          import urllib.request
+          for path in ('/health','/thursday-list'):
+              url='https://football-dataset-export.onrender.com'+path
+              try:
+                  with urllib.request.urlopen(url,timeout=30) as r:
+                      print(path+'='+r.read().decode('utf-8'))
+              except Exception as e:
+                  print(path+'_ERROR='+repr(e))
+          PY
