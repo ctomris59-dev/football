@@ -31,7 +31,6 @@ REFRESH_MIN_INTERVAL_MINUTES = float(os.getenv("LIVE_REFRESH_MIN_INTERVAL_MINUTE
 REFRESH_FORCE = os.getenv("LIVE_REFRESH_FORCE", "false").lower() in {"1", "true", "yes"}
 REFRESH_TRIGGER_NAME = os.getenv("LIVE_REFRESH_TRIGGER_NAME", "thursday-decision-prep").strip() or "thursday-decision-prep"
 FOTMOB_MAX_AGE_HOURS = float(os.getenv("THURSDAY_FOTMOB_MAX_AGE_HOURS", "12"))
-RUN_TOPN_SENSITIVITY_ONCE = os.getenv("RUN_TOPN_SENSITIVITY_ONCE", "false").strip().lower() in {"1", "true", "yes"}
 ISTANBUL = ZoneInfo("Europe/Istanbul")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -70,59 +69,9 @@ def _fotmob_is_fresh() -> bool:
         return False
 
 
-def _compact_topn(result: Dict[str, Any]) -> Dict[str, Any]:
-    compact: Dict[str, Any] = {
-        "version": result.get("version"),
-        "folds": result.get("folds"),
-        "candidate_rows": result.get("candidate_rows"),
-        "topn": {},
-    }
-    sensitivity = result.get("sensitivity") or {}
-    for n in ("3", "5", "10"):
-        item = sensitivity.get(n) or {}
-        overall = item.get("overall") or {}
-        compact["topn"][n] = {
-            "overall": {
-                "n": overall.get("n"),
-                "hits": overall.get("hits"),
-                "hit_rate": overall.get("hit_rate"),
-                "avg_confidence": overall.get("avg_confidence"),
-                "model_brier": overall.get("model_brier"),
-                "bootstrap95": overall.get("bootstrap95"),
-            },
-            "by_fold": {
-                str(fold): {
-                    "n": (metrics or {}).get("n"),
-                    "hits": (metrics or {}).get("hits"),
-                    "hit_rate": (metrics or {}).get("hit_rate"),
-                    "avg_confidence": (metrics or {}).get("avg_confidence"),
-                    "model_brier": (metrics or {}).get("model_brier"),
-                    "bootstrap95": (metrics or {}).get("bootstrap95"),
-                }
-                for fold, metrics in (item.get("by_fold") or {}).items()
-            },
-        }
-    return compact
-
-
 def _run() -> Dict[str, Any]:
     summary: Dict[str, Any] = {"started_at": utcnow().isoformat(), "workflow": "thursday-two-lists-final", "steps": {}}
     steps = summary["steps"]
-
-    # Temporary, research-only operational mode. It deliberately exits before any
-    # live fixture/player/price refresh so the historical Top-N audit can be run in
-    # isolation. Disabled by default and removed after the one-shot verification.
-    if RUN_TOPN_SENSITIVITY_ONCE:
-        from topn_sensitivity_audit import run as run_topn_sensitivity
-        result = run_topn_sensitivity(DATABASE_URL)
-        compact = _compact_topn(result)
-        steps["topn_sensitivity_once"] = {"status": "ok", "result": compact}
-        summary["finished_at"] = utcnow().isoformat()
-        summary["status"] = "success"
-        summary["workflow"] = "research-topn-only-once"
-        log.info("TOPN_SENSITIVITY_COMPACT %s", json.dumps(compact, ensure_ascii=False, default=str, separators=(",", ":")))
-        log.info("THURSDAY_REFRESH_RESULT %s", json.dumps(summary, ensure_ascii=False, default=str, separators=(",", ":")))
-        return summary
 
     from espn_current_importer import run_import as espn_current
     run_step("espn_current", lambda: espn_current(DATABASE_URL), steps)
