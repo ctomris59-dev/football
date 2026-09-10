@@ -24,7 +24,7 @@ from typing import Any, Optional
 
 import psycopg
 from fastapi import FastAPI, Header, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from starlette.background import BackgroundTask
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -122,14 +122,14 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Football Thursday Decision Service", version="5.1", lifespan=lifespan)
+app = FastAPI(title="Football Thursday Decision Service", version="5.2", lifespan=lifespan)
 
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
-        "version": "5.1",
+        "version": "5.2",
         "workflow": "Thursday -> model + international no-vig + Turkey price -> two lists -> bet -> done",
         "auto_live_refresh": AUTO_LIVE_REFRESH,
         "refresh": dict(refresh_state),
@@ -139,6 +139,20 @@ def health():
 @app.get("/")
 def root():
     return health()
+
+
+@app.get("/persembe", response_class=HTMLResponse)
+def persembe_page():
+    """Pinnable, user-facing dashboard for the immutable Thursday betting list."""
+    from thursday_page import render_page
+    return HTMLResponse(render_page(), headers={"Cache-Control": "no-store"})
+
+
+@app.get("/thursday", response_class=HTMLResponse)
+def thursday_page_alias():
+    """English-path alias for the same pinnable dashboard."""
+    from thursday_page import render_page
+    return HTMLResponse(render_page(), headers={"Cache-Control": "no-store"})
 
 
 @app.post("/refresh")
