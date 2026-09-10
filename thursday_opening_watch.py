@@ -20,7 +20,8 @@ from zoneinfo import ZoneInfo
 import psycopg
 from psycopg.types.json import Jsonb
 
-from thursday_decision_engine import build_decision, json_default, weekend_bounds
+from thursday_decision_engine_v2 import build_decision
+from thursday_decision_engine import json_default, weekend_bounds
 from turkey_iddaa_odds_collector import run_import
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -132,8 +133,6 @@ def main(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None) ->
             except Exception as exc:
                 international = {"status": "failed", "error": str(exc)[:1200]}
         else:
-            # Do not burn international-provider quota before Turkey actually exposes
-            # playable target prices.
             international = {"status": "waiting_for_turkey_prices"}
 
         decision = build_decision(database_url, now=now)
@@ -150,13 +149,17 @@ def main(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None) ->
             "turkey": turkey,
             "international": international,
             "decision_run_id": decision.get("decision_run_id"),
+            "decision_engine": decision.get("decision_engine"),
             "official_fixture_coverage": decision.get("official_fixture_coverage"),
             "candidate_rows": decision.get("candidate_rows"),
+            "playable_candidate_rows": decision.get("playable_candidate_rows"),
             "tr_candidate_coverage": decision.get("tr_candidate_coverage"),
             "international_candidate_coverage": decision.get("international_candidate_coverage"),
             "raw_high_candidates": decision.get("raw_high_candidates"),
             "priced_high_candidates": decision.get("priced_high_candidates"),
             "verified_high_candidates": decision.get("verified_high_candidates"),
+            "candidate_preview": decision.get("candidate_preview") or [],
+            "raw_high_preview": decision.get("raw_high_preview") or [],
             "high_confidence": decision.get("high_confidence") or [],
             "high_confidence_value": decision.get("high_confidence_value") or [],
         }
@@ -166,6 +169,7 @@ def main(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None) ->
                 "week_key": decision["week_key"],
                 "finalized_at": datetime.now(timezone.utc),
                 "decision_run_id": decision["decision_run_id"],
+                "decision_engine": decision.get("decision_engine"),
                 "official_fixture_coverage": decision["official_fixture_coverage"],
                 "high_confidence": decision["high_confidence"],
                 "high_confidence_value": decision["high_confidence_value"],
