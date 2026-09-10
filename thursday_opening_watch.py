@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Thursday opening watcher for the final two-list betting workflow.
+"""Thursday watcher: mandatory weekly reliability list + optional value list.
 
-Sequence:
-1) check for official Turkish İddaa weekend prices from Thursday morning;
-2) once target Turkey prices exist, refresh/map international paired no-vig reference;
-3) build two lists;
-4) freeze the first sufficiently complete decision for the week.
+The first list is always the best available V1-ranked, Turkey-playable forecast set
+once the Friday-Monday bulletin is sufficiently complete. It is not artificially
+labelled 70%+: each item carries its real V1 selected-side estimate and only >=70%
+items receive the strict High Confidence badge.
 
-After freezing, later odds/T-1/T-3 information never rewrites the user's bets.
+The second list remains strict model + international no-vig + Turkey value. It may
+legitimately be empty. Later T-1/T-3 information does not rewrite a frozen week.
 """
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS thursday_final_decisions(
  finalized_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
  decision_run_id BIGINT NOT NULL,
  payload JSONB NOT NULL,
- source TEXT NOT NULL DEFAULT 'model+international_no_vig+iddaa_official'
+ source TEXT NOT NULL DEFAULT 'v1_reliability+optional_value+iddaa_official'
 );
 CREATE TABLE IF NOT EXISTS thursday_watch_checks(
  week_key DATE NOT NULL,
@@ -73,8 +73,11 @@ def latest_final(database_url: str = DATABASE_URL, week_key: Optional[date] = No
     if not row:
         return None
     return {
-        "week_key": week_key, "finalized_at": row[0], "decision_run_id": int(row[1]),
-        "payload": row[2], "source": row[3],
+        "week_key": week_key,
+        "finalized_at": row[0],
+        "decision_run_id": int(row[1]),
+        "payload": row[2],
+        "source": row[3],
     }
 
 
@@ -87,7 +90,9 @@ def _record_check(database_url: str, week_key: date, check_hour: datetime, resul
                ON CONFLICT(week_key,check_hour) DO UPDATE SET
                  status=EXCLUDED.status,payload=EXCLUDED.payload,checked_at=NOW()""",
             (
-                week_key, check_hour, result["status"],
+                week_key,
+                check_hour,
+                result["status"],
                 Jsonb(result, dumps=lambda x: json.dumps(x, default=json_default, ensure_ascii=False)),
             ),
         )
@@ -112,21 +117,34 @@ def main(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None) ->
         ).fetchone()
         if existing:
             result = {
-                "status": "already_finalized", "week_key": week_key, "finalized_at": existing[0],
-                "decision_run_id": int(existing[1]), "payload": existing[2], "source": existing[3],
+                "status": "already_finalized",
+                "week_key": week_key,
+                "finalized_at": existing[0],
+                "decision_run_id": int(existing[1]),
+                "payload": existing[2],
+                "source": existing[3],
             }
             print("THURSDAY_FINAL_DECISION", json.dumps(result, ensure_ascii=False, default=json_default, separators=(",", ":")), flush=True)
             return result
 
     try:
         turkey = run_import(database_url)
-        turkey_ready_to_compare = bool(
+        # Expand the same official bulletin to both sides of each target market. This
+        # does not alter value logic; it only lets the weekly V1 list choose its
+        # stronger predicted side when that side is actually executable in Turkey.
+        try:
+            from turkey_two_sided_odds import run_import as run_two_sided
+            turkey_two_sided = run_two_sided(database_url)
+        except Exception as exc:
+            turkey_two_sided = {"status": "failed_optional", "error": str(exc)[:1200]}
+
+        turkey_ready = bool(
             int(turkey.get("matched_fixtures") or 0) > 0
             and int(turkey.get("stored_prices") or 0) > 0
         )
 
         international: Dict[str, Any]
-        if turkey_ready_to_compare:
+        if turkey_ready:
             try:
                 from international_market_reference import refresh_and_map
                 international = refresh_and_map(database_url, start=start, end=end)
@@ -135,48 +153,61 @@ def main(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None) ->
         else:
             international = {"status": "waiting_for_turkey_prices"}
 
+        # Strict value engine remains untouched and is now explicitly secondary.
         decision = build_decision(database_url, now=now)
-        status = "pending_bulletin"
-        if turkey_ready_to_compare and international.get("status") == "failed":
-            status = "pending_international_reference"
-        elif turkey_ready_to_compare and not decision.get("decision_ready"):
-            status = "pending_market_coverage"
+
+        from weekly_trusted_predictions import build as build_weekly_trusted
+        trusted = build_weekly_trusted(database_url, now=now)
+
+        value_list = (
+            decision.get("high_confidence_value") or []
+            if decision.get("decision_ready")
+            else []
+        )
+        status = "ready_to_finalize" if trusted.get("ready") else "pending_bulletin"
+        if turkey_ready and not trusted.get("ready"):
+            status = "pending_reliable_universe"
 
         result: Dict[str, Any] = {
             "status": status,
             "week_key": week_key,
             "window": window,
             "turkey": turkey,
+            "turkey_two_sided": turkey_two_sided,
             "international": international,
             "decision_run_id": decision.get("decision_run_id"),
             "decision_engine": decision.get("decision_engine"),
-            "official_fixture_coverage": decision.get("official_fixture_coverage"),
-            "candidate_rows": decision.get("candidate_rows"),
-            "playable_candidate_rows": decision.get("playable_candidate_rows"),
-            "tr_candidate_coverage": decision.get("tr_candidate_coverage"),
-            "international_candidate_coverage": decision.get("international_candidate_coverage"),
-            "raw_high_candidates": decision.get("raw_high_candidates"),
-            "priced_high_candidates": decision.get("priced_high_candidates"),
-            "verified_high_candidates": decision.get("verified_high_candidates"),
-            "candidate_preview": decision.get("candidate_preview") or [],
-            "raw_high_preview": decision.get("raw_high_preview") or [],
-            "high_confidence": decision.get("high_confidence") or [],
-            "high_confidence_value": decision.get("high_confidence_value") or [],
+            "official_fixture_coverage": trusted.get("official_fixture_coverage"),
+            "weekly_reliable": trusted.get("picks") or [],
+            "strict_high_confidence": trusted.get("strict_high_confidence") or [],
+            "strict_high_confidence_count": trusted.get("strict_high_confidence_count"),
+            "high_confidence_value": value_list,
+            "value_decision_ready": bool(decision.get("decision_ready")),
+            "value_candidate_preview": decision.get("candidate_preview") or [],
         }
 
-        if decision.get("decision_ready"):
+        if trusted.get("ready"):
             payload = {
-                "week_key": decision["week_key"],
+                "week_key": week_key,
                 "finalized_at": datetime.now(timezone.utc),
-                "decision_run_id": decision["decision_run_id"],
-                "decision_engine": decision.get("decision_engine"),
-                "official_fixture_coverage": decision["official_fixture_coverage"],
-                "high_confidence": decision["high_confidence"],
-                "high_confidence_value": decision["high_confidence_value"],
-                "policy": decision["diagnostics"]["policy"],
+                "decision_run_id": decision.get("decision_run_id") or 0,
+                "decision_engine": "weekly_v1_reliability_plus_optional_value_v1",
+                "official_fixture_coverage": trusted.get("official_fixture_coverage"),
+                # Backward-compatible key: the pinned page/API already reads this.
+                # Semantics are now explicit in each item's confidence_tier.
+                "high_confidence": trusted.get("picks") or [],
+                "weekly_reliable": trusted.get("picks") or [],
+                "strict_high_confidence": trusted.get("strict_high_confidence") or [],
+                "high_confidence_value": value_list,
+                "policy": {
+                    "primary_list": trusted.get("policy") or {},
+                    "value_list": (decision.get("diagnostics") or {}).get("policy") or {},
+                    "value_optional": True,
+                },
                 "sources": {
                     "model": "validated_v1",
-                    "international": "paired_same-book_no-vig_consensus",
+                    "international_primary": "safety_check_when_available; strong contradiction rejected",
+                    "international_value": "mandatory paired_same-book_no-vig_consensus",
                     "executable_price": "iddaa_official_turkey",
                 },
             }
@@ -184,10 +215,11 @@ def main(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None) ->
                 conn.execute(DDL)
                 conn.execute(
                     """INSERT INTO thursday_final_decisions(week_key,decision_run_id,payload,source)
-                       VALUES(%s,%s,%s,'model+international_no_vig+iddaa_official')
+                       VALUES(%s,%s,%s,'v1_reliability+optional_value+iddaa_official')
                        ON CONFLICT(week_key) DO NOTHING""",
                     (
-                        week_key, int(decision["decision_run_id"]),
+                        week_key,
+                        int(decision.get("decision_run_id") or 0),
                         Jsonb(payload, dumps=lambda x: json.dumps(x, default=json_default, ensure_ascii=False)),
                     ),
                 )
@@ -196,8 +228,12 @@ def main(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None) ->
                     (week_key,),
                 ).fetchone()
             result = {
-                "status": "finalized", "week_key": week_key, "finalized_at": stored[0],
-                "decision_run_id": int(stored[1]), "payload": stored[2], "source": stored[3],
+                "status": "finalized",
+                "week_key": week_key,
+                "finalized_at": stored[0],
+                "decision_run_id": int(stored[1]),
+                "payload": stored[2],
+                "source": stored[3],
             }
 
         _record_check(database_url, week_key, check_hour, result)
