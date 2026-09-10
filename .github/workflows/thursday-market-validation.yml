@@ -48,13 +48,14 @@ jobs:
           assert m['international_edge_vs_tr'] > 0
           print('thursday-market-validation-ok')
           PY
-      - name: Validate Thursday scheduler window and auth
+      - name: Validate Thursday scheduler window, weekly horizon and auth
         run: |
           python - <<'PY'
           from datetime import datetime
           from zoneinfo import ZoneInfo
           from fastapi import HTTPException
           from thursday_schedule_tick import in_decision_window
+          from thursday_decision_engine import weekend_bounds
           import export_app
 
           tr = ZoneInfo('Europe/Istanbul')
@@ -64,6 +65,11 @@ jobs:
           assert in_decision_window(datetime(2026, 9, 11, 12, 0, tzinfo=tr))
           assert not in_decision_window(datetime(2026, 9, 11, 12, 1, tzinfo=tr))
 
+          week_key, start, end = weekend_bounds(datetime(2026, 9, 10, 11, 51, tzinfo=tr))
+          assert week_key.isoformat() == '2026-09-11'
+          assert start.astimezone(tr) == datetime(2026, 9, 11, 0, 0, tzinfo=tr)
+          assert end.astimezone(tr) == datetime(2026, 9, 15, 0, 0, tzinfo=tr)
+
           export_app.THURSDAY_SCHEDULER_KEY = 'ci-secret'
           for bad in (None, '', 'wrong'):
               try:
@@ -72,5 +78,5 @@ jobs:
               except HTTPException as exc:
                   assert exc.status_code == 401
           export_app.scheduler_auth('ci-secret')
-          print('thursday-scheduler-window-auth-ok')
+          print('thursday-scheduler-window-horizon-auth-ok')
           PY
