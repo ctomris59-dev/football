@@ -31,6 +31,7 @@ REFRESH_MIN_INTERVAL_MINUTES = float(os.getenv("LIVE_REFRESH_MIN_INTERVAL_MINUTE
 REFRESH_FORCE = os.getenv("LIVE_REFRESH_FORCE", "false").lower() in {"1", "true", "yes"}
 REFRESH_TRIGGER_NAME = os.getenv("LIVE_REFRESH_TRIGGER_NAME", "thursday-decision-prep").strip() or "thursday-decision-prep"
 FOTMOB_MAX_AGE_HOURS = float(os.getenv("THURSDAY_FOTMOB_MAX_AGE_HOURS", "12"))
+RUN_RESEARCH_AUDITS = os.getenv("RUN_RESEARCH_AUDITS", "false").lower() in {"1", "true", "yes"}
 ISTANBUL = ZoneInfo("Europe/Istanbul")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -94,6 +95,15 @@ def _run() -> Dict[str, Any]:
     # no-vig reference and then freeze the first sufficiently complete two-list output.
     from thursday_opening_watch import main as opening_watch
     run_step("opening_watch", lambda: opening_watch(DATABASE_URL), steps)
+
+    # One-shot research hook. It is disabled by default and never changes model or
+    # policy activation. The flag is used only to execute reproducible diagnostics
+    # against the production database, then removed from the live service.
+    if RUN_RESEARCH_AUDITS:
+        from edge_structure_audit import run_audit as edge_audit
+        from odds_movement_backtest import run_backtest as movement_audit
+        run_step("research_edge_structure", lambda: edge_audit(DATABASE_URL), steps, optional=True)
+        run_step("research_odds_movement", lambda: movement_audit(DATABASE_URL), steps, optional=True)
 
     summary["finished_at"] = utcnow().isoformat()
     summary["status"] = "success"
