@@ -12,6 +12,7 @@ weekly user-facing decision path.
 """
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
@@ -30,6 +31,8 @@ from starlette.background import BackgroundTask
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DOWNLOAD_TOKEN = os.getenv("DOWNLOAD_TOKEN", "").strip()
 VALIDATION_TRIGGER_TOKEN = os.getenv("VALIDATION_TRIGGER_TOKEN", "").strip()
+THURSDAY_SCHEDULER_KEY = os.getenv("THURSDAY_SCHEDULER_KEY", "").strip()
+THURSDAY_RECENT_REFRESH_MINUTES = float(os.getenv("THURSDAY_RECENT_REFRESH_MINUTES", "20"))
 AUTO_LIVE_REFRESH = os.getenv("AUTO_LIVE_REFRESH", "false").lower() in {"1", "true", "yes"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -85,6 +88,54 @@ def auth(token: Optional[str], authorization: Optional[str]) -> None:
         raise HTTPException(401, "Invalid token.")
 
 
+def scheduler_auth(key: Optional[str]) -> None:
+    """Fail closed unless the private Render cron key matches."""
+    if not THURSDAY_SCHEDULER_KEY:
+        raise HTTPException(500, "THURSDAY_SCHEDULER_KEY is not configured.")
+    candidate = (key or "").strip()
+    if not candidate or not hmac.compare_digest(candidate, THURSDAY_SCHEDULER_KEY):
+        raise HTTPException(401, "Invalid scheduler key.")
+
+
+def recent_thursday_refresh() -> Optional[dict[str, Any]]:
+    """Return a recent/running canonical Thursday prep, if one exists.
+
+    This is intentionally checked only on the HTTP scheduler path. The canonical
+    live_refresh.py process calls thursday_opening_watch.main() directly and must
+    not suppress its own opening check.
+    """
+    if not DATABASE_URL or THURSDAY_RECENT_REFRESH_MINUTES <= 0:
+        return None
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            row = conn.execute(
+                """SELECT id,started_at,finished_at,status,trigger_name
+                   FROM live_refresh_runs
+                   WHERE trigger_name='thursday-decision-prep'
+                     AND (
+                       (status='running' AND started_at>=NOW()-(%s||' minutes')::interval)
+                       OR
+                       (status='success' AND COALESCE(finished_at,started_at)>=NOW()-(%s||' minutes')::interval)
+                     )
+                   ORDER BY started_at DESC LIMIT 1""",
+                (THURSDAY_RECENT_REFRESH_MINUTES, THURSDAY_RECENT_REFRESH_MINUTES),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "run_id": int(row[0]),
+            "started_at": row[1],
+            "finished_at": row[2],
+            "status": row[3],
+            "trigger_name": row[4],
+        }
+    except Exception as exc:
+        # Do not turn an optional overlap optimization into an outage. The
+        # thursday_opening_watch DB idempotency still prevents duplicate freezes.
+        log.warning("THURSDAY_RECENT_REFRESH_CHECK_FAILED %s", str(exc)[:500])
+        return None
+
+
 def _run_live_refresh() -> None:
     if not refresh_lock.acquire(blocking=False):
         return
@@ -122,16 +173,17 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Football Thursday Decision Service", version="5.2", lifespan=lifespan)
+app = FastAPI(title="Football Thursday Decision Service", version="5.3", lifespan=lifespan)
 
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
-        "version": "5.2",
+        "version": "5.3",
         "workflow": "Thursday -> model + international no-vig + Turkey price -> two lists -> bet -> done",
         "auto_live_refresh": AUTO_LIVE_REFRESH,
+        "scheduler_auth_configured": bool(THURSDAY_SCHEDULER_KEY),
         "refresh": dict(refresh_state),
     }
 
@@ -177,10 +229,21 @@ def validation_run(token: Optional[str] = Query(None)):
 
 
 @app.get("/opening-watch")
-def opening_watch():
-    """Public narrow endpoint used only to detect/freeze the Thursday opening list."""
+def opening_watch(x_scheduler_key: Optional[str] = Header(None, alias="X-Scheduler-Key")):
+    """Authenticated narrow endpoint used by the Render Thursday scheduler."""
+    scheduler_auth(x_scheduler_key)
     if not DATABASE_URL:
         raise HTTPException(500, "DATABASE_URL is not configured.")
+
+    recent = recent_thursday_refresh()
+    if recent:
+        return {
+            "ok": True,
+            "status": "skipped_recent_thursday_refresh",
+            "recent_refresh": recent,
+            "cooldown_minutes": THURSDAY_RECENT_REFRESH_MINUTES,
+        }
+
     if not opening_lock.acquire(blocking=False):
         return {"ok": True, "status": "opening_watch_already_running"}
     try:
