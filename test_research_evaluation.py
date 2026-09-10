@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from research_change_control import activation_evidence_is_safe, guarded_activation_mode
 from research_evaluation import confidence_band, shrink_rate, stratified_week_sample, week_block_bootstrap
-from clv_backtest import reconstruct_clv
+from clv_backtest import reconstruct_clv, split_evaluation_scope
 
 
 class ResearchEvaluationTests(unittest.TestCase):
@@ -81,6 +81,18 @@ class ResearchEvaluationTests(unittest.TestCase):
         self.assertGreater(result["probability_clv"], 0)
         self.assertGreater(result["log_price_clv"], 0)
         self.assertAlmostEqual(result["closing_price"], 1.80, places=6)
+
+    def test_clv_live_holdout_is_never_pooled_into_validation(self):
+        rows = [
+            {"fold": "2425", "id": 1},
+            {"fold": "2526", "id": 2},
+            {"fold": "2627", "id": 3},
+            {"fold": "2223", "id": 4},
+        ]
+        scopes = split_evaluation_scope(rows)
+        self.assertEqual([r["id"] for r in scopes["historical_validation"]], [1, 2])
+        self.assertEqual([r["id"] for r in scopes["live_holdout"]], [3])
+        self.assertEqual([r["id"] for r in scopes["other"]], [4])
 
 
 if __name__ == "__main__":
