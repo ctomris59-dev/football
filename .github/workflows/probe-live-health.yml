@@ -8,13 +8,16 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - name: Read current V2 preview and final list
+      - name: Read current runtime and V2 preview
         run: |
+          echo '=== HEALTH ==='
+          curl -fsS https://football-dataset-export.onrender.com/health
+          echo
           echo '=== PREVIEW ==='
-          for i in $(seq 1 12); do
+          for i in $(seq 1 18); do
             body=$(curl -sS https://football-dataset-export.onrender.com/__temp_v2_preview_20260910 || true)
             echo "$body"
-            if echo "$body" | grep -q '"decision_run_id"'; then
+            if echo "$body" | grep -Eq '"decision_run_id":([5-9]|[1-9][0-9]+)' && echo "$body" | grep -q '"finished_at"'; then
               break
             fi
             sleep 5
