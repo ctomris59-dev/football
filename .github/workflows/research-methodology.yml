@@ -21,17 +21,22 @@ jobs:
           python -m py_compile \
             research_evaluation.py \
             edge_structure_audit.py \
+            topn_sensitivity_audit.py \
+            pl_corners_top5_challenger.py \
             clv_backtest.py \
             research_change_control.py \
             production_predictor_v5.py \
-            test_research_evaluation.py
+            test_research_evaluation.py \
+            test_pl_corners_top5_challenger.py
       - name: Run methodology unit tests
-        run: python -m unittest -q test_research_evaluation.py
+        run: python -m unittest -q test_research_evaluation.py test_pl_corners_top5_challenger.py
       - name: Import integration modules
         run: |
           python - <<'PY'
           import research_evaluation
           import edge_structure_audit
+          import topn_sensitivity_audit
+          import pl_corners_top5_challenger
           import clv_backtest
           import research_change_control
           import production_predictor_v5
