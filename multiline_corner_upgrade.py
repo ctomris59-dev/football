@@ -6,6 +6,10 @@ already produces lambda_total_corners. We evaluate that same Poisson intensity a
 7.5/8.5/9.5/10.5 and only admit a side when official Turkish İddaa actually prices
 that exact side. The strict value list remains separate and unchanged unless a valid
 international reference already exists for that exact market key.
+
+All-competition schedule context is operational only: it can defer a fixture with an
+unplayed official match before the target league fixture and can reduce ranking for
+short rest. It never rewrites the frozen V1 probability itself.
 """
 from __future__ import annotations
 
@@ -13,7 +17,7 @@ import json
 import os
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Optional
 
 import psycopg
 import requests
@@ -23,6 +27,7 @@ from corner_multiline import corner_market_specs, corner_selections, normalize_c
 from international_market_reference import latest_ref
 from model_engine_v1 import predict_match
 from production_predictor import canon
+from schedule_context import SCHEDULE_CONTEXT_VERSION, team_schedule_context
 from thursday_decision_engine import (
     DATABASE_URL,
     HIGH_CONFIDENCE_MIN,
@@ -139,6 +144,7 @@ def _corner_public(row: Dict[str, Any]) -> Dict[str, Any]:
         "confidence_tier": "Yüksek Güven" if row["confidence"] >= HIGH_CONFIDENCE_MIN else "Haftanın En Güvenilirleri",
         "strict_high_confidence": row["confidence"] >= HIGH_CONFIDENCE_MIN,
         "ranking_score": row["ranking_score"],
+        "schedule_rank_factor": row.get("schedule_rank_factor", 1.0),
         "tr_price": row["price"].get("tr_price"),
         "tr_opening_price": row["price"].get("tr_opening_price"),
         "tr_source": row["price"].get("tr_source"),
@@ -152,7 +158,10 @@ def _corner_public(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_multiline_corner_candidates(database_url: str, *, now: Optional[datetime] = None) -> Dict[str, Any]:
-    week_key, start, end = weekend_bounds(now)
+    as_of = now or datetime.now(timezone.utc)
+    if as_of.tzinfo is None:
+        as_of = as_of.replace(tzinfo=timezone.utc)
+    week_key, start, end = weekend_bounds(as_of)
     with psycopg.connect(database_url) as conn:
         fixtures = conn.execute(
             """SELECT event_id,match_date,league_name,home_team,away_team
@@ -174,19 +183,47 @@ def build_multiline_corner_candidates(database_url: str, *, now: Optional[dateti
                 excluded["no_history"] += 1
                 continue
             pred = predict_match(history, canon(home), canon(away), recent_matches=18)
-            home_ctx = _player_context(conn, str(home))
-            away_ctx = _player_context(conn, str(away))
+            home_player_ctx = _player_context(conn, str(home))
+            away_player_ctx = _player_context(conn, str(away))
+            home_sched = team_schedule_context(
+                conn,
+                str(home),
+                match_date,
+                as_of=as_of,
+                fallback_rest_days=_last_rest_days(history, str(home), match_date),
+            )
+            away_sched = team_schedule_context(
+                conn,
+                str(away),
+                match_date,
+                as_of=as_of,
+                fallback_rest_days=_last_rest_days(history, str(away), match_date),
+            )
+            if home_sched.get("pending_pre_fixture_match") or away_sched.get("pending_pre_fixture_match"):
+                excluded["pending_intervening_official_match"] += 1
+                continue
             eligible, blockers, gate_diag = _early_gate(
                 pred,
-                home_ctx,
-                away_ctx,
-                _last_rest_days(history, str(home), match_date),
-                _last_rest_days(history, str(away), match_date),
+                home_player_ctx,
+                away_player_ctx,
+                home_sched.get("rest_days"),
+                away_sched.get("rest_days"),
             )
             if not eligible:
                 for blocker in blockers:
                     excluded[blocker] += 1
                 continue
+            schedule_factor = min(
+                float(home_sched.get("rank_factor") or 0.0),
+                float(away_sched.get("rank_factor") or 0.0),
+            )
+            gate_diag.update({
+                "schedule_context_version": SCHEDULE_CONTEXT_VERSION,
+                "schedule_scope": "all_competitions_with_domestic_fallback",
+                "schedule_rank_factor": schedule_factor,
+                "home_schedule": home_sched,
+                "away_schedule": away_sched,
+            })
             for spec in corner_market_specs(pred.lambda_total_corners):
                 market = str(spec["market"])
                 p_yes = float(spec["p_yes"])
@@ -214,7 +251,8 @@ def build_multiline_corner_candidates(database_url: str, *, now: Optional[dateti
                     "corner_line": float(spec["line"]),
                     "selection": selection,
                     "confidence": confidence,
-                    "ranking_score": confidence * (0.75 + 0.25 * data_quality),
+                    "ranking_score": confidence * (0.75 + 0.25 * data_quality) * schedule_factor,
+                    "schedule_rank_factor": schedule_factor,
                     "price": price,
                     "international": ref,
                     "international_selected_probability": ref_selected,
@@ -251,11 +289,13 @@ def upgrade_final(database_url: str = DATABASE_URL, *, now: Optional[datetime] =
         return {"status": "waiting_for_final", "week_key": week_key, "multiline_prices": prices}
     existing_payload = dict(row[1] or {})
     primary_policy = dict((existing_payload.get("policy") or {}).get("primary_list") or {})
-    if primary_policy.get("multiline_corners") is True and not FORCE:
+    if (
+        primary_policy.get("multiline_corners") is True
+        and primary_policy.get("schedule_context_version") == SCHEDULE_CONTEXT_VERSION
+        and not FORCE
+    ):
         return {"status": "already_upgraded", "week_key": week_key, "multiline_prices": prices}
 
-    # Rebuild the base list at a wide limit so dynamic corners compete fairly with
-    # every fixture's strongest existing goal/BTTS/fixed-corner candidate.
     from weekly_trusted_predictions import build as build_base
     base = build_base(database_url, now=now, limit=100)
     corner = build_multiline_corner_candidates(database_url, now=now)
@@ -303,6 +343,10 @@ def upgrade_final(database_url: str = DATABASE_URL, *, now: Optional[datetime] =
         "corner_probability_source": "same_frozen_v1_lambda_total_corners_poisson_threshold",
         "turkey_exact_line_price_required": True,
         "value_separate": True,
+        "schedule_context_version": SCHEDULE_CONTEXT_VERSION,
+        "schedule_scope": "domestic_plus_uefa",
+        "schedule_ranking": "raw_v1_probability_unchanged; operational_short_rest_factor_only",
+        "pending_intervening_official_match": "excluded_until_refresh_after_match",
     })
     policy["primary_list"] = primary
     payload["policy"] = policy
@@ -317,7 +361,8 @@ def upgrade_final(database_url: str = DATABASE_URL, *, now: Optional[datetime] =
     with psycopg.connect(database_url, autocommit=True) as conn:
         conn.execute(
             """UPDATE thursday_final_decisions
-                  SET finalized_at=NOW(),payload=%s,source='v1_reliability+multiline_corners+optional_value+iddaa_official'
+                  SET finalized_at=NOW(),payload=%s,
+                      source='v1_reliability+multiline_corners+all_comp_schedule+optional_value+iddaa_official'
                 WHERE week_key=%s""",
             (Jsonb(payload, dumps=lambda x: json.dumps(x, ensure_ascii=False, default=str)), week_key),
         )
