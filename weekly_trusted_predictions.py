@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Build the mandatory weekly reliability-ranked list from the frozen V1 model.
+"""Build the mandatory weekly reliability-ranked list.
 
-V1 probabilities remain frozen. Operational schedule context may de-rank/block a
-candidate. Lineup Stability V2 may affect ranking only when its dedicated registry
-row contains holdout-safe two-fold evidence accepted by research_change_control.
+Frozen V1 remains the fail-closed baseline. Operational all-competition schedule
+context may de-rank/block a candidate. Lineup Stability V2 and advanced goal-model
+challengers can affect production only when their dedicated registry rows contain
+holdout-safe two-fold evidence accepted by research_change_control.
 """
 from __future__ import annotations
 
@@ -15,6 +16,11 @@ from typing import Any, Dict, List, Optional
 
 import psycopg
 
+from advanced_goal_models import (
+    MODE_V1 as ADVANCED_V1_MODE,
+    POLICY_KEY as ADVANCED_GOAL_POLICY_KEY,
+    apply_mode as apply_advanced_goal_mode,
+)
 from international_market_reference import latest_ref
 from lineup_stability_v2_policy import (
     ACTIVE_MODE as LINEUP_V2_ACTIVE_MODE,
@@ -60,6 +66,12 @@ def _selected_market_probability(ref: Optional[Dict[str, Any]], selected_yes: bo
 
 def _public(row: Dict[str, Any]) -> Dict[str, Any]:
     ref = row.get("international") or {}
+    goal_mode = row.get("goal_model_mode", ADVANCED_V1_MODE)
+    semantics = (
+        "selected_side_raw_v1_probability_estimate_not_perfectly_calibrated"
+        if goal_mode == ADVANCED_V1_MODE
+        else "selected_side_guarded_advanced_goal_probability_estimate_not_perfectly_calibrated"
+    )
     return {
         "event_id": row["event_id"],
         "match_date": row["match_date"],
@@ -70,11 +82,13 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
         "selection": row["selection"],
         "confidence": row["confidence"],
         "model_probability_estimate": row["confidence"],
-        "confidence_semantics": "selected_side_raw_v1_probability_estimate_not_perfectly_calibrated",
+        "confidence_semantics": semantics,
         "confidence_tier": "Yüksek Güven" if row["confidence"] >= HIGH_CONFIDENCE_MIN else "Haftanın En Güvenilirleri",
         "strict_high_confidence": row["confidence"] >= HIGH_CONFIDENCE_MIN,
         "ranking_score": row["ranking_score"],
         "schedule_rank_factor": row.get("schedule_rank_factor", 1.0),
+        "goal_model_mode": goal_mode,
+        "advanced_goal_available": row.get("advanced_goal_available", True),
         "lineup_v2_active": row.get("lineup_v2_active", False),
         "lineup_v2_available": row.get("lineup_v2_available", False),
         "lineup_v2_factor": row.get("lineup_v2_factor", 1.0),
@@ -96,10 +110,13 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
     if as_of.tzinfo is None:
         as_of = as_of.replace(tzinfo=timezone.utc)
     week_key, start, end = weekend_bounds(as_of)
-    with psycopg.connect(database_url) as conn:
+    # Read-only list construction deliberately uses autocommit: optional context
+    # lookups are fail-soft and must never poison the rest of the read transaction.
+    with psycopg.connect(database_url, autocommit=True) as conn:
         conn.execute(TURKEY_PRICE_DDL)
         lineup_v2_mode = registry_activation_mode(conn, LINEUP_V2_POLICY_KEY)
         lineup_v2_active = lineup_v2_mode == LINEUP_V2_ACTIVE_MODE
+        advanced_goal_mode = registry_activation_mode(conn, ADVANCED_GOAL_POLICY_KEY)
         fixtures = conn.execute(
             """SELECT event_id,match_date,league_name,home_team,away_team
                  FROM espn_upcoming
@@ -121,8 +138,14 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                 excluded["no_history"] += 1
                 continue
             pred = predict_match(history, canon(home), canon(away), recent_matches=18)
-            home_player_ctx, away_player_ctx = _player_context(conn, str(home)), _player_context(conn, str(away))
+            advanced = apply_advanced_goal_mode(pred, history, canon(home), canon(away), advanced_goal_mode)
+            advanced_available = bool(advanced.get("available", True))
+            effective_goal_mode = advanced_goal_mode
+            if advanced_goal_mode != ADVANCED_V1_MODE and not advanced_available:
+                advanced = apply_advanced_goal_mode(pred, history, canon(home), canon(away), ADVANCED_V1_MODE)
+                effective_goal_mode = ADVANCED_V1_MODE
 
+            home_player_ctx, away_player_ctx = _player_context(conn, str(home)), _player_context(conn, str(away))
             legacy_home_rest = _last_rest_days(history, str(home), match_date)
             legacy_away_rest = _last_rest_days(history, str(away), match_date)
             home_sched = team_schedule_context(conn, str(home), match_date, as_of=as_of, fallback_rest_days=legacy_home_rest)
@@ -153,6 +176,11 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                 "away_schedule": away_sched,
                 "match_environment": environment,
                 "match_environment_semantics": "shadow_unless_guarded_policy_activated",
+                "advanced_goal_policy_key": ADVANCED_GOAL_POLICY_KEY,
+                "advanced_goal_registry_mode": advanced_goal_mode,
+                "advanced_goal_effective_mode": effective_goal_mode,
+                "advanced_goal_available": advanced_available,
+                "advanced_goal_meta": advanced.get("meta") or {},
                 "lineup_v2_policy_key": LINEUP_V2_POLICY_KEY,
                 "lineup_v2_mode": lineup_v2_mode,
                 "lineup_v2_active": lineup_v2_active,
@@ -161,7 +189,7 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
             })
 
             for market, attr, yes_selection, no_selection in MARKETS:
-                p_yes = float(getattr(pred, attr))
+                p_yes = float(advanced.get(attr, getattr(pred, attr)))
                 selected_yes = p_yes >= 0.5
                 confidence = p_yes if selected_yes else 1.0 - p_yes
                 selection = yes_selection if selected_yes else no_selection
@@ -182,6 +210,7 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                     "event_id": str(eid), "match_date": match_date, "league": league_s,
                     "home": str(home), "away": str(away), "market": market, "selection": selection,
                     "confidence": confidence, "ranking_score": ranking_score, "schedule_rank_factor": schedule_factor,
+                    "goal_model_mode": effective_goal_mode, "advanced_goal_available": advanced_available,
                     "lineup_v2_active": lineup_v2_active, "lineup_v2_available": lineup_available,
                     "lineup_v2_factor": lineup_factor,
                     "price": price, "international": ref, "international_selected_probability": ref_selected,
@@ -204,7 +233,10 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
             "policy": {
                 "list_semantics": "weekly_reliability_ranking_not_guaranteed_70pct",
                 "strict_high_confidence_min": HIGH_CONFIDENCE_MIN,
-                "ranking": "frozen_v1_probability_x_data_quality_x_operational_schedule_factor_x_guarded_lineup_v2_factor",
+                "ranking": "guarded_goal_probability_x_data_quality_x_operational_schedule_factor_x_guarded_lineup_v2_factor",
+                "advanced_goal_policy_key": ADVANCED_GOAL_POLICY_KEY,
+                "advanced_goal_mode": advanced_goal_mode,
+                "advanced_goal_fail_closed": True,
                 "schedule_context_version": SCHEDULE_CONTEXT_VERSION,
                 "schedule_scope": "all_competitions_with_domestic_fallback",
                 "lineup_v2_policy_key": LINEUP_V2_POLICY_KEY,
