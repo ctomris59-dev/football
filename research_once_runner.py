@@ -3,8 +3,9 @@
 
 This is operational plumbing only. It never changes model probabilities or activates
 challengers. The runner executes the historical V1 structural audit, the Top-3/5/10
-sensitivity audit, the separate CLV evaluation, installs the frozen policy snapshot,
-and records the methodology change log once for a fixed execution key.
+general sensitivity audit, the Over 2.5-only sensitivity audit, the separate CLV
+evaluation, installs the frozen policy snapshot, and records the methodology change
+log once for a fixed execution key.
 """
 from __future__ import annotations
 
@@ -103,8 +104,6 @@ def run(database_url: Optional[str] = None) -> Dict[str, Any]:
                 "validation_protocol": edge.get("validation_protocol"),
             }
 
-            # Same historical folds and frozen V1, but one scoring pass compares
-            # weekly Top-3/5/10. This is diagnostic only and never promotes policy.
             from topn_sensitivity_audit import run as run_topn_sensitivity
             topn = run_topn_sensitivity(db)
             summary["steps"]["topn_sensitivity"] = {
@@ -114,6 +113,17 @@ def run(database_url: Optional[str] = None) -> Dict[str, Any]:
                 "folds": topn.get("folds"),
                 "sensitivity": topn.get("sensitivity"),
                 "interpretation_rule": topn.get("interpretation_rule"),
+            }
+
+            from over25_sensitivity_audit import run as run_over25_sensitivity
+            over25 = run_over25_sensitivity(db)
+            summary["steps"]["over25_sensitivity"] = {
+                "status": "success",
+                "version": over25.get("version"),
+                "protocol": over25.get("protocol"),
+                "folds": over25.get("folds"),
+                "sensitivity": over25.get("sensitivity"),
+                "interpretation_rule": over25.get("interpretation_rule"),
             }
 
             from clv_backtest import run_backtest as run_clv
@@ -145,7 +155,7 @@ def run(database_url: Optional[str] = None) -> Dict[str, Any]:
             )
             infra = record_change(
                 "INFRA_ONLY",
-                "Install block-bootstrap/shrinkage/CLV/Top-N sensitivity methodology and execute the one-shot historical validation run.",
+                "Install block-bootstrap/shrinkage/CLV/Top-N/Over2.5 sensitivity methodology and execute the one-shot historical validation run.",
                 behavior_change=False,
                 source_sha=os.getenv("RENDER_GIT_COMMIT", ""),
                 evidence={
@@ -153,6 +163,7 @@ def run(database_url: Optional[str] = None) -> Dict[str, Any]:
                     "new_challenger_activated": False,
                     "closing_odds_evaluation_only": True,
                     "topn_sensitivity_research_only": True,
+                    "over25_sensitivity_research_only": True,
                 },
                 database_url=db,
             )
