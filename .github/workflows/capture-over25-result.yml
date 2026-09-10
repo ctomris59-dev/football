@@ -1,0 +1,59 @@
+name: capture-over25-result
+
+on:
+  push:
+    paths:
+      - '.github/workflows/capture-over25-result.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wait for temporary controller and start audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://football-dataset-export.onrender.com/__research/over25/7c61b34f9e2a4f6d8b5c'
+          for i in $(seq 1 60); do
+            if curl -fsS "$BASE/start" -o /tmp/start.json; then
+              cat /tmp/start.json
+              break
+            fi
+            sleep 5
+          done
+          test -s /tmp/start.json
+      - name: Poll result
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://football-dataset-export.onrender.com/__research/over25/7c61b34f9e2a4f6d8b5c'
+          mkdir -p research_results
+          for i in $(seq 1 120); do
+            curl -fsS "$BASE/status" -o /tmp/status.json
+            STATUS=$(python -c "import json; print(json.load(open('/tmp/status.json'))['status'])")
+            echo "status=$STATUS"
+            if [ "$STATUS" = success ]; then
+              cp /tmp/status.json research_results/over25_latest.json
+              exit 0
+            fi
+            if [ "$STATUS" = failed ]; then
+              cat /tmp/status.json
+              exit 1
+            fi
+            sleep 5
+          done
+          echo 'audit timeout'
+          exit 1
+      - name: Commit captured result
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add research_results/over25_latest.json
+          git commit -m 'Capture Over 2.5 sensitivity result' || exit 0
+          git push
