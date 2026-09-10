@@ -6,7 +6,7 @@ services:
     plan: free
     region: frankfurt
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn export_app:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn preview_app:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: DATABASE_URL
@@ -27,8 +27,10 @@ services:
       # installs must provide it during initial setup.
       - key: ODDSPAPI_API_KEY
         sync: false
+      # TEMP 2026-09-10: force one startup refresh so the current published bulletin
+      # is processed without waiting for the next cron tick. Revert to false after verification.
       - key: AUTO_LIVE_REFRESH
-        value: "false"
+        value: "true"
       - key: FOTMOB_AVAILABILITY_LOOKAHEAD_DAYS
         value: "8"
 
@@ -57,6 +59,8 @@ services:
         value: "0.75"
       - key: THURSDAY_NO_CANDIDATE_BULLETIN_COVERAGE_MIN
         value: "0.70"
+      - key: THURSDAY_PLAYABLE_BULLETIN_COVERAGE_MIN
+        value: "0.90"
 
       # International validation policy. International prices never become the
       # executable bet price; they are de-vigged fair-market references only.
@@ -91,15 +95,15 @@ services:
       - key: TR_PRICE_MAX_AGE_HOURS
         value: "6"
 
-  # Canonical weekly preparation: Thursday 18:00 Türkiye time (15:00 UTC).
-  # This service already exists in the live Render workspace; defining it here makes
-  # the schedule durable and version-controlled.
+  # Canonical weekly preparation: Thursday 09:00 Türkiye time (06:00 UTC).
+  # The opening watcher below still checks every 15 minutes after that, so if the
+  # bulletin is not ready at 09:00 the system continues without forcing a decision.
   - type: cron
     name: football-weekly-preview-refresh
     runtime: python
     plan: starter
     region: frankfurt
-    schedule: "0 15 * * 4"
+    schedule: "0 6 * * 4"
     buildCommand: pip install -r requirements.txt
     startCommand: python live_refresh.py
     envVars:
@@ -116,7 +120,7 @@ services:
 
   # Opening-price watcher. Render cron is UTC, so it wakes every 15 minutes on
   # Thursday/Friday; thursday_schedule_tick.py gates execution to Europe/Istanbul
-  # Thursday 18:00 -> Friday 12:00 and stops doing work once the week is finalized.
+  # Thursday 09:00 -> Friday 12:00 and stops doing work once the week is finalized.
   - type: cron
     name: football-thursday-opening-watch
     runtime: python
@@ -133,6 +137,8 @@ services:
         sync: false
       - key: THURSDAY_SCHEDULER_HTTP_TIMEOUT_SECONDS
         value: "120"
+      - key: THURSDAY_SCHEDULER_START_HOUR
+        value: "9"
 
   # Historical collector only. Not part of the weekly betting workflow.
   - type: cron
