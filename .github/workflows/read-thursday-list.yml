@@ -1,0 +1,17 @@
+name: read-thursday-list
+on:
+  push:
+    branches: ['tmp/read-thursday-list-final']
+jobs:
+  read:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch production Thursday list
+        run: |
+          curl -fsSL --retry 5 --retry-delay 2 https://football-dataset-export.onrender.com/thursday-list | tee /tmp/list.json
+          echo '---PARSED---'
+          python - <<'PY'
+          import json
+          p=json.load(open('/tmp/list.json'))
+          print(json.dumps(p, ensure_ascii=False, indent=2))
+          PY
