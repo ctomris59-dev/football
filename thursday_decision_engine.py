@@ -92,13 +92,13 @@ def json_default(v: Any):
 
 
 def weekend_bounds(now: Optional[datetime] = None) -> Tuple[date, datetime, datetime]:
-    """Friday 00:00 through Monday 00:00 Istanbul time (Fri-Sun fixtures)."""
+    """Friday 00:00 through Tuesday 00:00 Istanbul time (Fri-Mon fixtures)."""
     now = now or datetime.now(timezone.utc)
     local = now.astimezone(ISTANBUL)
     days_to_friday = (4 - local.weekday()) % 7
     friday = local.date() + timedelta(days=days_to_friday)
     start_local = datetime.combine(friday, time.min, tzinfo=ISTANBUL)
-    end_local = start_local + timedelta(days=3)
+    end_local = start_local + timedelta(days=4)
     return friday, start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
 
