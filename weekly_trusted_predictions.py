@@ -10,13 +10,18 @@ as "Haftanın En Güvenilirleri", never relabelled as 70%+.
 International market data is a safety check when available: a strong contradiction
 rejects the pick; missing international reference does not erase a model forecast.
 Value remains a separate, stricter list.
+
+Schedule context is operational only: the latest official club fixture is read across
+domestic + UEFA competitions. Raw V1 probabilities stay frozen; short-rest context
+only adjusts ranking and a still-unplayed official match before the target fixture
+keeps that candidate pending until the next refresh.
 """
 from __future__ import annotations
 
 import json
 import os
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import psycopg
@@ -24,6 +29,7 @@ import psycopg
 from international_market_reference import latest_ref
 from model_engine_v1 import predict_match
 from production_predictor import canon
+from schedule_context import SCHEDULE_CONTEXT_VERSION, team_schedule_context
 from thursday_decision_engine import (
     DATABASE_URL,
     HIGH_CONFIDENCE_MIN,
@@ -72,6 +78,7 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
         "confidence_tier": "Yüksek Güven" if row["confidence"] >= HIGH_CONFIDENCE_MIN else "Haftanın En Güvenilirleri",
         "strict_high_confidence": row["confidence"] >= HIGH_CONFIDENCE_MIN,
         "ranking_score": row["ranking_score"],
+        "schedule_rank_factor": row.get("schedule_rank_factor", 1.0),
         "tr_price": row["price"].get("tr_price"),
         "tr_opening_price": row["price"].get("tr_opening_price"),
         "tr_source": row["price"].get("tr_source"),
@@ -86,7 +93,10 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
 def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, limit: int = LIST_LIMIT) -> Dict[str, Any]:
     if not database_url:
         raise RuntimeError("Missing DATABASE_URL")
-    week_key, start, end = weekend_bounds(now)
+    as_of = now or datetime.now(timezone.utc)
+    if as_of.tzinfo is None:
+        as_of = as_of.replace(tzinfo=timezone.utc)
+    week_key, start, end = weekend_bounds(as_of)
     with psycopg.connect(database_url) as conn:
         conn.execute(TURKEY_PRICE_DDL)
         fixtures = conn.execute(
@@ -110,14 +120,54 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                 excluded["no_history"] += 1
                 continue
             pred = predict_match(history, canon(home), canon(away), recent_matches=18)
-            home_ctx, away_ctx = _player_context(conn, str(home)), _player_context(conn, str(away))
-            home_rest = _last_rest_days(history, str(home), match_date)
-            away_rest = _last_rest_days(history, str(away), match_date)
-            eligible, blockers, gate_diag = _early_gate(pred, home_ctx, away_ctx, home_rest, away_rest)
+            home_player_ctx, away_player_ctx = _player_context(conn, str(home)), _player_context(conn, str(away))
+
+            legacy_home_rest = _last_rest_days(history, str(home), match_date)
+            legacy_away_rest = _last_rest_days(history, str(away), match_date)
+            home_sched = team_schedule_context(
+                conn,
+                str(home),
+                match_date,
+                as_of=as_of,
+                fallback_rest_days=legacy_home_rest,
+            )
+            away_sched = team_schedule_context(
+                conn,
+                str(away),
+                match_date,
+                as_of=as_of,
+                fallback_rest_days=legacy_away_rest,
+            )
+
+            if home_sched.get("pending_pre_fixture_match") or away_sched.get("pending_pre_fixture_match"):
+                excluded["pending_intervening_official_match"] += 1
+                continue
+
+            home_rest = home_sched.get("rest_days")
+            away_rest = away_sched.get("rest_days")
+            eligible, blockers, gate_diag = _early_gate(
+                pred,
+                home_player_ctx,
+                away_player_ctx,
+                home_rest,
+                away_rest,
+            )
             if not eligible:
                 for blocker in blockers:
                     excluded[blocker] += 1
                 continue
+
+            schedule_factor = min(
+                float(home_sched.get("rank_factor") or 0.0),
+                float(away_sched.get("rank_factor") or 0.0),
+            )
+            gate_diag.update({
+                "schedule_context_version": SCHEDULE_CONTEXT_VERSION,
+                "schedule_scope": "all_competitions_with_domestic_fallback",
+                "schedule_rank_factor": schedule_factor,
+                "home_schedule": home_sched,
+                "away_schedule": away_sched,
+            })
 
             for market, attr, yes_selection, no_selection in MARKETS:
                 p_yes = float(getattr(pred, attr))
@@ -136,7 +186,7 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                     continue
                 market_check = "aligned" if ref_selected is not None else "reference_unavailable"
                 data_quality = float(gate_diag.get("model_data_quality") or 0.0)
-                ranking_score = confidence * (0.75 + 0.25 * data_quality)
+                ranking_score = confidence * (0.75 + 0.25 * data_quality) * schedule_factor
                 rows.append({
                     "event_id": str(eid),
                     "match_date": match_date,
@@ -147,6 +197,7 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                     "selection": selection,
                     "confidence": confidence,
                     "ranking_score": ranking_score,
+                    "schedule_rank_factor": schedule_factor,
                     "price": price,
                     "international": ref,
                     "international_selected_probability": ref_selected,
@@ -183,7 +234,10 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
             "policy": {
                 "list_semantics": "weekly_reliability_ranking_not_guaranteed_70pct",
                 "strict_high_confidence_min": HIGH_CONFIDENCE_MIN,
-                "ranking": "existing_v1_probability_x_data_quality_factor",
+                "ranking": "existing_v1_probability_x_data_quality_x_operational_schedule_factor",
+                "schedule_context_version": SCHEDULE_CONTEXT_VERSION,
+                "schedule_scope": "all_competitions_with_domestic_fallback",
+                "pending_intervening_official_match": "exclude_until_next_refresh",
                 "turkey_price_required": True,
                 "international_reference": "reject strong contradiction when available; missing reference allowed for reliability list",
                 "value_separate": True,

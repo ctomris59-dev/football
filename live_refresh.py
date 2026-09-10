@@ -3,6 +3,7 @@
 
 Active weekly preparation:
 - ESPN current results/upcoming fixtures;
+- all-competition club schedules (domestic + UEFA) for true rest/fatigue context;
 - current injury availability (freshness-gated, optional);
 - current rosters + real historical starts -> expected-XI/player context;
 - official Turkish İddaa opening-price watch;
@@ -11,8 +12,8 @@ Active weekly preparation:
 - exact-line 7.5/8.5/9.5/10.5 corner upgrade using the same frozen V1 corner lambda.
 
 International prices are never executable prices and never replace model confidence.
-Later T-1/T-3 information does not rewrite a frozen week. The multiline corner step is
-idempotent: it upgrades a week's payload once and then leaves it frozen.
+Later T-1/T-3 information does not rewrite a frozen week except for an explicit
+schedule-context migration that corrects a previously incomplete rest calculation.
 """
 from __future__ import annotations
 
@@ -76,6 +77,11 @@ def _run() -> Dict[str, Any]:
     from espn_current_importer import run_import as espn_current
     run_step("espn_current", lambda: espn_current(DATABASE_URL), steps)
 
+    # Critical schedule-context fix: collect each Big Five club's domestic + UEFA
+    # schedule before ranking so rest is not accidentally league-only.
+    from espn_team_schedule_importer import run_import as espn_team_schedule
+    run_step("espn_team_schedule_all_comp", lambda: espn_team_schedule(DATABASE_URL), steps)
+
     if _fotmob_is_fresh():
         steps["fotmob_availability"] = {"status": "skipped", "reason": f"fresh<{FOTMOB_MAX_AGE_HOURS}h"}
         log.info("THURSDAY_REFRESH_STEP step=fotmob_availability status=skipped reason=fresh")
@@ -89,18 +95,12 @@ def _run() -> Dict[str, Any]:
     from player_context_orchestrator import run as player_context
     run_step("player_context", lambda: player_context(DATABASE_URL), steps)
 
-    # Opening watch owns the ordinary fixed-market freeze and optional value list.
     from thursday_opening_watch import main as opening_watch
     run_step("opening_watch", lambda: opening_watch(DATABASE_URL), steps)
 
-    # Market-coverage upgrade: after a weekly payload exists, collect the exact
-    # Turkish 7.5/8.5/9.5/10.5 corner lines and let them compete with goal/BTTS picks.
-    # This evaluates the same frozen V1 lambda_total_corners; no model weight changes.
     from multiline_corner_upgrade import upgrade_final
     run_step("multiline_corners", lambda: upgrade_final(DATABASE_URL), steps)
 
-    # Operational one-shot only: disabled by default and idempotent in Postgres.
-    # Closing odds remain evaluation-only and no challenger is activated here.
     if os.getenv("RUN_RESEARCH_ONCE", "false").strip().lower() in {"1", "true", "yes"}:
         from research_once_runner import run as research_once
         run_step("research_methodology_once", lambda: research_once(DATABASE_URL), steps)

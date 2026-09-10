@@ -2,9 +2,9 @@
 """Temporary research controller plus one idempotent current-week migration hook.
 
 The Over 2.5 controller remains isolated. During this deployment only, importing this
-module also starts the multi-line corner upgrade in a daemon thread. The upgrade is
-idempotent in the weekly payload, so replacement instances safely return
-``already_upgraded`` after the first successful write.
+module also refreshes all-competition team schedules and re-runs the current-week
+multi-line corner/reliability upgrade. The migration is idempotent via the weekly
+payload's schedule-context version marker.
 """
 from __future__ import annotations
 
@@ -63,23 +63,24 @@ def _ensure_started() -> None:
         threading.Thread(target=_run, name="over25-isolated-audit", daemon=True).start()
 
 
-def _upgrade_current_week_multiline_corners() -> None:
+def _upgrade_current_week_with_all_comp_schedule() -> None:
     if not DATABASE_URL:
         return
     try:
+        from espn_team_schedule_importer import run_import as schedule_import
+        schedule_result = schedule_import(DATABASE_URL)
+        log.info("CURRENT_WEEK_ALL_COMP_SCHEDULE_REFRESH %s", schedule_result)
         from multiline_corner_upgrade import upgrade_final
         result = upgrade_final(DATABASE_URL)
-        log.info("CURRENT_WEEK_MULTILINE_CORNER_BOOTSTRAP %s", result)
+        log.info("CURRENT_WEEK_ALL_COMP_RELIABILITY_MIGRATION %s", result)
     except Exception:
-        log.exception("CURRENT_WEEK_MULTILINE_CORNER_BOOTSTRAP_FAILED")
+        log.exception("CURRENT_WEEK_ALL_COMP_RELIABILITY_MIGRATION_FAILED")
 
 
-# One current-week migration hook. Safe on replacement instances because
-# multiline_corner_upgrade.upgrade_final() is idempotent after a successful write.
 if DATABASE_URL:
     threading.Thread(
-        target=_upgrade_current_week_multiline_corners,
-        name="current-week-multiline-corners",
+        target=_upgrade_current_week_with_all_comp_schedule,
+        name="current-week-all-comp-schedule-migration",
         daemon=True,
     ).start()
 
