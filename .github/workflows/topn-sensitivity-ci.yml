@@ -1,0 +1,33 @@
+name: topn-sensitivity-ci
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile audit
+        run: python -m py_compile topn_sensitivity_audit.py
+      - name: Validate helper semantics
+        run: |
+          python - <<'PY'
+          from topn_sensitivity_audit import _weekly_top, _shrink_rate
+          rows=[]
+          for fold in ('2425','2526'):
+              for week in ('2025-W01','2025-W02'):
+                  for i in range(10):
+                      rows.append({'fold':fold,'week':week,'ranking':1-i/20,'confidence':.9-i/20})
+          assert len(_weekly_top(rows,3)) == 12
+          assert len(_weekly_top(rows,5)) == 20
+          assert abs(_shrink_rate(7,10,.6,30) - .625) < 1e-12
+          print('topn-sensitivity-ci-ok')
+          PY
