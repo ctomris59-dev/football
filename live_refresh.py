@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Minimal production refresh for Thursday -> two lists -> bet -> done.
+"""Minimal production refresh for Thursday -> weekly list + optional value -> done.
 
 Active weekly preparation:
 - ESPN current results/upcoming fixtures;
 - current injury availability (freshness-gated, optional);
 - current rosters + real historical starts -> expected-XI/player context;
 - official Turkish İddaa opening-price watch;
-- international paired same-book no-vig validation ONLY after Turkey target prices appear;
-- one frozen Thursday decision.
+- international paired same-book no-vig validation after Turkey target prices appear;
+- frozen weekly decision;
+- exact-line 7.5/8.5/9.5/10.5 corner upgrade using the same frozen V1 corner lambda.
 
 International prices are never executable prices and never replace model confidence.
-They are fetched at freeze time only as a fair-market sanity/value reference. T-1/T-3,
-confirmed-lineup reselection, odds-movement rebets, shadow audits and weekly backtests
-remain outside the live user decision path.
+Later T-1/T-3 information does not rewrite a frozen week. The multiline corner step is
+idempotent: it upgrades a week's payload once and then leaves it frozen.
 """
 from __future__ import annotations
 
@@ -89,11 +89,15 @@ def _run() -> Dict[str, Any]:
     from player_context_orchestrator import run as player_context
     run_step("player_context", lambda: player_context(DATABASE_URL), steps)
 
-    # This single step owns all price logic. It checks official Turkey prices first.
-    # Only once playable target prices exist does it refresh the international paired
-    # no-vig reference and then freeze the first sufficiently complete two-list output.
+    # Opening watch owns the ordinary fixed-market freeze and optional value list.
     from thursday_opening_watch import main as opening_watch
     run_step("opening_watch", lambda: opening_watch(DATABASE_URL), steps)
+
+    # Market-coverage upgrade: after a weekly payload exists, collect the exact
+    # Turkish 7.5/8.5/9.5/10.5 corner lines and let them compete with goal/BTTS picks.
+    # This evaluates the same frozen V1 lambda_total_corners; no model weight changes.
+    from multiline_corner_upgrade import upgrade_final
+    run_step("multiline_corners", lambda: upgrade_final(DATABASE_URL), steps)
 
     # Operational one-shot only: disabled by default and idempotent in Postgres.
     # Closing odds remain evaluation-only and no challenger is activated here.
