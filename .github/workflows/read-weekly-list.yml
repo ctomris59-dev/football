@@ -1,0 +1,33 @@
+name: read-weekly-list
+
+on:
+  push:
+    branches: ['ops/read-weekly-list']
+
+jobs:
+  read:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read production weekly list
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, time, urllib.request, urllib.error
+          base='https://football-dataset-export.onrender.com'
+          last=None
+          for i in range(40):
+              try:
+                  with urllib.request.urlopen(base+'/thursday-list', timeout=25) as r:
+                      body=r.read().decode('utf-8')
+                  data=json.loads(body)
+                  print('WEEKLY_LIST_ATTEMPT',i+1,json.dumps(data,ensure_ascii=False,separators=(',',':')))
+                  last=data
+                  if data.get('status')=='finalized' and (data.get('high_confidence') or []):
+                      print('WEEKLY_LIST_FINAL='+json.dumps(data,ensure_ascii=False,separators=(',',':')))
+                      raise SystemExit(0)
+              except Exception as exc:
+                  print('WEEKLY_LIST_ERROR',i+1,repr(exc))
+              time.sleep(15)
+          print('WEEKLY_LIST_LAST='+json.dumps(last,ensure_ascii=False,separators=(',',':')) if isinstance(last,dict) else repr(last))
+          raise SystemExit(1)
+          PY
