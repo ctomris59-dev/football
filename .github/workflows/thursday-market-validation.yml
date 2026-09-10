@@ -18,13 +18,14 @@ jobs:
         run: pip install -r requirements.txt
       - name: Compile final Thursday modules
         run: |
-          python -m py_compile export_app.py market_consensus_builder.py international_market_reference.py thursday_decision_engine.py thursday_opening_watch.py thursday_schedule_tick.py live_refresh.py turkey_value_workflow.py
+          python -m py_compile export_app.py market_consensus_builder.py international_market_reference.py thursday_decision_engine.py thursday_decision_engine_v2.py thursday_opening_watch.py thursday_schedule_tick.py live_refresh.py turkey_value_workflow.py
       - name: Validate no-vig and Turkey-value separation
         run: |
           python - <<'PY'
           from market_consensus_builder import no_vig, no_vig_pair
           from international_market_reference import reference_quality
           from thursday_decision_engine import market_metrics
+          from thursday_decision_engine_v2 import playable_decision_ready
 
           fair = no_vig(1.90, 2.00)
           assert fair is not None and 0 < fair < 1
@@ -46,6 +47,12 @@ jobs:
           assert m['international_ev_vs_tr'] > .06
           assert m['model_edge_vs_tr'] > 0
           assert m['international_edge_vs_tr'] > 0
+
+          # A market not offered by Turkey is non-executable, not missing coverage.
+          assert not playable_decision_ready(.89, 0, 0.0)
+          assert playable_decision_ready(.95, 0, 0.0)
+          assert not playable_decision_ready(.95, 1, 0.0)
+          assert playable_decision_ready(.95, 1, .80)
           print('thursday-market-validation-ok')
           PY
       - name: Validate Thursday scheduler window, weekly horizon and auth
