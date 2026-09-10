@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Exploratory Over/Under 2.5 model-vs-market value backtest.
+"""Exploratory O/U 2.5 xG-diagnostic-model versus market value backtest.
 
-Uses Football-Data's stored average pre-match O/U prices as the historical
-market benchmark and the leakage-safe rolling xG-aware model.
+IMPORTANT: this module evaluates `model_engine` (the xG-aware diagnostic/helper
+model), NOT the frozen production V1 engine in `model_engine_v1`. Therefore Brier
+scores produced here must never be cited as evidence that production V1 is better
+or worse than the market.
 
-Important: this is not proof of realizable profit. Historical average prices may
-not equal the exact price available at the user's decision timestamp. Results
-are diagnostic for whether model probabilities add information beyond market
-prices.
+Uses Football-Data's stored average pre-match O/U prices as the historical market
+benchmark. Historical average prices are not the exact executable Thursday Turkey
+price, so the ROI output is diagnostic rather than proof of realizable profit.
+
+The production-V1 market benchmark and league/market walk-forward breakdown live in
+`edge_structure_audit.py`.
 """
 from __future__ import annotations
 import json, logging, os
@@ -17,7 +21,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 from backtest_model import load_matches, BACKTEST_TRAIN_SEASON, BACKTEST_TEST_SEASON
 from model_engine import predict_match
-DATABASE_URL=os.getenv("DATABASE_URL","").strip(); VERSION="ou25-market-edge-v1"; EDGES=(0.00,0.02,0.04,0.06,0.08,0.10)
+DATABASE_URL=os.getenv("DATABASE_URL","").strip(); VERSION="ou25-xg-diagnostic-market-edge-v1"; EDGES=(0.00,0.02,0.04,0.06,0.08,0.10)
 logging.basicConfig(level=logging.INFO,format="%(asctime)s | %(levelname)s | %(message)s");log=logging.getLogger("value-backtest")
 SCHEMA="""CREATE TABLE IF NOT EXISTS model_value_backtest_runs(id BIGSERIAL PRIMARY KEY,started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),finished_at TIMESTAMPTZ,version TEXT NOT NULL,train_season TEXT NOT NULL,test_season TEXT NOT NULL,matches_scored INTEGER NOT NULL DEFAULT 0,odds_matches INTEGER NOT NULL DEFAULT 0,metrics JSONB,status TEXT NOT NULL,message TEXT);"""
 def f(v):
@@ -55,7 +59,7 @@ def run_backtest(database_url:Optional[str]=None)->Dict[str,Any]:
             if calibration:
                 model_brier=sum((x["model"]-int(x["outcome"]))**2 for x in calibration)/len(calibration);market_brier=sum((x["market"]-int(x["outcome"]))**2 for x in calibration)/len(calibration)
             else:model_brier=market_brier=None
-            result={"version":VERSION,"matches_scored":scored,"odds_matches":odds_matches,"model_brier":round(model_brier,5) if model_brier is not None else None,"market_brier":round(market_brier,5) if market_brier is not None else None,"gates":metrics,"warning":"Diagnostic only; historical average pre-match odds are not guaranteed execution prices."}
+            result={"version":VERSION,"model_role":"xg_diagnostic_not_production_v1","matches_scored":scored,"odds_matches":odds_matches,"model_brier":round(model_brier,5) if model_brier is not None else None,"market_brier":round(market_brier,5) if market_brier is not None else None,"gates":metrics,"warning":"Diagnostic xG-model result only; not production V1, and historical average pre-match odds are not guaranteed execution prices."}
             conn.execute("UPDATE model_value_backtest_runs SET finished_at=NOW(),matches_scored=%s,odds_matches=%s,metrics=%s,status='success',message='ok' WHERE id=%s",(scored,odds_matches,Jsonb(result),rid));log.info("VALUE_BACKTEST_RESULT %s",json.dumps(result,ensure_ascii=False,separators=(",",":")));return result
         except Exception as exc:
             conn.execute("UPDATE model_value_backtest_runs SET finished_at=NOW(),status='failed',message=%s WHERE id=%s",(str(exc),rid));raise
