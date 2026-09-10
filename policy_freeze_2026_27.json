@@ -1,6 +1,10 @@
 {
   "freeze_key": "production-policy-2026-27-live-holdout",
   "created_at": "2026-09-10T10:44:00+03:00",
+  "freeze_effective_from": "2026-09-10T10:44:00+03:00",
+  "freeze_timing": "IN_SEASON_GOVERNANCE_FREEZE",
+  "retroactive": false,
+  "caveat": "The 2026/27 season was already live on 2026-09-10. This snapshot prevents outcome-driven tuning from this point forward and does not claim pre-season isolation.",
   "source_sha": "5f78b53246f81e54e63762512a642c83f62910e2",
   "season": "2627",
   "status": "FROZEN_BASELINE",
