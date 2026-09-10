@@ -1,0 +1,19 @@
+name: incremental-feature-ci
+
+on:
+  push:
+    branches: [main, 'research/**', 'feature/**']
+  pull_request:
+    branches: [main]
+
+jobs:
+  incremental-feature:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt pytest
+      - run: python -m py_compile incremental_feature_policy.py incremental_feature_audit.py incremental_feature_audit_once.py over25_research_endpoint.py
+      - run: pytest -q test_incremental_feature_policy.py
