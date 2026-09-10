@@ -43,6 +43,17 @@ def _history(n=80):
     return rows
 
 
+def _dc_history(n=120):
+    score_cycle = [(0,0),(1,0),(0,1),(1,1)]
+    teams = [('A','B'),('C','D'),('A','C'),('B','D')]
+    rows = []
+    for i in range(n):
+        home, away = teams[i % len(teams)]
+        hg, ag = score_cycle[i % len(score_cycle)]
+        rows.append({'home_team':home,'away_team':away,'home_goals':hg,'away_goals':ag})
+    return rows
+
+
 def test_dc_rho_zero_matches_independent_goal_markets_close():
     p = dixon_coles_probabilities(1.55, 1.15, 0.0, max_goals=12)
     independent_btts = (1-math.exp(-1.55)) * (1-math.exp(-1.15))
@@ -51,11 +62,12 @@ def test_dc_rho_zero_matches_independent_goal_markets_close():
     assert abs(p['p_home'] + p['p_draw'] + p['p_away'] - 1.0) < 1e-9
 
 
-def test_dc_fit_is_bounded_and_past_data_only_function():
-    rho, available, meta = fit_dc_rho(_history())
+def test_dc_fit_is_bounded_and_has_enough_low_score_support():
+    rho, available, meta = fit_dc_rho(_dc_history())
     assert -0.20 <= rho <= 0.20
     assert available is True
-    assert meta['fit_matches'] == 80
+    assert meta['fit_matches'] == 120
+    assert meta['low_score_rows'] == 120
 
 
 def test_opponent_adjusted_strengths_identify_strong_and_weak_teams():
@@ -70,7 +82,7 @@ def test_opponent_adjusted_strengths_identify_strong_and_weak_teams():
 def test_modes_preserve_corner_probability_and_v1_fail_closed():
     pred = _pred(); history = _history()
     base = apply_mode(pred, history, 'Strong', 'Weak', MODE_V1)
-    dc = apply_mode(pred, history, 'Strong', 'Weak', MODE_DC)
+    dc = apply_mode(pred, _dc_history(), 'A', 'B', MODE_DC)
     opp = apply_mode(pred, history, 'Strong', 'Weak', MODE_OPP)
     assert base['p_over_2_5'] == pred.p_over_2_5
     assert dc['p_corners_over_8_5'] == pred.p_corners_over_8_5
