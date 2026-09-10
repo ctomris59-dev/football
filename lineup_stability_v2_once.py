@@ -27,8 +27,23 @@ CREATE TABLE IF NOT EXISTS lineup_stability_v2_audit_once(
 
 
 def _preview(db: str) -> Dict[str, Any]:
-    from weekly_trusted_predictions import build
-    result = build(db)
+    # The weekly builder deliberately tolerates optional/missing context tables.
+    # Run its read path in autocommit mode so a caught optional-query failure cannot
+    # poison the entire connection with InFailedSqlTransaction.
+    import weekly_trusted_predictions as weekly
+
+    original_connect = weekly.psycopg.connect
+
+    def _autocommit_connect(*args, **kwargs):
+        kwargs.setdefault("autocommit", True)
+        return original_connect(*args, **kwargs)
+
+    weekly.psycopg.connect = _autocommit_connect
+    try:
+        result = weekly.build(db)
+    finally:
+        weekly.psycopg.connect = original_connect
+
     picks = result.get("picks") or []
     return {
         "week_key": result.get("week_key"),
