@@ -34,11 +34,13 @@ VALIDATION_TRIGGER_TOKEN = os.getenv("VALIDATION_TRIGGER_TOKEN", "").strip()
 THURSDAY_SCHEDULER_KEY = os.getenv("THURSDAY_SCHEDULER_KEY", "").strip()
 THURSDAY_RECENT_REFRESH_MINUTES = float(os.getenv("THURSDAY_RECENT_REFRESH_MINUTES", "20"))
 AUTO_LIVE_REFRESH = os.getenv("AUTO_LIVE_REFRESH", "false").lower() in {"1", "true", "yes"}
+RUN_OVER25_RESEARCH_ONCE = os.getenv("RUN_OVER25_RESEARCH_ONCE", "false").lower() in {"1", "true", "yes"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("football-thursday-service")
 refresh_lock = threading.Lock()
 opening_lock = threading.Lock()
+research_lock = threading.Lock()
 refresh_state: dict[str, Any] = {
     "running": False,
     "last_started": None,
@@ -47,9 +49,6 @@ refresh_state: dict[str, Any] = {
     "last_error": None,
 }
 
-# Only data directly supporting the Thursday decision is surfaced/exported. Raw
-# provider/research clutter stays hidden; the international layer exposes only its
-# de-vigged consensus/reference tables.
 ACTIVE_TABLES = [
     "football_data_matches",
     "espn_current_matches",
@@ -89,7 +88,6 @@ def auth(token: Optional[str], authorization: Optional[str]) -> None:
 
 
 def scheduler_auth(key: Optional[str]) -> None:
-    """Fail closed unless the private Render cron key matches."""
     if not THURSDAY_SCHEDULER_KEY:
         raise HTTPException(500, "THURSDAY_SCHEDULER_KEY is not configured.")
     candidate = (key or "").strip()
@@ -98,12 +96,6 @@ def scheduler_auth(key: Optional[str]) -> None:
 
 
 def recent_thursday_refresh() -> Optional[dict[str, Any]]:
-    """Return a recent/running canonical Thursday prep, if one exists.
-
-    This is intentionally checked only on the HTTP scheduler path. The canonical
-    live_refresh.py process calls thursday_opening_watch.main() directly and must
-    not suppress its own opening check.
-    """
     if not DATABASE_URL or THURSDAY_RECENT_REFRESH_MINUTES <= 0:
         return None
     try:
@@ -130,8 +122,6 @@ def recent_thursday_refresh() -> Optional[dict[str, Any]]:
             "trigger_name": row[4],
         }
     except Exception as exc:
-        # Do not turn an optional overlap optimization into an outage. The
-        # thursday_opening_watch DB idempotency still prevents duplicate freezes.
         log.warning("THURSDAY_RECENT_REFRESH_CHECK_FAILED %s", str(exc)[:500])
         return None
 
@@ -139,11 +129,7 @@ def recent_thursday_refresh() -> Optional[dict[str, Any]]:
 def _run_live_refresh() -> None:
     if not refresh_lock.acquire(blocking=False):
         return
-    refresh_state.update({
-        "running": True,
-        "last_started": datetime.now(timezone.utc).isoformat(),
-        "last_error": None,
-    })
+    refresh_state.update({"running": True, "last_started": datetime.now(timezone.utc).isoformat(), "last_error": None})
     try:
         from live_refresh import main
         result = main()
@@ -166,10 +152,31 @@ def _start_refresh_thread() -> bool:
     return True
 
 
+def _run_over25_research_once() -> None:
+    if not research_lock.acquire(blocking=False):
+        return
+    try:
+        from over25_sensitivity_audit import run
+        result = run(DATABASE_URL)
+        compact = {
+            "version": result.get("version"),
+            "folds": result.get("folds"),
+            "candidate_rows": result.get("candidate_rows"),
+            "sensitivity": result.get("sensitivity"),
+        }
+        log.info("OVER25_RESEARCH_ONCE_COMPLETED %s", json.dumps(compact, ensure_ascii=False, default=json_default, separators=(",", ":")))
+    except Exception:
+        log.exception("OVER25_RESEARCH_ONCE_FAILED")
+    finally:
+        research_lock.release()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if DATABASE_URL and AUTO_LIVE_REFRESH:
         _start_refresh_thread()
+    if DATABASE_URL and RUN_OVER25_RESEARCH_ONCE:
+        threading.Thread(target=_run_over25_research_once, name="over25-research-once", daemon=True).start()
     yield
 
 
@@ -195,14 +202,12 @@ def root():
 
 @app.get("/persembe", response_class=HTMLResponse)
 def persembe_page():
-    """Pinnable, user-facing dashboard for the immutable Thursday betting list."""
     from thursday_page import render_page
     return HTMLResponse(render_page(), headers={"Cache-Control": "no-store"})
 
 
 @app.get("/thursday", response_class=HTMLResponse)
 def thursday_page_alias():
-    """English-path alias for the same pinnable dashboard."""
     from thursday_page import render_page
     return HTMLResponse(render_page(), headers={"Cache-Control": "no-store"})
 
@@ -230,20 +235,12 @@ def validation_run(token: Optional[str] = Query(None)):
 
 @app.get("/opening-watch")
 def opening_watch(x_scheduler_key: Optional[str] = Header(None, alias="X-Scheduler-Key")):
-    """Authenticated narrow endpoint used by the Render Thursday scheduler."""
     scheduler_auth(x_scheduler_key)
     if not DATABASE_URL:
         raise HTTPException(500, "DATABASE_URL is not configured.")
-
     recent = recent_thursday_refresh()
     if recent:
-        return {
-            "ok": True,
-            "status": "skipped_recent_thursday_refresh",
-            "recent_refresh": recent,
-            "cooldown_minutes": THURSDAY_RECENT_REFRESH_MINUTES,
-        }
-
+        return {"ok": True, "status": "skipped_recent_thursday_refresh", "recent_refresh": recent, "cooldown_minutes": THURSDAY_RECENT_REFRESH_MINUTES}
     if not opening_lock.acquire(blocking=False):
         return {"ok": True, "status": "opening_watch_already_running"}
     try:
@@ -256,17 +253,12 @@ def opening_watch(x_scheduler_key: Optional[str] = Header(None, alias="X-Schedul
 
 @app.get("/thursday-list")
 def thursday_list():
-    """Return only the immutable frozen weekly decision; otherwise report pending."""
     if not DATABASE_URL:
         raise HTTPException(500, "DATABASE_URL is not configured.")
     from thursday_opening_watch import latest_final
     final = latest_final(DATABASE_URL)
     if not final:
-        return {
-            "ok": True,
-            "status": "pending",
-            "message": "This week's model + international + Turkey opening decision has not been finalized yet.",
-        }
+        return {"ok": True, "status": "pending", "message": "This week's model + international + Turkey opening decision has not been finalized yet."}
     payload = final.get("payload") or {}
     return {
         "ok": True,
@@ -330,7 +322,6 @@ def status(token: Optional[str] = Query(None), authorization: Optional[str] = He
 
 @app.get("/predictions")
 def predictions(token: Optional[str] = Query(None), authorization: Optional[str] = Header(None)):
-    """Compatibility endpoint: returns only the immutable frozen two-list decision."""
     auth(token, authorization)
     if not DATABASE_URL:
         raise HTTPException(500, "DATABASE_URL is not configured.")
@@ -353,7 +344,6 @@ def predictions(token: Optional[str] = Query(None), authorization: Optional[str]
 
 @app.get("/download")
 def download(token: Optional[str] = Query(None), authorization: Optional[str] = Header(None)):
-    """Export only the active operational dataset, not legacy research clutter."""
     auth(token, authorization)
     if not DATABASE_URL:
         raise HTTPException(500, "DATABASE_URL is not configured.")
@@ -370,12 +360,7 @@ def download(token: Optional[str] = Query(None), authorization: Optional[str] = 
                         zf.writestr(f"{table}.jsonl", "\n".join(lines))
                     except Exception:
                         conn.rollback()
-        return FileResponse(
-            path,
-            media_type="application/zip",
-            filename="football_thursday_dataset.zip",
-            background=BackgroundTask(lambda: os.path.exists(path) and os.unlink(path)),
-        )
+        return FileResponse(path, media_type="application/zip", filename="football_thursday_dataset.zip", background=BackgroundTask(lambda: os.path.exists(path) and os.unlink(path)))
     except Exception:
         if os.path.exists(path):
             os.unlink(path)
