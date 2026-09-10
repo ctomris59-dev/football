@@ -17,6 +17,11 @@ services:
         generateValue: true
       - key: VALIDATION_TRIGGER_TOKEN
         generateValue: true
+      # Shared manually between the web service and opening-watch cron.
+      - key: THURSDAY_SCHEDULER_KEY
+        sync: false
+      - key: THURSDAY_RECENT_REFRESH_MINUTES
+        value: "20"
       # Required only for the international paired same-book no-vig reference.
       # Existing services keep their current manually configured value; new Blueprint
       # installs must provide it during initial setup.
@@ -123,6 +128,9 @@ services:
     envVars:
       - key: THURSDAY_SERVICE_BASE_URL
         value: "https://football-dataset-export.onrender.com"
+      # Must be the same secret value configured on football-dataset-export.
+      - key: THURSDAY_SCHEDULER_KEY
+        sync: false
       - key: THURSDAY_SCHEDULER_HTTP_TIMEOUT_SECONDS
         value: "120"
 
