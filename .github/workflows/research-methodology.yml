@@ -43,8 +43,9 @@ jobs:
           python - <<'PY'
           from research_change_control import load_freeze
           cfg=load_freeze()
-          assert cfg['live_holdout_season']=='2627'
+          assert cfg['season']=='2627'
           assert cfg['status']=='FROZEN_BASELINE'
+          assert cfg['validation_protocol']['live_holdout_season']=='2627'
           assert cfg['validation_protocol']['test_seasons']==['2425','2526']
           assert cfg['validation_protocol']['holdout_excluded'] is True
           print('policy-freeze-ok')
