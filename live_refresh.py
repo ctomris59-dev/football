@@ -95,6 +95,12 @@ def _run() -> Dict[str, Any]:
     from thursday_opening_watch import main as opening_watch
     run_step("opening_watch", lambda: opening_watch(DATABASE_URL), steps)
 
+    # Operational one-shot only: disabled by default and idempotent in Postgres.
+    # Closing odds remain evaluation-only and no challenger is activated here.
+    if os.getenv("RUN_RESEARCH_ONCE", "false").strip().lower() in {"1", "true", "yes"}:
+        from research_once_runner import run as research_once
+        run_step("research_methodology_once", lambda: research_once(DATABASE_URL), steps)
+
     summary["finished_at"] = utcnow().isoformat()
     summary["status"] = "success"
     log.info("THURSDAY_REFRESH_RESULT %s", json.dumps(summary, ensure_ascii=False, default=str, separators=(",", ":")))
