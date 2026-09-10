@@ -8,10 +8,17 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - name: Read live health and list
+      - name: Read current V2 preview and final list
         run: |
-          echo '=== HEALTH ==='
-          curl -fsS https://football-dataset-export.onrender.com/health
+          echo '=== PREVIEW ==='
+          for i in $(seq 1 12); do
+            body=$(curl -sS https://football-dataset-export.onrender.com/__temp_v2_preview_20260910 || true)
+            echo "$body"
+            if echo "$body" | grep -q '"decision_run_id"'; then
+              break
+            fi
+            sleep 5
+          done
           echo
           echo '=== LIST ==='
           curl -fsS https://football-dataset-export.onrender.com/thursday-list
