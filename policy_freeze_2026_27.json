@@ -1,0 +1,67 @@
+{
+  "freeze_key": "production-policy-2026-27-live-holdout",
+  "created_at": "2026-09-10T10:44:00+03:00",
+  "source_sha": "5f78b53246f81e54e63762512a642c83f62910e2",
+  "season": "2627",
+  "status": "FROZEN_BASELINE",
+  "activation_mode": "v1_only",
+  "probability_engine": "model_engine_v1.py",
+  "model_version_family": "production-poisson-form-v1",
+  "v1_parameters": {
+    "recent_matches": 18,
+    "half_life_matches": 7.0,
+    "prior_matches": 7.0,
+    "venue_vs_overall_goal_attack_weights": [0.78, 0.22],
+    "goal_vs_shots_on_target_lambda_weights": [0.72, 0.28],
+    "home_goal_lambda_bounds": [0.2, 4.5],
+    "away_goal_lambda_bounds": [0.15, 4.0],
+    "corner_lambda_bounds": [3.0, 16.0],
+    "data_quality_full_sample": 15
+  },
+  "production_thresholds": {
+    "prediction_min_confidence": 0.6,
+    "prediction_min_price": 1.2,
+    "weekly_top_n": 10,
+    "value_min_confidence": 0.65,
+    "value_min_edge": 0.015,
+    "value_min_ev": 0.02,
+    "v5_min_hit_rate_improvement_legacy": 0.005
+  },
+  "active_features": [
+    "historical_goals",
+    "historical_shots_on_target",
+    "historical_corners",
+    "league_baseline_shrinkage",
+    "recency_weighting"
+  ],
+  "shadow_or_validation_gated_features": [
+    "pressure",
+    "starter_continuity",
+    "pressure_continuity",
+    "expected_xi_injury_impact",
+    "asian_multiline_movement",
+    "elo",
+    "score_state",
+    "promotion_prior"
+  ],
+  "validation_protocol": {
+    "gate_version": "two-fold-week-block-v1",
+    "test_seasons": ["2425", "2526"],
+    "live_holdout_season": "2627",
+    "holdout_excluded": true,
+    "folds": [
+      {"train": ["2324"], "test": "2425"},
+      {"train": ["2324", "2425"], "test": "2526"}
+    ],
+    "bootstrap": "fold-stratified ISO-week block bootstrap",
+    "bucket_shrinkage": "market -> league/market -> confidence partial pooling",
+    "clv_role": "post-decision evaluation only"
+  },
+  "change_control": {
+    "allowed_types": ["BUG_FIX", "CHALLENGER", "INFRA_ONLY"],
+    "bug_fix_requires_reason_and_evidence": true,
+    "challenger_requires_historical_gate_before_behavior_change": true,
+    "infra_only_must_not_change_predictions": true,
+    "live_holdout_outcomes_must_not_be_used_for_tuning": true
+  }
+}
