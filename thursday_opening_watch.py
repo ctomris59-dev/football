@@ -2,7 +2,7 @@
 """Thursday opening watcher for the final two-list betting workflow.
 
 Sequence:
-1) wait for official Turkish İddaa weekend prices;
+1) check for official Turkish İddaa weekend prices from Thursday morning;
 2) once target Turkey prices exist, refresh/map international paired no-vig reference;
 3) build two lists;
 4) freeze the first sufficiently complete decision for the week.
@@ -26,7 +26,7 @@ from turkey_iddaa_odds_collector import run_import
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 ISTANBUL = ZoneInfo("Europe/Istanbul")
 FORCE = os.getenv("OPENING_WATCH_FORCE", "false").lower() in {"1", "true", "yes"}
-EARLIEST_THURSDAY_HOUR = int(os.getenv("THURSDAY_EARLIEST_FINALIZE_HOUR", "18"))
+EARLIEST_THURSDAY_HOUR = int(os.getenv("THURSDAY_EARLIEST_FINALIZE_HOUR", "9"))
 FRIDAY_CUTOFF_HOUR = int(os.getenv("FRIDAY_OPENING_WATCH_CUTOFF_HOUR", "12"))
 
 DDL = """
@@ -53,7 +53,7 @@ def _allowed_now(now: Optional[datetime] = None) -> tuple[bool, datetime, str]:
     if FORCE:
         return True, local, "forced"
     if local.weekday() == 3 and local.hour >= EARLIEST_THURSDAY_HOUR:
-        return True, local, "thursday_evening"
+        return True, local, "thursday_bulletin_window"
     if local.weekday() == 4 and local.hour <= FRIDAY_CUTOFF_HOUR:
         return True, local, "friday_fallback"
     return False, local, "outside_watch_window"
