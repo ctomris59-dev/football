@@ -8,7 +8,9 @@ Leakage boundary:
 - closing prices are never returned to the model, filter, threshold or ranking logic.
 
 This module is intentionally separate from value_backtest.py because CLV requires a
-true time series of decision-time versus closing market snapshots.
+true time series of decision-time versus closing market snapshots. Historical
+validation and the live 2026/27 holdout are reported separately so live outcomes can
+never silently contaminate a validation aggregate.
 """
 from __future__ import annotations
 
@@ -23,12 +25,16 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from research_evaluation import stable_seed, week_block_bootstrap
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-VERSION = "production-clv-same-book-paired-v1"
+VERSION = "production-clv-same-book-paired-v2-holdout-separated"
 PRICE_MIN = float(os.getenv("CLV_PRICE_MIN", "1.01"))
 PRICE_MAX = float(os.getenv("CLV_PRICE_MAX", "20.0"))
 MAX_OVERROUND = float(os.getenv("CLV_MAX_OVERROUND", "1.20"))
 BOOTSTRAP_ITERATIONS = int(os.getenv("CLV_BOOTSTRAP_ITERATIONS", "2000"))
 TOP10_ONLY = os.getenv("CLV_TOP10_ONLY", "1").strip().lower() in {"1", "true", "yes"}
+HISTORICAL_VALIDATION_SEASONS = tuple(
+    x.strip() for x in os.getenv("CLV_VALIDATION_SEASONS", "2425,2526").split(",") if x.strip()
+)
+LIVE_HOLDOUT_SEASON = os.getenv("CLV_LIVE_HOLDOUT_SEASON", "2627").strip()
 MARKETS = ("over_2_5", "btts", "corners_over_8_5")
 
 
@@ -60,6 +66,7 @@ def outcome_key(market: str, outcome: Any) -> Optional[str]:
         if s == "no" or " no" in " " + s:
             return "no"
     return None
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS clv_backtest_runs(
@@ -191,6 +198,18 @@ def _week(ts: Any) -> str:
     return f"{iso.year}-W{iso.week:02d}"
 
 
+def split_evaluation_scope(rows: Sequence[Mapping[str, Any]]) -> Dict[str, List[Mapping[str, Any]]]:
+    """Separate historical validation from the live holdout before any aggregate is built."""
+    historical = [r for r in rows if str(r.get("fold")) in HISTORICAL_VALIDATION_SEASONS]
+    live = [r for r in rows if str(r.get("fold")) == LIVE_HOLDOUT_SEASON]
+    other = [
+        r for r in rows
+        if str(r.get("fold")) not in HISTORICAL_VALIDATION_SEASONS
+        and str(r.get("fold")) != LIVE_HOLDOUT_SEASON
+    ]
+    return {"historical_validation": historical, "live_holdout": live, "other": other}
+
+
 def _clv_metrics(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Optional[float]]:
     if not rows:
         return {"probability_clv": None, "log_price_clv": None}
@@ -200,7 +219,7 @@ def _clv_metrics(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Optional[float]
     }
 
 
-def _summary(rows: Sequence[Dict[str, Any]], label: str) -> Dict[str, Any]:
+def _summary(rows: Sequence[Mapping[str, Any]], label: str) -> Dict[str, Any]:
     if not rows:
         return {"n": 0}
     point = _clv_metrics(rows)
@@ -221,10 +240,27 @@ def _summary(rows: Sequence[Dict[str, Any]], label: str) -> Dict[str, Any]:
     }
 
 
+def _scope_report(rows: Sequence[Mapping[str, Any]], label: str) -> Dict[str, Any]:
+    seasons = sorted({str(r["fold"]) for r in rows})
+    return {
+        "overall": _summary(rows, label + ":overall"),
+        "by_market": {
+            m: _summary([r for r in rows if r["market"] == m], label + ":market:" + m)
+            for m in MARKETS
+        },
+        "by_season": {
+            s: _summary([r for r in rows if str(r["fold"]) == s], label + ":season:" + s)
+            for s in seasons
+        },
+    }
+
+
 def _load_picks(conn) -> List[Dict[str, Any]]:
     top_filter = "AND p.top10_rank IS NOT NULL" if TOP10_ONLY else ""
+    # One evaluable decision per fixture/market: the latest recorded qualifying pick.
+    # Repeated model refreshes for the same fixture must not inflate CLV sample size.
     rows = conn.execute(
-        f"""SELECT DISTINCT ON (p.event_id,p.market,p.snapshot_hour)
+        f"""SELECT DISTINCT ON (p.event_id,p.market)
                   p.run_id,p.event_id,p.market,p.selection,p.selection_yes,p.model_probability,
                   p.snapshot_hour,p.match_date,p.league_name,p.home_team,p.away_team,p.market_price,
                   fs.oddspapi_fixture_id
@@ -242,7 +278,7 @@ def _load_picks(conn) -> List[Dict[str, Any]]:
              AND p.market IN ('over_2_5','btts','corners_over_8_5')
              AND r.model_version LIKE '%v1%'
              {top_filter}
-           ORDER BY p.event_id,p.market,p.snapshot_hour,p.run_id DESC"""
+           ORDER BY p.event_id,p.market,p.snapshot_hour DESC,p.run_id DESC"""
     ).fetchall()
     keys = [
         "run_id", "event_id", "market", "selection", "selection_yes", "confidence",
@@ -296,7 +332,10 @@ def run_backtest(database_url: Optional[str] = None) -> Dict[str, Any]:
                     "week": _week(pick["match_date"]),
                 })
 
-            seasons = sorted({str(r["fold"]) for r in evaluated})
+            scopes = split_evaluation_scope(evaluated)
+            historical = scopes["historical_validation"]
+            live = scopes["live_holdout"]
+            other = scopes["other"]
             results = {
                 "version": VERSION,
                 "purpose": "post_decision_evaluation_only_no_production_signal",
@@ -306,15 +345,28 @@ def run_backtest(database_url: Optional[str] = None) -> Dict[str, Any]:
                     "closing_price": "latest paired same-book snapshot strictly before kickoff",
                     "production_use": "closing price is evaluation-only and must never enter model/filter/threshold/ranking",
                 },
+                "sampling_rule": "latest qualifying recorded pick per event_id+market; repeated refresh snapshots are deduplicated",
                 "picks_seen": len(picks),
                 "picks_with_valid_clv": len(evaluated),
                 "missing_fixture_mapping": missing_fixture,
                 "no_valid_same_book_decision_to_close_pair": no_decision_close_pair,
-                "overall": _summary(evaluated, "overall"),
-                "by_market": {m: _summary([r for r in evaluated if r["market"] == m], "market:" + m) for m in MARKETS},
-                "by_season": {s: _summary([r for r in evaluated if r["fold"] == s], "season:" + s) for s in seasons},
-                "live_holdout_note": "2026/27 CLV may be monitored descriptively but must not be used to tune the frozen policy.",
-                "promotion_rule": "CLV is supporting evidence only. No feature or threshold is activated from this report alone.",
+                "historical_validation": {
+                    "seasons": list(HISTORICAL_VALIDATION_SEASONS),
+                    "eligible_for_research_gate": True,
+                    **_scope_report(historical, "historical"),
+                },
+                "live_holdout_monitoring": {
+                    "season": LIVE_HOLDOUT_SEASON,
+                    "eligible_for_research_gate": False,
+                    **_scope_report(live, "live-holdout"),
+                    "rule": "descriptive monitoring only; never pooled with historical validation for tuning or activation",
+                },
+                "other_seasons_descriptive": {
+                    "n": len(other),
+                    "eligible_for_research_gate": False,
+                    "by_season": _scope_report(other, "other").get("by_season", {}),
+                },
+                "promotion_rule": "Only historical_validation may support a challenger gate. CLV remains supporting evidence and cannot activate a feature or threshold by itself.",
             }
             conn.execute(
                 "UPDATE clv_backtest_runs SET finished_at=NOW(),status='success',picks_seen=%s,picks_with_clv=%s,results=%s,message='ok' WHERE id=%s",
