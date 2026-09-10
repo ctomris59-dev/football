@@ -1,5 +1,5 @@
 services:
-  # Small web service only for checking status and downloading the final ZIP.
+  # User-facing Thursday decision service and pinnable /persembe page.
   - type: web
     name: football-dataset-export
     runtime: python
@@ -7,6 +7,7 @@ services:
     region: frankfurt
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn export_app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
     envVars:
       - key: DATABASE_URL
         fromDatabase:
@@ -14,13 +15,118 @@ services:
           property: connectionString
       - key: DOWNLOAD_TOKEN
         generateValue: true
-      # Cover the full 7-day production horizon plus a safety day.
+      - key: VALIDATION_TRIGGER_TOKEN
+        generateValue: true
+      # Required only for the international paired same-book no-vig reference.
+      # Existing services keep their current manually configured value; new Blueprint
+      # installs must provide it during initial setup.
+      - key: ODDSPAPI_API_KEY
+        sync: false
+      - key: AUTO_LIVE_REFRESH
+        value: "false"
       - key: FOTMOB_AVAILABILITY_LOOKAHEAD_DAYS
         value: "8"
 
-  # Dashboard-only "Run now" option:
-  # Create as a Cron Job, then use Runs -> Trigger Run manually.
-  # The annual schedule prevents routine collection; delete/suspend after the one-time pull.
+      # Frozen Thursday decision policy.
+      - key: HIGH_CONFIDENCE_MIN
+        value: "0.70"
+      - key: VALUE_MIN_CONFIDENCE
+        value: "0.65"
+      - key: VALUE_MIN_EDGE
+        value: "0.015"
+      - key: VALUE_MIN_EV
+        value: "0.02"
+      - key: THURSDAY_LIST_LIMIT
+        value: "10"
+      - key: THURSDAY_MIN_MODEL_DATA_QUALITY
+        value: "0.80"
+      - key: THURSDAY_MIN_PLAYER_COVERAGE
+        value: "0.70"
+      - key: THURSDAY_MIN_STARTER_CONTINUITY
+        value: "0.50"
+      - key: THURSDAY_MAX_KNOWN_INJURY_IMPACT
+        value: "0.20"
+      - key: THURSDAY_MIN_REST_DAYS
+        value: "2.5"
+      - key: THURSDAY_CANDIDATE_COVERAGE_MIN
+        value: "0.75"
+      - key: THURSDAY_NO_CANDIDATE_BULLETIN_COVERAGE_MIN
+        value: "0.70"
+
+      # International validation policy. International prices never become the
+      # executable bet price; they are de-vigged fair-market references only.
+      - key: INTERNATIONAL_REFERENCE_MAX_AGE_HOURS
+        value: "6"
+      - key: INTERNATIONAL_REFRESH_MAX_AGE_HOURS
+        value: "2"
+      - key: INTERNATIONAL_FIXTURE_TOLERANCE_HOURS
+        value: "12"
+      - key: INTERNATIONAL_MATCH_SCORE_MIN
+        value: "1.55"
+      - key: INTERNATIONAL_MATCH_SIDE_MIN
+        value: "0.72"
+      - key: INTERNATIONAL_MATCH_MARGIN_MIN
+        value: "0.08"
+      - key: INTERNATIONAL_MAX_DISPERSION
+        value: "0.06"
+      - key: INTERNATIONAL_MAX_SHARP_DELTA
+        value: "0.08"
+      - key: INTERNATIONAL_MIN_TR_EDGE
+        value: "0.01"
+      - key: INTERNATIONAL_MIN_TR_EV
+        value: "0.01"
+      - key: INTERNATIONAL_MAX_MODEL_DIVERGENCE
+        value: "0.12"
+
+      # Official Turkey executable-price freshness/validation.
+      - key: TR_PRICE_MIN
+        value: "1.01"
+      - key: TR_PRICE_MAX
+        value: "5.00"
+      - key: TR_PRICE_MAX_AGE_HOURS
+        value: "6"
+
+  # Canonical weekly preparation: Thursday 18:00 Türkiye time (15:00 UTC).
+  # This service already exists in the live Render workspace; defining it here makes
+  # the schedule durable and version-controlled.
+  - type: cron
+    name: football-weekly-preview-refresh
+    runtime: python
+    plan: starter
+    region: frankfurt
+    schedule: "0 15 * * 4"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python live_refresh.py
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: football-dataset-db
+          property: connectionString
+      - key: LIVE_REFRESH_TRIGGER_NAME
+        value: "thursday-decision-prep"
+      - key: LIVE_REFRESH_FORCE
+        value: "false"
+      - key: LIVE_REFRESH_MIN_INTERVAL_MINUTES
+        value: "45"
+
+  # Opening-price watcher. Render cron is UTC, so it wakes every 15 minutes on
+  # Thursday/Friday; thursday_schedule_tick.py gates execution to Europe/Istanbul
+  # Thursday 18:00 -> Friday 12:00 and stops doing work once the week is finalized.
+  - type: cron
+    name: football-thursday-opening-watch
+    runtime: python
+    plan: starter
+    region: frankfurt
+    schedule: "*/15 * * * 4,5"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python thursday_schedule_tick.py
+    envVars:
+      - key: THURSDAY_SERVICE_BASE_URL
+        value: "https://football-dataset-export.onrender.com"
+      - key: THURSDAY_SCHEDULER_HTTP_TIMEOUT_SECONDS
+        value: "120"
+
+  # Historical collector only. Not part of the weekly betting workflow.
   - type: cron
     name: football-bulk-collector
     runtime: python
