@@ -1,0 +1,33 @@
+name: over25-sensitivity-ci
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile audit
+        run: python -m py_compile over25_sensitivity_audit.py
+      - name: Validate weekly selection semantics
+        run: |
+          python - <<'PY'
+          from over25_sensitivity_audit import _weekly_top
+          rows=[]
+          for fold in ('2425','2526'):
+              for week in ('2025-W01','2025-W02'):
+                  for i in range(10):
+                      rows.append({'fold':fold,'week':week,'ranking':1-i/20,'confidence':.9-i/20})
+          assert len(_weekly_top(rows,3)) == 12
+          assert len(_weekly_top(rows,5)) == 20
+          assert all(float(r['confidence']) >= 0 for r in _weekly_top(rows,10))
+          print('over25-sensitivity-ci-ok')
+          PY
