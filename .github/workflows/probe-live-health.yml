@@ -1,0 +1,18 @@
+name: probe-live-health
+
+on:
+  push:
+    branches: [probe-live-health]
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read live health and list
+        run: |
+          echo '=== HEALTH ==='
+          curl -fsS https://football-dataset-export.onrender.com/health
+          echo
+          echo '=== LIST ==='
+          curl -fsS https://football-dataset-export.onrender.com/thursday-list
+          echo
