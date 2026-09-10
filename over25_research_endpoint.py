@@ -2,7 +2,9 @@
 """Temporary, research-only controller for one isolated Over 2.5 audit run.
 
 The random route token limits accidental discovery while this short-lived endpoint
-is deployed. The audit is read-only with respect to production decisions.
+is deployed. The audit is read-only with respect to production decisions. Status
+polling auto-starts an idle audit so a Render replacement instance cannot strand
+the capture workflow in an idle state.
 """
 from __future__ import annotations
 
@@ -54,18 +56,20 @@ def _run() -> None:
         _lock.release()
 
 
+def _ensure_started() -> None:
+    if DATABASE_URL and _state["status"] == "idle" and not _lock.locked():
+        threading.Thread(target=_run, name="over25-isolated-audit", daemon=True).start()
+
+
 @router.get(f"/__research/over25/{TOKEN}/start")
 def start():
     if not DATABASE_URL:
         return {"ok": False, "status": "failed", "error": "DATABASE_URL missing"}
-    if _state["status"] == "running":
-        return {"ok": True, "status": "already_running"}
-    if _state["status"] == "success":
-        return {"ok": True, "status": "already_successful"}
-    threading.Thread(target=_run, name="over25-isolated-audit", daemon=True).start()
-    return {"ok": True, "status": "started"}
+    _ensure_started()
+    return {"ok": True, "status": _state["status"]}
 
 
 @router.get(f"/__research/over25/{TOKEN}/status")
 def status():
+    _ensure_started()
     return {"ok": True, **_state}
