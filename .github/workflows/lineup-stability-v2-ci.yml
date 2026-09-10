@@ -1,0 +1,19 @@
+name: lineup-stability-v2-ci
+
+on:
+  push:
+    branches: [main, 'research/**', 'feature/**']
+  pull_request:
+    branches: [main]
+
+jobs:
+  lineup-v2:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt pytest
+      - run: python -m py_compile lineup_stability_v2_policy.py lineup_stability_v2_audit.py lineup_stability_v2_once.py weekly_trusted_predictions.py over25_research_endpoint.py
+      - run: pytest -q test_lineup_stability_v2_policy.py
