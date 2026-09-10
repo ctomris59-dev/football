@@ -23,7 +23,7 @@ from psycopg.types.json import Jsonb
 from odds_movement_enricher import market_key, outcome_key
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-VERSION = "v1-odds-movement-leakage-safe-v1"
+VERSION = "v1-odds-movement-leakage-safe-v2"
 PRICE_MIN = float(os.getenv("MOVEMENT_PRICE_MIN", "1.01"))
 PRICE_MAX = float(os.getenv("MOVEMENT_PRICE_MAX", "8.0"))
 MAX_OVERROUND = float(os.getenv("MOVEMENT_MAX_OVERROUND", "1.18"))
@@ -43,6 +43,12 @@ CREATE TABLE IF NOT EXISTS odds_movement_backtest_runs(
  message TEXT
 );
 """
+
+
+def is_production_v1_version(version: Any) -> bool:
+    """True only for the production V1 family, never the old xG diagnostic v1."""
+    text = str(version or "")
+    return text.startswith("production-poisson-form-v1-") and "xg" not in text.lower()
 
 
 def _wilson(hits: int, n: int, z: float = 1.96) -> Optional[List[float]]:
@@ -142,7 +148,7 @@ def reconstruct_movement(
 
 
 def _load_picks(conn) -> List[Dict[str, Any]]:
-    """Earliest recorded V1-family pre-match pick for each event/market."""
+    """Earliest recorded true production-V1 pre-match pick for each event/market."""
     rows = conn.execute(
         """SELECT DISTINCT ON (p.event_id,p.market)
                   p.event_id,p.market,p.selection,p.selection_yes,p.model_probability,
@@ -166,7 +172,8 @@ def _load_picks(conn) -> List[Dict[str, Any]]:
            ) fs ON TRUE
            WHERE p.snapshot_hour < p.match_date
              AND p.market IN ('over_2_5','btts','corners_over_8_5')
-             AND r.model_version LIKE '%v1%'
+             AND r.model_version LIKE 'production-poisson-form-v1-%'
+             AND LOWER(r.model_version) NOT LIKE '%xg%'
              AND CASE p.market
                    WHEN 'over_2_5' THEN e.over_2_5
                    WHEN 'btts' THEN e.btts
@@ -245,6 +252,7 @@ def run_backtest(database_url: Optional[str] = None) -> Dict[str, Any]:
             results = {
                 "version": VERSION,
                 "purpose": "research_only_no_production_change",
+                "production_model_filter": "production-poisson-form-v1-* excluding any xg version",
                 "leakage_guard": "raw OddsPapi snapshots only; snapshot_hour <= earliest recorded V1 pick timestamp",
                 "movement_definition": f"median same-book paired no-vig probability change; toward >= +{MOVE_PP*100:.1f}pp, against <= -{MOVE_PP*100:.1f}pp",
                 "raw_picks": len(picks),
