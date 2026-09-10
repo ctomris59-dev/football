@@ -6,14 +6,17 @@ Active weekly preparation:
 - all-competition club schedules (domestic + UEFA) for true rest/fatigue context;
 - current injury availability (freshness-gated, optional);
 - current rosters + real historical starts -> expected-XI/player context;
+- optional xG/Elo/pressure refresh + unified match-environment shadow snapshot;
 - official Turkish İddaa opening-price watch;
 - international paired same-book no-vig validation after Turkey target prices appear;
 - frozen weekly decision;
 - exact-line 7.5/8.5/9.5/10.5 corner upgrade using the same frozen V1 corner lambda.
 
 International prices are never executable prices and never replace model confidence.
-Later T-1/T-3 information does not rewrite a frozen week except for an explicit
-schedule-context migration that corrects a previously incomplete rest calculation.
+The match-environment layer is shadow-only: xG regression, pace, Elo, venue and
+scoreline diagnostics cannot alter frozen V1 probabilities without two-fold OOS
+validation. All-competition rest is an operational data-correction layer and can
+block/de-rank a candidate when a real intervening match exists.
 """
 from __future__ import annotations
 
@@ -94,6 +97,32 @@ def _run() -> Dict[str, Any]:
 
     from player_context_orchestrator import run as player_context
     run_step("player_context", lambda: player_context(DATABASE_URL), steps)
+
+    # These context sources are useful but are deliberately non-blocking. If an
+    # external xG endpoint is unavailable, V1 + Turkey prices can still operate.
+    try:
+        from understat_xg_importer import run_import as understat_xg
+        run_step("understat_xg_shadow", lambda: understat_xg(DATABASE_URL), steps, optional=True)
+    except Exception as exc:
+        steps["understat_xg_shadow"] = {"status": "unavailable_optional", "error": str(exc)[:500]}
+
+    try:
+        from internal_elo_builder import build as internal_elo
+        run_step("internal_elo_shadow", lambda: internal_elo(DATABASE_URL), steps, optional=True)
+    except Exception as exc:
+        steps["internal_elo_shadow"] = {"status": "unavailable_optional", "error": str(exc)[:500]}
+
+    try:
+        from pressure_features_builder import build as pressure_features
+        run_step("pressure_features_shadow", lambda: pressure_features(DATABASE_URL), steps, optional=True)
+    except Exception as exc:
+        steps["pressure_features_shadow"] = {"status": "unavailable_optional", "error": str(exc)[:500]}
+
+    try:
+        from match_environment_builder import build as match_environment
+        run_step("match_environment_shadow", lambda: match_environment(DATABASE_URL), steps, optional=True)
+    except Exception as exc:
+        steps["match_environment_shadow"] = {"status": "unavailable_optional", "error": str(exc)[:500]}
 
     from thursday_opening_watch import main as opening_watch
     run_step("opening_watch", lambda: opening_watch(DATABASE_URL), steps)
