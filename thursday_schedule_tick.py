@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Scheduled trigger for the Thursday betting workflow.
 
-This script is intentionally stateless and secret-free. A Render cron runs it every
-15 minutes on Thursday/Friday. It only acts inside the Istanbul decision window:
-Thursday 18:00 through Friday 12:00. If the week is already finalized it exits
-without calling /opening-watch again.
+A Render cron runs this every 15 minutes on Thursday/Friday. It only acts inside
+the Istanbul decision window (Thursday 18:00 through Friday 12:00), stops once the
+week is finalized, and authenticates the mutating /opening-watch call with a
+private scheduler header.
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ SERVICE_BASE_URL = os.getenv(
     "THURSDAY_SERVICE_BASE_URL",
     "https://football-dataset-export.onrender.com",
 ).rstrip("/")
+SCHEDULER_KEY = os.getenv("THURSDAY_SCHEDULER_KEY", "").strip()
 HTTP_TIMEOUT_SECONDS = int(os.getenv("THURSDAY_SCHEDULER_HTTP_TIMEOUT_SECONDS", "120"))
 
 
@@ -34,11 +35,16 @@ def in_decision_window(now: datetime | None = None) -> bool:
     return False
 
 
-def get_json(path: str) -> dict:
+def get_json(path: str, *, scheduler_auth: bool = False) -> dict:
+    headers = {"User-Agent": "football-thursday-scheduler/1.1"}
+    if scheduler_auth:
+        if not SCHEDULER_KEY:
+            raise RuntimeError("THURSDAY_SCHEDULER_KEY is not configured")
+        headers["X-Scheduler-Key"] = SCHEDULER_KEY
     response = requests.get(
         f"{SERVICE_BASE_URL}{path}",
         timeout=HTTP_TIMEOUT_SECONDS,
-        headers={"User-Agent": "football-thursday-scheduler/1.0"},
+        headers=headers,
     )
     response.raise_for_status()
     return response.json()
@@ -67,7 +73,7 @@ def main() -> int:
         return 0
 
     try:
-        result = get_json("/opening-watch")
+        result = get_json("/opening-watch", scheduler_auth=True)
     except Exception as exc:
         print("THURSDAY_SCHEDULER_ERROR opening_watch", repr(exc), flush=True)
         return 3
