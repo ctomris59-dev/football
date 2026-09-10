@@ -1,0 +1,33 @@
+name: read-v2-preview
+
+on:
+  push:
+    branches: ['ops/read-v2-preview']
+
+jobs:
+  read-preview:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch current production V2 preview
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, time, urllib.request
+          url='https://football-dataset-export.onrender.com/__temp_v2_preview_20260910'
+          last=None
+          for i in range(18):
+              try:
+                  with urllib.request.urlopen(url, timeout=20) as r:
+                      body=r.read().decode('utf-8')
+                  data=json.loads(body)
+                  print('V2_PREVIEW_JSON='+json.dumps(data, ensure_ascii=False, separators=(',',':')))
+                  if data.get('ok'):
+                      raise SystemExit(0)
+                  last=body
+              except Exception as exc:
+                  last=repr(exc)
+              time.sleep(10)
+          print('V2_PREVIEW_FAILED='+str(last))
+          raise SystemExit(1)
+          PY
