@@ -1,0 +1,51 @@
+name: research-methodology
+
+on:
+  push:
+    branches: [main, 'research/**']
+  pull_request:
+    branches: [main]
+
+jobs:
+  methodology-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile research modules
+        run: |
+          python -m py_compile \
+            research_evaluation.py \
+            edge_structure_audit.py \
+            clv_backtest.py \
+            research_change_control.py \
+            production_predictor_v5.py \
+            test_research_evaluation.py
+      - name: Run methodology unit tests
+        run: python -m unittest -q test_research_evaluation.py
+      - name: Import integration modules
+        run: |
+          python - <<'PY'
+          import research_evaluation
+          import edge_structure_audit
+          import clv_backtest
+          import research_change_control
+          import production_predictor_v5
+          print('research-methodology-imports-ok')
+          PY
+      - name: Validate frozen policy snapshot
+        run: |
+          python -m json.tool policy_freeze_2026_27.json >/dev/null
+          python - <<'PY'
+          from research_change_control import load_freeze
+          cfg=load_freeze()
+          assert cfg['live_holdout_season']=='2627'
+          assert cfg['status']=='FROZEN_BASELINE'
+          assert cfg['validation_protocol']['test_seasons']==['2425','2526']
+          assert cfg['validation_protocol']['holdout_excluded'] is True
+          print('policy-freeze-ok')
+          PY
