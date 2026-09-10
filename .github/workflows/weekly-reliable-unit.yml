@@ -1,0 +1,19 @@
+name: weekly-reliable-unit
+
+on:
+  push:
+    branches: ['weekly-reliable-output']
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt pytest
+      - run: python -m py_compile turkey_two_sided_odds.py weekly_trusted_predictions.py thursday_opening_watch.py thursday_page.py
+      - run: pytest -q test_weekly_reliable_output.py
