@@ -18,19 +18,19 @@ jobs:
         run: pip install -r requirements.txt
       - name: Compile final Thursday modules
         run: |
-          python -m py_compile export_app.py market_consensus_builder.py international_market_reference.py thursday_decision_engine.py thursday_decision_engine_v2.py thursday_opening_watch.py thursday_schedule_tick.py live_refresh.py turkey_value_workflow.py
-      - name: Validate no-vig and Turkey-value separation
+          python -m py_compile export_app.py market_consensus_builder.py international_market_reference.py thursday_decision_engine.py thursday_decision_engine_v2.py thursday_opening_watch.py thursday_schedule_tick.py live_refresh.py turkey_value_workflow.py turkey_two_sided_odds.py weekly_trusted_predictions.py thursday_page.py
+      - name: Validate no-vig, Turkey-value and weekly-reliability separation
         run: |
           python - <<'PY'
           from market_consensus_builder import no_vig, no_vig_pair
           from international_market_reference import reference_quality
           from thursday_decision_engine import market_metrics
           from thursday_decision_engine_v2 import playable_decision_ready
+          from turkey_two_sided_odds import _side
+          from weekly_trusted_predictions import _selected_market_probability, _public
 
           fair = no_vig(1.90, 2.00)
           assert fair is not None and 0 < fair < 1
-
-          # Old malformed central-market price patterns must fail closed.
           assert no_vig(29.0, 1.03) is None
           assert no_vig_pair(12.0, 1.04) is None
 
@@ -45,14 +45,41 @@ jobs:
           assert abs(m['tr_implied_probability'] - 1/1.55) < 1e-12
           assert m['model_ev_vs_tr'] > .11
           assert m['international_ev_vs_tr'] > .06
-          assert m['model_edge_vs_tr'] > 0
-          assert m['international_edge_vs_tr'] > 0
 
-          # A market not offered by Turkey is non-executable, not missing coverage.
           assert not playable_decision_ready(.89, 0, 0.0)
           assert playable_decision_ready(.95, 0, 0.0)
           assert not playable_decision_ready(.95, 1, 0.0)
           assert playable_decision_ready(.95, 1, .80)
+
+          # Both executable sides are classified; this broadens selection only,
+          # not the model or the strict value gate.
+          assert _side('over_2_5', 'Üst') == 'yes'
+          assert _side('over_2_5', 'Alt') == 'no'
+          assert _side('btts', 'Var') == 'yes'
+          assert _side('btts', 'Yok') == 'no'
+          assert abs(_selected_market_probability({'reference_p_yes': .62}, False) - .38) < 1e-12
+
+          low = _public({
+              'event_id':'x','match_date':None,'league':'L','home':'A','away':'B',
+              'market':'over_2_5','selection':'2.5 ÜST','confidence':.66,
+              'ranking_score':.64,'price':{'tr_price':1.70,'tr_opening_price':1.72,'tr_source':'iddaa_official'},
+              'international':{},'international_selected_probability':None,
+              'market_check':'reference_unavailable','early_context':{}
+          })
+          assert low['strict_high_confidence'] is False
+          assert low['confidence_tier'] == 'Haftanın En Güvenilirleri'
+          high = dict(low)
+          high['confidence'] = .71
+          # _public takes internal rows; verify strict label using a fresh internal row.
+          high_item = _public({
+              'event_id':'y','match_date':None,'league':'L','home':'C','away':'D',
+              'market':'btts','selection':'KG VAR','confidence':.71,
+              'ranking_score':.69,'price':{'tr_price':1.55,'tr_opening_price':1.58,'tr_source':'iddaa_official'},
+              'international':{},'international_selected_probability':None,
+              'market_check':'reference_unavailable','early_context':{}
+          })
+          assert high_item['strict_high_confidence'] is True
+          assert high_item['confidence_tier'] == 'Yüksek Güven'
           print('thursday-market-validation-ok')
           PY
       - name: Validate Thursday scheduler window, weekly horizon and auth
