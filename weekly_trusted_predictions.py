@@ -14,7 +14,8 @@ Value remains a separate, stricter list.
 Schedule context is operational only: the latest official club fixture is read across
 domestic + UEFA competitions. Raw V1 probabilities stay frozen; short-rest context
 only adjusts ranking and a still-unplayed official match before the target fixture
-keeps that candidate pending until the next refresh.
+keeps that candidate pending until the next refresh. The richer match-environment
+snapshot is exposed for audit/research only and does not affect ranking.
 """
 from __future__ import annotations
 
@@ -27,6 +28,7 @@ from typing import Any, Dict, List, Optional
 import psycopg
 
 from international_market_reference import latest_ref
+from match_environment_builder import latest_environment
 from model_engine_v1 import predict_match
 from production_predictor import canon
 from schedule_context import SCHEDULE_CONTEXT_VERSION, team_schedule_context
@@ -124,20 +126,8 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
 
             legacy_home_rest = _last_rest_days(history, str(home), match_date)
             legacy_away_rest = _last_rest_days(history, str(away), match_date)
-            home_sched = team_schedule_context(
-                conn,
-                str(home),
-                match_date,
-                as_of=as_of,
-                fallback_rest_days=legacy_home_rest,
-            )
-            away_sched = team_schedule_context(
-                conn,
-                str(away),
-                match_date,
-                as_of=as_of,
-                fallback_rest_days=legacy_away_rest,
-            )
+            home_sched = team_schedule_context(conn, str(home), match_date, as_of=as_of, fallback_rest_days=legacy_home_rest)
+            away_sched = team_schedule_context(conn, str(away), match_date, as_of=as_of, fallback_rest_days=legacy_away_rest)
 
             if home_sched.get("pending_pre_fixture_match") or away_sched.get("pending_pre_fixture_match"):
                 excluded["pending_intervening_official_match"] += 1
@@ -145,28 +135,22 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
 
             home_rest = home_sched.get("rest_days")
             away_rest = away_sched.get("rest_days")
-            eligible, blockers, gate_diag = _early_gate(
-                pred,
-                home_player_ctx,
-                away_player_ctx,
-                home_rest,
-                away_rest,
-            )
+            eligible, blockers, gate_diag = _early_gate(pred, home_player_ctx, away_player_ctx, home_rest, away_rest)
             if not eligible:
                 for blocker in blockers:
                     excluded[blocker] += 1
                 continue
 
-            schedule_factor = min(
-                float(home_sched.get("rank_factor") or 0.0),
-                float(away_sched.get("rank_factor") or 0.0),
-            )
+            schedule_factor = min(float(home_sched.get("rank_factor") or 0.0), float(away_sched.get("rank_factor") or 0.0))
+            environment = latest_environment(conn, str(eid))
             gate_diag.update({
                 "schedule_context_version": SCHEDULE_CONTEXT_VERSION,
                 "schedule_scope": "all_competitions_with_domestic_fallback",
                 "schedule_rank_factor": schedule_factor,
                 "home_schedule": home_sched,
                 "away_schedule": away_sched,
+                "match_environment": environment,
+                "match_environment_semantics": "shadow_only_no_ranking_effect",
             })
 
             for market, attr, yes_selection, no_selection in MARKETS:
@@ -188,48 +172,25 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                 data_quality = float(gate_diag.get("model_data_quality") or 0.0)
                 ranking_score = confidence * (0.75 + 0.25 * data_quality) * schedule_factor
                 rows.append({
-                    "event_id": str(eid),
-                    "match_date": match_date,
-                    "league": league_s,
-                    "home": str(home),
-                    "away": str(away),
-                    "market": market,
-                    "selection": selection,
-                    "confidence": confidence,
-                    "ranking_score": ranking_score,
-                    "schedule_rank_factor": schedule_factor,
-                    "price": price,
-                    "international": ref,
-                    "international_selected_probability": ref_selected,
-                    "market_check": market_check,
-                    "early_context": gate_diag,
+                    "event_id": str(eid), "match_date": match_date, "league": league_s,
+                    "home": str(home), "away": str(away), "market": market, "selection": selection,
+                    "confidence": confidence, "ranking_score": ranking_score, "schedule_rank_factor": schedule_factor,
+                    "price": price, "international": ref, "international_selected_probability": ref_selected,
+                    "market_check": market_check, "early_context": gate_diag,
                 })
 
-        one_per_fixture = _one_per_fixture(
-            rows,
-            lambda r: (float(r["ranking_score"]), float(r["confidence"]), r["market_check"] == "aligned"),
-        )
-        one_per_fixture.sort(
-            key=lambda r: (float(r["ranking_score"]), float(r["confidence"]), r["market_check"] == "aligned"),
-            reverse=True,
-        )
+        one_per_fixture = _one_per_fixture(rows, lambda r: (float(r["ranking_score"]), float(r["confidence"]), r["market_check"] == "aligned"))
+        one_per_fixture.sort(key=lambda r: (float(r["ranking_score"]), float(r["confidence"]), r["market_check"] == "aligned"), reverse=True)
         picks = [_public(r) for r in one_per_fixture[:limit]]
         strict_high = [p for p in picks if p["strict_high_confidence"]]
         coverage = _latest_import_coverage(conn, len(fixtures))
         official_coverage = float(coverage.get("fixture_coverage") or 0.0)
         ready = official_coverage >= 0.90 and len(picks) >= min(MIN_WEEKLY_PICKS, max(1, len(fixtures)))
         result = {
-            "status": "success",
-            "week_key": week_key,
-            "horizon_start": start,
-            "horizon_end": end,
-            "fixture_count": len(fixtures),
-            "official_fixture_coverage": official_coverage,
-            "ready": ready,
-            "picks": picks,
-            "strict_high_confidence": strict_high,
-            "strict_high_confidence_count": len(strict_high),
-            "ranked_pick_count": len(picks),
+            "status": "success", "week_key": week_key, "horizon_start": start, "horizon_end": end,
+            "fixture_count": len(fixtures), "official_fixture_coverage": official_coverage, "ready": ready,
+            "picks": picks, "strict_high_confidence": strict_high,
+            "strict_high_confidence_count": len(strict_high), "ranked_pick_count": len(picks),
             "excluded_counts": dict(excluded),
             "policy": {
                 "list_semantics": "weekly_reliability_ranking_not_guaranteed_70pct",
@@ -237,6 +198,7 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                 "ranking": "existing_v1_probability_x_data_quality_x_operational_schedule_factor",
                 "schedule_context_version": SCHEDULE_CONTEXT_VERSION,
                 "schedule_scope": "all_competitions_with_domestic_fallback",
+                "match_environment": "shadow_only_no_ranking_effect",
                 "pending_intervening_official_match": "exclude_until_next_refresh",
                 "turkey_price_required": True,
                 "international_reference": "reject strong contradiction when available; missing reference allowed for reliability list",
