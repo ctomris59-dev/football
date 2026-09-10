@@ -4,8 +4,9 @@
 User workflow: Thursday -> two frozen lists -> place bets -> done.
 
 Roles are deliberately separated:
-- validated V1 model = calibrated football probability/confidence;
-- international paired same-book no-vig market = sanity/fair-value reference only;
+- validated V1 model = historical probability/ranking estimate; it is NOT assumed to
+  be perfectly calibrated in every league/market/confidence band;
+- international paired same-book no-vig market = sanity/fair-value reference;
 - official Turkish İddaa price = the only executable price and the only price used for
   the user's model EV.
 
@@ -262,10 +263,16 @@ def _one_per_fixture(rows: Iterable[Dict[str, Any]], key_fn):
 
 def _public_item(row: Dict[str, Any], *, include_value: bool) -> Dict[str, Any]:
     pinfo, ref = row.get("price") or {}, row.get("international") or {}
+    model_p = row["confidence"]
     item = {
         "event_id": row["event_id"], "match_date": row["match_date"], "league": row["league"],
         "home": row["home"], "away": row["away"], "market": row["market"], "selection": row["selection"],
-        "confidence": row["confidence"],
+        # Backward-compatible field plus explicit semantic name. Audit evidence shows
+        # raw V1 is not perfectly calibrated, so callers should describe this as a
+        # model estimate rather than guaranteed real-world probability.
+        "confidence": model_p,
+        "model_probability_estimate": model_p,
+        "confidence_semantics": "raw_v1_probability_estimate_not_perfectly_calibrated",
         "tr_price": pinfo.get("tr_price"), "tr_opening_price": pinfo.get("tr_opening_price"),
         "tr_source": pinfo.get("tr_source"),
         "international_fair_probability": ref.get("reference_p_yes"),
@@ -409,8 +416,6 @@ def build_decision(database_url: str = DATABASE_URL, *, now: Optional[datetime] 
                     and international_candidate_coverage >= CANDIDATE_COVERAGE_MIN
                 )
             else:
-                # Only finalize an empty week after enough of the Turkish bulletin is
-                # visible to know that "no candidate" is a real conclusion.
                 decision_ready = bool(official_coverage >= NO_CANDIDATE_BULLETIN_COVERAGE_MIN)
 
             alignment_rejections = defaultdict(int)
@@ -435,8 +440,9 @@ def build_decision(database_url: str = DATABASE_URL, *, now: Optional[datetime] 
                     "min_rest_days": MIN_REST_DAYS,
                     "candidate_coverage_min": CANDIDATE_COVERAGE_MIN,
                     "no_candidate_bulletin_coverage_min": NO_CANDIDATE_BULLETIN_COVERAGE_MIN,
-                    "model_source": "validated_v1",
-                    "international_role": "paired_same-book_no-vig_reference_only",
+                    "model_source": "validated_v1_probability_estimate",
+                    "model_probability_semantics": "not_assumed_perfectly_calibrated; international market remains mandatory sanity filter",
+                    "international_role": "paired_same-book_no-vig_reference",
                     "executable_price_source": "iddaa_official_turkey",
                     "confirmed_lineup_required": False,
                     "t_minus_reselection": False,
@@ -493,7 +499,7 @@ def build_decision(database_url: str = DATABASE_URL, *, now: Optional[datetime] 
                     Jsonb(high_list, dumps=lambda x: json.dumps(x, default=json_default, ensure_ascii=False)),
                     Jsonb(value_list, dumps=lambda x: json.dumps(x, default=json_default, ensure_ascii=False)),
                     Jsonb(diagnostics, dumps=lambda x: json.dumps(x, default=json_default, ensure_ascii=False)),
-                    "model+international no-vig reference+Turkey executable price",
+                    "model estimate+international no-vig reference+Turkey executable price",
                     run_id,
                 ),
             )
