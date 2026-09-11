@@ -3,22 +3,21 @@
 
 This module does not change the frozen V1 goal model. It converts the already-
 validated home/away Poisson goal intensities into mutually exclusive 1/X/2 match-
-result probabilities, then applies a predeclared cost-aware coupon policy.
+result probabilities, then applies a cost-aware coupon policy.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, List, Tuple
 
 POLICY_KEY = "one-x-two-v1"
 POLICY_VERSION = "one-x-two-poisson-v1"
 ACTIVE_MODE = "one_x_two_v1"
+V2_ACTIVE_MODE = "one_x_two_v2"
 OUTCOMES = ("1", "0", "2")
 
-# Frozen before historical audit. These thresholds are intentionally conservative:
-# strong + separated favourites stay single; ambiguous matches get a double; only
-# genuinely three-way fixtures become 102.
+# Original V1 thresholds, kept frozen for reproducibility of the first audit.
 SINGLE_MIN_PROB = 0.56
 SINGLE_MIN_MARGIN = 0.10
 TRIPLE_MAX_TOP = 0.40
@@ -59,11 +58,7 @@ def _poisson_probs(lam: float, max_goals: int) -> List[float]:
 
 
 def probabilities_from_lambdas(lambda_home: float, lambda_away: float, *, max_goals: int = 12) -> OneXTwoPrediction:
-    """Convert independent home/away Poisson goal intensities to 1/X/2.
-
-    A finite score grid is renormalized, so p1+px+p2 is exactly one up to floating
-    point error even when lambdas are unusually large.
-    """
+    """Convert independent home/away Poisson goal intensities to 1/X/2."""
     lh = max(0.01, float(lambda_home))
     la = max(0.01, float(lambda_away))
     hp = _poisson_probs(lh, max_goals)
@@ -105,23 +100,25 @@ def ranked_outcomes(prediction: OneXTwoPrediction) -> List[Tuple[str, float]]:
     return sorted(probs.items(), key=lambda item: (-item[1], order[item[0]]))
 
 
-def coupon_selection(prediction: OneXTwoPrediction) -> Dict[str, Any]:
-    """Return a cost-aware single/double/triple recommendation.
-
-    The returned string follows Turkish pool convention: 1, 0, 2 in display order,
-    e.g. 10, 02, 12, 102. Thresholds are frozen constants and must not be tuned on
-    the 2026/27 live holdout.
-    """
+def coupon_selection_with_thresholds(
+    prediction: OneXTwoPrediction,
+    *,
+    single_min_prob: float,
+    single_min_margin: float,
+    triple_max_top: float,
+    triple_min_bottom: float,
+) -> Dict[str, Any]:
+    """Return a single/double/triple recommendation for explicit frozen thresholds."""
     ranked = ranked_outcomes(prediction)
     top_label, top_prob = ranked[0]
     second_label, second_prob = ranked[1]
     _, bottom_prob = ranked[2]
     margin = top_prob - second_prob
 
-    if top_prob >= SINGLE_MIN_PROB and margin >= SINGLE_MIN_MARGIN:
+    if top_prob >= float(single_min_prob) and margin >= float(single_min_margin):
         chosen = {top_label}
         tier = "single"
-    elif top_prob <= TRIPLE_MAX_TOP and bottom_prob >= TRIPLE_MIN_BOTTOM:
+    elif top_prob <= float(triple_max_top) and bottom_prob >= float(triple_min_bottom):
         chosen = set(OUTCOMES)
         tier = "triple"
     else:
@@ -142,6 +139,17 @@ def coupon_selection(prediction: OneXTwoPrediction) -> Dict[str, Any]:
         "coverage_probability": coverage_probability,
         "probabilities": prediction.probabilities(),
     }
+
+
+def coupon_selection(prediction: OneXTwoPrediction) -> Dict[str, Any]:
+    """Reproduce the frozen V1 coupon policy."""
+    return coupon_selection_with_thresholds(
+        prediction,
+        single_min_prob=SINGLE_MIN_PROB,
+        single_min_margin=SINGLE_MIN_MARGIN,
+        triple_max_top=TRIPLE_MAX_TOP,
+        triple_min_bottom=TRIPLE_MIN_BOTTOM,
+    )
 
 
 def actual_outcome(home_goals: Any, away_goals: Any) -> str:

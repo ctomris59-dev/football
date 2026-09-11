@@ -1,8 +1,7 @@
-import math
-
 from one_x_two_engine import (
     actual_outcome,
     coupon_selection,
+    coupon_selection_with_thresholds,
     probabilities_from_lambdas,
     selection_contains,
 )
@@ -40,6 +39,20 @@ def test_balanced_match_is_not_forced_single():
     coupon = coupon_selection(pred)
     assert coupon["selection_count"] >= 2
     assert coupon["tier"] in {"double", "triple"}
+
+
+def test_parameterized_policy_can_reduce_coverage_cost():
+    pred = probabilities_from_lambdas(1.85, 0.90)
+    base = coupon_selection(pred)
+    tighter = coupon_selection_with_thresholds(
+        pred,
+        single_min_prob=0.46,
+        single_min_margin=0.02,
+        triple_max_top=0.34,
+        triple_min_bottom=0.30,
+    )
+    assert tighter["selection_count"] <= base["selection_count"]
+    assert tighter["top_outcome"] == base["top_outcome"]
 
 
 def test_outcome_and_selection_membership():
