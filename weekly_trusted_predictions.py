@@ -21,6 +21,7 @@ from advanced_goal_models import (
     POLICY_KEY as ADVANCED_GOAL_POLICY_KEY,
     apply_mode as apply_advanced_goal_mode,
 )
+from corner_multiline import SUPPORTED_CORNER_LINES, corner_market_specs
 from international_market_reference import latest_ref
 from lineup_stability_v2_policy import (
     ACTIVE_MODE as LINEUP_V2_ACTIVE_MODE,
@@ -50,11 +51,44 @@ from thursday_decision_engine import (
 
 MIN_WEEKLY_PICKS = int(os.getenv("WEEKLY_RELIABLE_MIN_PICKS", "5"))
 
-MARKETS = (
+GOAL_MARKETS = (
     ("over_2_5", "p_over_2_5", "2.5 ÜST", "2.5 ALT"),
     ("btts", "p_btts", "KG VAR", "KG YOK"),
+)
+
+# Backward-compatible descriptor for callers that inspect the legacy fixed market set.
+# Fresh-preview construction itself uses GOAL_MARKETS plus all dynamic corner lines below.
+MARKETS = GOAL_MARKETS + (
     ("corners_over_8_5", "p_corners_over_8_5", "8.5 KORNER ÜST", "8.5 KORNER ALT"),
 )
+
+
+def _fixture_market_specs(pred: Any, advanced: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return every market candidate evaluated by fresh preview for one fixture.
+
+    Goal/BTTS probabilities may come from the guarded goal challenger. Every corner
+    line deliberately remains tied to the same frozen V1 total-corner Poisson lambda.
+    """
+    specs: List[Dict[str, Any]] = []
+    for market, attr, yes_selection, no_selection in GOAL_MARKETS:
+        specs.append({
+            "market": market,
+            "p_yes": float(advanced.get(attr, getattr(pred, attr))),
+            "yes_selection": yes_selection,
+            "no_selection": no_selection,
+            "corner_line": None,
+            "confidence_semantics": None,
+        })
+    for spec in corner_market_specs(pred.lambda_total_corners):
+        specs.append({
+            "market": str(spec["market"]),
+            "p_yes": float(spec["p_yes"]),
+            "yes_selection": str(spec["yes_selection"]),
+            "no_selection": str(spec["no_selection"]),
+            "corner_line": float(spec["line"]),
+            "confidence_semantics": "selected_side_raw_v1_probability_from_same_frozen_corner_lambda",
+        })
+    return specs
 
 
 def _selected_market_probability(ref: Optional[Dict[str, Any]], selected_yes: bool) -> Optional[float]:
@@ -67,12 +101,12 @@ def _selected_market_probability(ref: Optional[Dict[str, Any]], selected_yes: bo
 def _public(row: Dict[str, Any]) -> Dict[str, Any]:
     ref = row.get("international") or {}
     goal_mode = row.get("goal_model_mode", ADVANCED_V1_MODE)
-    semantics = (
+    semantics = row.get("confidence_semantics") or (
         "selected_side_raw_v1_probability_estimate_not_perfectly_calibrated"
         if goal_mode == ADVANCED_V1_MODE
         else "selected_side_guarded_advanced_goal_probability_estimate_not_perfectly_calibrated"
     )
-    return {
+    out = {
         "event_id": row["event_id"],
         "match_date": row["match_date"],
         "league": row["league"],
@@ -101,6 +135,9 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
         "market_check": row["market_check"],
         "early_context": row["early_context"],
     }
+    if row.get("corner_line") is not None:
+        out["corner_line"] = float(row["corner_line"])
+    return out
 
 
 def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, limit: int = LIST_LIMIT) -> Dict[str, Any]:
@@ -128,6 +165,8 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
         histories: Dict[str, List[Dict[str, Any]]] = {}
         rows: List[Dict[str, Any]] = []
         excluded: Dict[str, int] = defaultdict(int)
+        offered_corner_markets: Dict[str, int] = defaultdict(int)
+        corner_candidate_rows = 0
 
         for eid, match_date, league, home, away in fixtures:
             league_s = str(league)
@@ -188,15 +227,19 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                 "lineup_v2_factor": lineup_factor,
             })
 
-            for market, attr, yes_selection, no_selection in MARKETS:
-                p_yes = float(advanced.get(attr, getattr(pred, attr)))
+            for spec in _fixture_market_specs(pred, advanced):
+                market = str(spec["market"])
+                p_yes = float(spec["p_yes"])
                 selected_yes = p_yes >= 0.5
                 confidence = p_yes if selected_yes else 1.0 - p_yes
-                selection = yes_selection if selected_yes else no_selection
+                selection = spec["yes_selection"] if selected_yes else spec["no_selection"]
+                is_corner = spec.get("corner_line") is not None
                 price = _price_payload(conn, str(eid), market, selection)
                 if not price:
-                    excluded["selected_side_not_priced"] += 1
+                    excluded["selected_corner_line_not_priced" if is_corner else "selected_side_not_priced"] += 1
                     continue
+                if is_corner:
+                    offered_corner_markets[market] += 1
 
                 ref = latest_ref(conn, str(eid), market)
                 ref_selected = _selected_market_probability(ref, selected_yes)
@@ -215,7 +258,11 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                     "lineup_v2_factor": lineup_factor,
                     "price": price, "international": ref, "international_selected_probability": ref_selected,
                     "market_check": market_check, "early_context": gate_diag,
+                    "corner_line": spec.get("corner_line"),
+                    "confidence_semantics": spec.get("confidence_semantics"),
                 })
+                if is_corner:
+                    corner_candidate_rows += 1
 
         one_per_fixture = _one_per_fixture(rows, lambda r: (float(r["ranking_score"]), float(r["confidence"]), r["market_check"] == "aligned"))
         one_per_fixture.sort(key=lambda r: (float(r["ranking_score"]), float(r["confidence"]), r["market_check"] == "aligned"), reverse=True)
@@ -230,13 +277,24 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
             "picks": picks, "strict_high_confidence": strict_high,
             "strict_high_confidence_count": len(strict_high), "ranked_pick_count": len(picks),
             "excluded_counts": dict(excluded),
+            "multiline_corner_diagnostics": {
+                "evaluated_lines": list(SUPPORTED_CORNER_LINES),
+                "offered_market_counts": dict(offered_corner_markets),
+                "candidate_rows": corner_candidate_rows,
+                "corners_in_ranked_picks": sum(str(p.get("market") or "").startswith("corners_over_") for p in picks),
+                "turkey_exact_line_price_required": True,
+            },
             "policy": {
                 "list_semantics": "weekly_reliability_ranking_not_guaranteed_70pct",
                 "strict_high_confidence_min": HIGH_CONFIDENCE_MIN,
-                "ranking": "guarded_goal_probability_x_data_quality_x_operational_schedule_factor_x_guarded_lineup_v2_factor",
+                "ranking": "guarded_goal_or_frozen_multiline_corner_probability_x_data_quality_x_operational_schedule_factor_x_guarded_lineup_v2_factor",
                 "advanced_goal_policy_key": ADVANCED_GOAL_POLICY_KEY,
                 "advanced_goal_mode": advanced_goal_mode,
                 "advanced_goal_fail_closed": True,
+                "corner_lines": list(SUPPORTED_CORNER_LINES),
+                "corner_probability_source": "same_frozen_v1_lambda_total_corners_poisson_threshold",
+                "multiline_corners_in_fresh_preview": True,
+                "turkey_exact_corner_line_price_required": True,
                 "schedule_context_version": SCHEDULE_CONTEXT_VERSION,
                 "schedule_scope": "all_competitions_with_domestic_fallback",
                 "lineup_v2_policy_key": LINEUP_V2_POLICY_KEY,
