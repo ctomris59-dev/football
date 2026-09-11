@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run a one-shot current-week shadow preview with guarded 1X2 enabled.
 
-This utility deliberately does NOT touch thursday_final_decisions. It refreshes only
+This utility deliberately does NOT touch thursday_final_decisions. It can refresh
 price/reference inputs, builds the current guarded weekly list in memory, compares it
 with the already-frozen list, stores the diagnostic result in its own shadow table,
 and prints a compact log payload.
@@ -20,6 +20,7 @@ from thursday_decision_engine import weekend_bounds
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 RUN_KEY = os.getenv("SHADOW_1X2_RUN_KEY", "").strip()
+REFRESH_INPUTS = os.getenv("SHADOW_1X2_REFRESH_INPUTS", "true").strip().lower() in {"1", "true", "yes"}
 
 DDL = """
 CREATE TABLE IF NOT EXISTS shadow_1x2_preview_runs(
@@ -120,19 +121,26 @@ def run(database_url: Optional[str] = None) -> Dict[str, Any]:
         if not frozen_list:
             raise RuntimeError("Frozen decision exists but contains no weekly list")
 
-        from turkey_iddaa_odds_collector import run_import as run_turkey
-        from turkey_two_sided_odds import run_import as run_turkey_all_sides
-        turkey = _safe("turkey", lambda: run_turkey(db))
-        turkey_all = _safe("turkey_all_sides", lambda: run_turkey_all_sides(db))
+        if REFRESH_INPUTS:
+            from turkey_iddaa_odds_collector import run_import as run_turkey
+            from turkey_two_sided_odds import run_import as run_turkey_all_sides
+            turkey = _safe("turkey", lambda: run_turkey(db))
+            turkey_all = _safe("turkey_all_sides", lambda: run_turkey_all_sides(db))
 
-        # One current all-book snapshot is enough for both existing binary references
-        # and the new same-book three-way 1X2 reference. Failure is non-blocking;
-        # weekly reliability already permits missing international reference.
-        from oddspapi_allbooks_importer import run_import as run_allbooks
-        allbooks = _safe("allbooks", lambda: run_allbooks(db))
+            # One current all-book snapshot is enough for both existing binary references
+            # and the new same-book three-way 1X2 reference. Failure is non-blocking;
+            # weekly reliability already permits missing international reference.
+            from oddspapi_allbooks_importer import run_import as run_allbooks
+            allbooks = _safe("allbooks", lambda: run_allbooks(db))
 
-        from one_x_two_market_reference import build_refs as build_1x2_refs
-        refs_1x2 = _safe("one_x_two_refs", lambda: build_1x2_refs(db, start=start, end=end))
+            from one_x_two_market_reference import build_refs as build_1x2_refs
+            refs_1x2 = _safe("one_x_two_refs", lambda: build_1x2_refs(db, start=start, end=end))
+        else:
+            reused = {"status": "skipped_reuse_current_snapshots"}
+            turkey = dict(reused)
+            turkey_all = dict(reused)
+            allbooks = dict(reused)
+            refs_1x2 = dict(reused)
 
         from weekly_trusted_predictions_v2 import build as build_shadow
         shadow_result = build_shadow(db, now=now, limit=10)
@@ -163,7 +171,11 @@ def run(database_url: Optional[str] = None) -> Dict[str, Any]:
             conn.execute(DDL)
             conn.execute(
                 "UPDATE shadow_1x2_preview_runs SET finished_at=NOW(),status='success',result=%s,message=%s WHERE run_key=%s",
-                (Jsonb(result), "Shadow preview completed; frozen final was not modified.", run_key),
+                (
+                    Jsonb(result, dumps=lambda obj: json.dumps(obj, ensure_ascii=False, default=str)),
+                    "Shadow preview completed; frozen final was not modified.",
+                    run_key,
+                ),
             )
         print("SHADOW_1X2_PREVIEW_RESULT", json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":")), flush=True)
         return result
