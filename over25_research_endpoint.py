@@ -112,6 +112,21 @@ if DATABASE_URL and RUN_LINEUP_V2_AUDIT_ONCE: _ensure_lineup_v2_started()
 if DATABASE_URL and RUN_ADVANCED_GOAL_AUDIT_ONCE: _ensure_advanced_goal_started()
 
 
+@router.get("/weekly-preview")
+def weekly_preview():
+    """Fresh operational ranking from current DB state without rewriting the frozen Thursday decision."""
+    if not DATABASE_URL:
+        return {"ok": False, "status": "failed", "error": "DATABASE_URL missing"}
+    from weekly_trusted_predictions import build
+    result = build(DATABASE_URL)
+    return {
+        "ok": True,
+        "status": "fresh_non_frozen_preview",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        **result,
+    }
+
+
 @router.get(f"/__research/over25/{TOKEN}/start")
 def start_over25():
     if not DATABASE_URL: return {"ok": False, "status": "failed", "error": "DATABASE_URL missing"}
