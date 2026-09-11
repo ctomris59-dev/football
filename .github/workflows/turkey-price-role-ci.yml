@@ -1,0 +1,21 @@
+name: turkey-price-role-ci
+
+on:
+  push:
+    branches: [main, 'feature/**', 'fix/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  turkey-price-role:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+      - name: Prove Turkey/international price roles stay separated
+        run: pytest -q test_turkey_price_role_contract.py
