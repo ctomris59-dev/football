@@ -3,7 +3,8 @@
 
 Binary goal/BTTS/corner behavior remains delegated to v2. A separately validated
 1X2 probability engine may add full-time match-result candidates only when official
-Turkey prices and a fresh same-book three-way no-vig international reference exist.
+Turkey prices and a fresh same-book three-way no-vig international probability
+reference exist. International prices are never compared with Turkish prices.
 """
 from __future__ import annotations
 
@@ -23,8 +24,6 @@ from thursday_decision_engine import (
     DATABASE_URL,
     HIGH_CONFIDENCE_MIN,
     INTERNATIONAL_MAX_MODEL_DIVERGENCE,
-    INTERNATIONAL_MIN_TR_EDGE,
-    INTERNATIONAL_MIN_TR_EV,
     LIST_LIMIT,
     VALUE_MIN_CONFIDENCE,
     VALUE_MIN_EDGE,
@@ -67,8 +66,6 @@ def _public(row: Dict[str, Any], *, include_value: bool) -> Dict[str, Any]:
             "tr_implied_probability": metrics["tr_implied_probability"],
             "model_edge_vs_tr": metrics["model_edge_vs_tr"],
             "model_ev_vs_tr": metrics["model_ev_vs_tr"],
-            "international_edge_vs_tr": metrics["international_edge_vs_tr"],
-            "international_ev_vs_tr": metrics["international_ev_vs_tr"],
         })
     return item
 
@@ -159,7 +156,6 @@ def build_decision(database_url: str = DATABASE_URL, *, now: Optional[datetime] 
         r for r in rows
         if r["eligible"] and r["confidence"] >= HIGH_CONFIDENCE_MIN and r["price"] and r["international_aligned"]
     ]
-    # Only one 1X2 outcome can be the high-confidence representative for a fixture.
     x12_high_by_fixture: Dict[str, Dict[str, Any]] = {}
     for r in high_candidates:
         cur = x12_high_by_fixture.get(r["event_id"])
@@ -175,15 +171,21 @@ def build_decision(database_url: str = DATABASE_URL, *, now: Optional[datetime] 
         if (
             metrics["model_edge_vs_tr"] >= VALUE_MIN_EDGE
             and metrics["model_ev_vs_tr"] >= VALUE_MIN_EV
-            and metrics["international_edge_vs_tr"] >= INTERNATIONAL_MIN_TR_EDGE
-            and metrics["international_ev_vs_tr"] >= INTERNATIONAL_MIN_TR_EV
         ):
             value_candidates.append(r)
     x12_value_by_fixture: Dict[str, Dict[str, Any]] = {}
     for r in value_candidates:
-        key = min(float(r["metrics"]["model_ev_vs_tr"]), float(r["metrics"]["international_ev_vs_tr"]))
+        key = (
+            float(r["metrics"]["model_ev_vs_tr"]),
+            float(r["confidence"]),
+            float(r["metrics"]["model_edge_vs_tr"]),
+        )
         cur = x12_value_by_fixture.get(r["event_id"])
-        cur_key = min(float(cur["metrics"]["model_ev_vs_tr"]), float(cur["metrics"]["international_ev_vs_tr"])) if cur else None
+        cur_key = (
+            float(cur["metrics"]["model_ev_vs_tr"]),
+            float(cur["confidence"]),
+            float(cur["metrics"]["model_edge_vs_tr"]),
+        ) if cur else None
         if cur is None or key > cur_key:
             x12_value_by_fixture[r["event_id"]] = r
     x12_value = [_public(r, include_value=True) for r in x12_value_by_fixture.values()]
@@ -198,10 +200,11 @@ def build_decision(database_url: str = DATABASE_URL, *, now: Optional[datetime] 
     high.sort(key=lambda x: float(x.get("confidence") or 0.0), reverse=True)
 
     value_by_fixture: Dict[str, Dict[str, Any]] = {}
-    def value_key(item: Dict[str, Any]) -> tuple[float, float]:
+    def value_key(item: Dict[str, Any]) -> tuple[float, float, float]:
         return (
-            min(float(item.get("model_ev_vs_tr") or -9.0), float(item.get("international_ev_vs_tr") or -9.0)),
+            float(item.get("model_ev_vs_tr") or -9.0),
             float(item.get("confidence") or 0.0),
+            float(item.get("model_edge_vs_tr") or -9.0),
         )
     for item in list(base.get("high_confidence_value") or []) + x12_value:
         eid = str(item.get("event_id"))
@@ -223,12 +226,15 @@ def build_decision(database_url: str = DATABASE_URL, *, now: Optional[datetime] 
     )
     policy = dict(diagnostics.get("policy") or {})
     policy.update({
+        "international_role": "no-vig_probability_sanity_only",
+        "international_vs_turkey_price_comparison": "disabled_all_markets",
+        "value_role": "model_probability_x_turkey_executable_price_only",
         "one_x_two_policy_key": ONE_X_TWO_POLICY_KEY,
         "one_x_two_registry_mode": x12["registry_mode"],
         "one_x_two_market_active": True,
         "one_x_two_fail_closed": True,
-        "one_x_two_reference": "three_way_same_book_no_vig",
-        "one_x_two_value_thresholds": "same_as_existing_strict_value_engine",
+        "one_x_two_reference": "three_way_same_book_no_vig_probability_sanity_only",
+        "one_x_two_value_thresholds": "model_edge_and_model_ev_vs_turkey_only_after_probability_alignment",
     })
     diagnostics.update({
         "policy": policy,
