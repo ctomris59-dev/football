@@ -18,20 +18,26 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt pytest
       - name: Compile 1X2 modules
-        run: python -m py_compile one_x_two_engine.py one_x_two_audit.py one_x_two_weekly.py
+        run: python -m py_compile one_x_two_engine.py one_x_two_audit.py one_x_two_coupon_v2_audit.py one_x_two_weekly.py sitecustomize.py
       - name: Run deterministic unit tests
         run: pytest -q test_one_x_two_engine.py
       - name: Import weekly integration
         run: python -c "import one_x_two_weekly; print('one-x-two-weekly-import-ok')"
-      - name: Prove live holdout exclusion and canonical history contract
+      - name: Prove V1 and V2 holdout contracts
         run: |
           python - <<'PY'
           from pathlib import Path
-          text = Path('one_x_two_audit.py').read_text()
-          assert 'LIVE_HOLDOUT = "2627"' in text
-          assert 'tuple(TEST_SEASONS) != ("2425", "2526")' in text
-          assert 'LIVE_HOLDOUT in TEST_SEASONS' in text
-          assert 'm["home_team"] = canon(raw.get("home_team"))' in text
-          assert 'm["away_team"] = canon(raw.get("away_team"))' in text
-          print('one-x-two-holdout-and-canonical-contract-ok')
+          v1 = Path('one_x_two_audit.py').read_text()
+          assert 'LIVE_HOLDOUT = "2627"' in v1
+          assert 'tuple(TEST_SEASONS) != ("2425", "2526")' in v1
+          assert 'LIVE_HOLDOUT in TEST_SEASONS' in v1
+          assert 'm["home_team"] = canon(raw.get("home_team"))' in v1
+          assert 'm["away_team"] = canon(raw.get("away_team"))' in v1
+          v2 = Path('one_x_two_coupon_v2_audit.py').read_text()
+          assert 'DEV_SEASON = "2425"' in v2
+          assert 'FINAL_HOLDOUT_SEASON = "2526"' in v2
+          assert 'LIVE_HOLDOUT_SEASON = "2627"' in v2
+          assert 'LIVE_HOLDOUT_SEASON in TEST_SEASONS' in v2
+          assert 'selected_coupon_policy' in v2
+          print('one-x-two-v1-v2-holdout-contract-ok')
           PY
