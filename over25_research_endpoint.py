@@ -127,6 +127,67 @@ def weekly_preview():
     }
 
 
+@router.get("/fixture-context/{event_id}")
+def fixture_context(event_id: str):
+    """Price-independent current V1 + all-competition schedule/player context for one fixture."""
+    if not DATABASE_URL:
+        return {"ok": False, "status": "failed", "error": "DATABASE_URL missing"}
+    import psycopg
+    from model_engine_v1 import predict_match
+    from production_predictor import canon
+    from schedule_context import SCHEDULE_CONTEXT_VERSION, team_schedule_context
+    from thursday_decision_engine import _early_gate, _history_rows, _last_rest_days, _player_context
+
+    as_of = datetime.now(timezone.utc)
+    with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
+        fixture = conn.execute(
+            """SELECT event_id,match_date,league_name,home_team,away_team
+                 FROM espn_upcoming WHERE event_id=%s LIMIT 1""",
+            (event_id,),
+        ).fetchone()
+        if not fixture:
+            return {"ok": False, "status": "not_found", "event_id": event_id}
+        eid, match_date, league, home, away = fixture
+        history = _history_rows(conn, str(league), match_date)
+        pred = predict_match(history, canon(home), canon(away), recent_matches=18)
+        home_player_ctx = _player_context(conn, str(home))
+        away_player_ctx = _player_context(conn, str(away))
+        legacy_home_rest = _last_rest_days(history, str(home), match_date)
+        legacy_away_rest = _last_rest_days(history, str(away), match_date)
+        home_sched = team_schedule_context(conn, str(home), match_date, as_of=as_of, fallback_rest_days=legacy_home_rest)
+        away_sched = team_schedule_context(conn, str(away), match_date, as_of=as_of, fallback_rest_days=legacy_away_rest)
+        eligible, blockers, gate_diag = _early_gate(
+            pred, home_player_ctx, away_player_ctx,
+            home_sched.get("rest_days"), away_sched.get("rest_days")
+        )
+        schedule_factor = min(float(home_sched.get("rank_factor") or 0.0), float(away_sched.get("rank_factor") or 0.0))
+        return {
+            "ok": True,
+            "status": "success",
+            "event_id": str(eid),
+            "match_date": match_date,
+            "league": str(league),
+            "home": str(home),
+            "away": str(away),
+            "v1": {
+                "p_over_2_5": float(pred.p_over_2_5),
+                "p_btts": float(pred.p_btts),
+                "p_corners_over_8_5": float(pred.p_corners_over_8_5),
+            },
+            "eligible": bool(eligible),
+            "blockers": list(blockers),
+            "model_data_quality": gate_diag.get("model_data_quality"),
+            "player_coverage": gate_diag.get("player_coverage"),
+            "min_starter_continuity": gate_diag.get("min_starter_continuity"),
+            "max_known_injury_impact": gate_diag.get("max_known_injury_impact"),
+            "schedule_context_version": SCHEDULE_CONTEXT_VERSION,
+            "schedule_rank_factor": schedule_factor,
+            "home_schedule": home_sched,
+            "away_schedule": away_sched,
+            "generated_at": as_of.isoformat(),
+        }
+
+
 @router.get(f"/__research/over25/{TOKEN}/start")
 def start_over25():
     if not DATABASE_URL: return {"ok": False, "status": "failed", "error": "DATABASE_URL missing"}
