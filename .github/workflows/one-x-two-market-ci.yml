@@ -28,6 +28,7 @@ jobs:
           turkey_iddaa_odds_collector.py
           turkey_value_workflow.py
           oddspapi_allbooks_importer.py
+          shadow_1x2_preview_once.py
           thursday_opening_watch.py
           sitecustomize.py
       - name: Run deterministic integration tests
@@ -39,11 +40,15 @@ jobs:
           audit = Path('one_x_two_market_audit.py').read_text()
           weekly = Path('weekly_trusted_predictions_v2.py').read_text()
           value = Path('thursday_decision_engine_v3.py').read_text()
+          shadow = Path('shadow_1x2_preview_once.py').read_text()
           assert 'LIVE_HOLDOUT_SEASON in TEST_SEASONS' in audit
           assert 'TEST_SEASONS != ("2425", "2526")' in audit
           assert 'one-x-two-market-v1' in audit
           assert 'registry_activation_mode(conn, ONE_X_TWO_POLICY_KEY)' in weekly
           assert 'if one_x_two_mode != ONE_X_TWO_ACTIVE_MODE' in weekly
           assert 'three_way_same_book_no_vig' in value
+          assert 'frozen_final_untouched' in shadow
+          assert 'UPDATE thursday_final_decisions' not in shadow
+          assert 'INSERT INTO thursday_final_decisions' not in shadow
           print('one-x-two-market-contract-ok')
           PY

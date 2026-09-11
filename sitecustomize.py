@@ -1,9 +1,9 @@
-"""Optional process-start hooks for one-shot 1X2 historical audits.
+"""Optional process-start hooks for one-shot football audits and shadow previews.
 
 Normal production is inert: all flags default false. Render build interpreters may
 import sitecustomize before dependencies exist; those invocations fail closed. At
-runtime, explicitly enabled audits start in background threads so web-service port
-binding is never delayed while holdout-safe research runs.
+runtime, explicitly enabled jobs start in background threads so web-service port
+binding is never delayed while holdout-safe research or shadow diagnostics run.
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import threading
 _V1_ENABLED = os.getenv("RUN_ONE_X_TWO_AUDIT_ONCE", "false").lower() in {"1", "true", "yes"}
 _V2_ENABLED = os.getenv("RUN_ONE_X_TWO_V2_AUDIT_ONCE", "false").lower() in {"1", "true", "yes"}
 _MARKET_ENABLED = os.getenv("RUN_ONE_X_TWO_MARKET_AUDIT_ONCE", "false").lower() in {"1", "true", "yes"}
+_SHADOW_1X2_ENABLED = os.getenv("RUN_SHADOW_1X2_PREVIEW_ONCE", "false").lower() in {"1", "true", "yes"}
 _DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 _log = logging.getLogger("one-x-two-site-hook")
 
@@ -66,15 +67,33 @@ def _run_market() -> None:
         _log.exception("ONE_X_TWO_MARKET_AUDIT_ONCE_FAILED")
 
 
+def _run_shadow_1x2() -> None:
+    try:
+        from shadow_1x2_preview_once import run
+        result = run(_DATABASE_URL)
+        comparison = result.get("comparison") or {}
+        _log.warning(
+            "SHADOW_1X2_PREVIEW_ONCE_COMPLETED week=%s one_x_two=%s changed=%s entered=%s exited=%s frozen_untouched=%s",
+            result.get("week_key"), result.get("one_x_two_in_shadow_top10"),
+            len(comparison.get("changed_same_fixture") or []),
+            len(comparison.get("entered") or []), len(comparison.get("exited") or []),
+            result.get("frozen_final_untouched"),
+        )
+    except Exception:
+        _log.exception("SHADOW_1X2_PREVIEW_ONCE_FAILED")
+
+
 def _start(name: str, fn) -> None:
     _log.warning("%s_STARTED", name)
     threading.Thread(target=fn, name=name.lower().replace("_", "-"), daemon=True).start()
 
 
-if _DATABASE_URL and (_V1_ENABLED or _V2_ENABLED or _MARKET_ENABLED) and _runtime_dependencies_ready():
+if _DATABASE_URL and (_V1_ENABLED or _V2_ENABLED or _MARKET_ENABLED or _SHADOW_1X2_ENABLED) and _runtime_dependencies_ready():
     if _V1_ENABLED:
         _start("ONE_X_TWO_AUDIT_ONCE", _run_v1)
     if _V2_ENABLED:
         _start("ONE_X_TWO_V2_AUDIT_ONCE", _run_v2)
     if _MARKET_ENABLED:
         _start("ONE_X_TWO_MARKET_AUDIT_ONCE", _run_market)
+    if _SHADOW_1X2_ENABLED:
+        _start("SHADOW_1X2_PREVIEW_ONCE", _run_shadow_1x2)
