@@ -2,15 +2,17 @@
 """Playable-market aware Thursday decision engine.
 
 This is deliberately a thin production policy layer over the validated V1 model.
-It does NOT change model probabilities. The only behavior change is that a model
-candidate for a market which official Turkish İddaa does not actually price is
-classified as non-executable, rather than being counted as missing bulletin coverage.
+It does NOT change model probabilities. A candidate for a market which official
+Turkish İddaa does not actually price is classified as non-executable.
 
-Final selections still require:
+Final selections require:
 - the existing V1 eligibility gates;
 - an executable official Turkish price;
-- a fresh international paired same-book no-vig reference;
-- the existing model/market alignment and value thresholds.
+- a fresh international paired same-book no-vig probability reference;
+- model/international probability alignment;
+- for value, model edge and EV calculated only from the executable Turkey price.
+
+Raw international prices are never compared with Turkish prices.
 """
 from __future__ import annotations
 
@@ -29,8 +31,6 @@ from thursday_decision_engine import (
     VALUE_MIN_CONFIDENCE,
     VALUE_MIN_EDGE,
     VALUE_MIN_EV,
-    INTERNATIONAL_MIN_TR_EDGE,
-    INTERNATIONAL_MIN_TR_EV,
     CANDIDATE_COVERAGE_MIN,
     NO_CANDIDATE_BULLETIN_COVERAGE_MIN,
     LIST_LIMIT,
@@ -64,7 +64,7 @@ def playable_decision_ready(
     playable_candidate_count: int,
     international_candidate_coverage: float,
 ) -> bool:
-    """Readiness based on executable markets, not unavailable market slots."""
+    """Readiness based on executable markets and probability-reference coverage."""
     if float(official_fixture_coverage or 0.0) < PLAYABLE_BULLETIN_COVERAGE_MIN:
         return False
     if int(playable_candidate_count or 0) <= 0:
@@ -188,9 +188,7 @@ def build_decision(
                 if r["eligible"] and r["confidence"] >= VALUE_MIN_CONFIDENCE
             ]
             playable_candidate_rows = [r for r in candidate_rows if r["price"]]
-            intl_candidate_rows = [
-                r for r in playable_candidate_rows if r["international"]
-            ]
+            intl_candidate_rows = [r for r in playable_candidate_rows if r["international"]]
             aligned_candidate_rows = [
                 r for r in intl_candidate_rows if r["international_aligned"]
             ]
@@ -202,21 +200,13 @@ def build_decision(
             ]
             priced_high = [r for r in raw_high if r["price"]]
             verified_high = [
-                r
-                for r in priced_high
-                if r["international"] and r["international_aligned"]
+                r for r in priced_high if r["international"] and r["international_aligned"]
             ]
 
             raw_high_fixtures = _one_per_fixture(raw_high, lambda r: (r["confidence"],))
-            priced_high_fixtures = _one_per_fixture(
-                priced_high, lambda r: (r["confidence"],)
-            )
-            verified_high_fixtures = _one_per_fixture(
-                verified_high, lambda r: (r["confidence"],)
-            )
-            verified_high_fixtures.sort(
-                key=lambda r: r["confidence"], reverse=True
-            )
+            priced_high_fixtures = _one_per_fixture(priced_high, lambda r: (r["confidence"],))
+            verified_high_fixtures = _one_per_fixture(verified_high, lambda r: (r["confidence"],))
+            verified_high_fixtures.sort(key=lambda r: r["confidence"], reverse=True)
             high_list = [
                 _public_item(r, include_value=False)
                 for r in verified_high_fixtures[:limit]
@@ -230,61 +220,46 @@ def build_decision(
                 if (
                     metrics["model_edge_vs_tr"] >= VALUE_MIN_EDGE
                     and metrics["model_ev_vs_tr"] >= VALUE_MIN_EV
-                    and metrics["international_edge_vs_tr"] >= INTERNATIONAL_MIN_TR_EDGE
-                    and metrics["international_ev_vs_tr"] >= INTERNATIONAL_MIN_TR_EV
                 ):
                     value_candidates.append(r)
 
             value_rows = _one_per_fixture(
                 value_candidates,
                 lambda r: (
-                    min(
-                        r["metrics"]["model_ev_vs_tr"],
-                        r["metrics"]["international_ev_vs_tr"],
-                    ),
+                    r["metrics"]["model_ev_vs_tr"],
                     r["confidence"],
                     r["metrics"]["model_edge_vs_tr"],
                 ),
             )
             value_rows.sort(
                 key=lambda r: (
-                    min(
-                        r["metrics"]["model_ev_vs_tr"],
-                        r["metrics"]["international_ev_vs_tr"],
-                    ),
+                    r["metrics"]["model_ev_vs_tr"],
                     r["confidence"],
+                    r["metrics"]["model_edge_vs_tr"],
                 ),
                 reverse=True,
             )
-            value_list = [
-                _public_item(r, include_value=True) for r in value_rows[:limit]
-            ]
+            value_list = [_public_item(r, include_value=True) for r in value_rows[:limit]]
 
             high_keys = {(x["event_id"], x["market"]) for x in high_list}
             value_keys = {(x["event_id"], x["market"]) for x in value_list}
             for item in high_list:
                 item["also_value"] = (item["event_id"], item["market"]) in value_keys
             for item in value_list:
-                item["also_high_confidence"] = (
-                    item["event_id"], item["market"]
-                ) in high_keys
+                item["also_high_confidence"] = (item["event_id"], item["market"]) in high_keys
 
             coverage = _latest_import_coverage(conn, len(fixtures))
             official_coverage = float(coverage.get("fixture_coverage") or 0.0)
             legacy_tr_candidate_coverage = (
-                len(playable_candidate_rows) / len(candidate_rows)
-                if candidate_rows
-                else 0.0
+                len(playable_candidate_rows) / len(candidate_rows) if candidate_rows else 0.0
             )
             international_candidate_coverage = (
                 len(intl_candidate_rows) / len(playable_candidate_rows)
-                if playable_candidate_rows
-                else 0.0
+                if playable_candidate_rows else 0.0
             )
             aligned_candidate_coverage = (
                 len(aligned_candidate_rows) / len(playable_candidate_rows)
-                if playable_candidate_rows
-                else 0.0
+                if playable_candidate_rows else 0.0
             )
 
             decision_ready = playable_decision_ready(
@@ -304,19 +279,11 @@ def build_decision(
             }
             candidate_preview = [
                 _preview(r)
-                for r in sorted(
-                    candidate_rows,
-                    key=lambda x: x["confidence"],
-                    reverse=True,
-                )
+                for r in sorted(candidate_rows, key=lambda x: x["confidence"], reverse=True)
             ]
             raw_high_preview = [
                 _preview(r)
-                for r in sorted(
-                    raw_high_fixtures,
-                    key=lambda x: x["confidence"],
-                    reverse=True,
-                )
+                for r in sorted(raw_high_fixtures, key=lambda x: x["confidence"], reverse=True)
             ]
 
             diagnostics = {
@@ -326,15 +293,15 @@ def build_decision(
                     "value_min_confidence": VALUE_MIN_CONFIDENCE,
                     "model_edge_vs_tr_min": VALUE_MIN_EDGE,
                     "model_ev_vs_tr_min": VALUE_MIN_EV,
-                    "international_edge_vs_tr_min": INTERNATIONAL_MIN_TR_EDGE,
-                    "international_ev_vs_tr_min": INTERNATIONAL_MIN_TR_EV,
                     "candidate_coverage_min": CANDIDATE_COVERAGE_MIN,
                     "playable_bulletin_coverage_min": PLAYABLE_BULLETIN_COVERAGE_MIN,
                     "legacy_no_candidate_bulletin_coverage_min": NO_CANDIDATE_BULLETIN_COVERAGE_MIN,
                     "candidate_universe": "official_turkey_priced_markets_only",
                     "model_source": "validated_v1_probability_estimate",
-                    "model_probability_semantics": "not_assumed_perfectly_calibrated; international market remains mandatory sanity filter",
-                    "international_role": "paired_same-book_no-vig_reference",
+                    "model_probability_semantics": "not_assumed_perfectly_calibrated; international market remains mandatory probability sanity filter",
+                    "international_role": "paired_same-book_no-vig_probability_sanity_only",
+                    "international_vs_turkey_price_comparison": "disabled_all_markets",
+                    "value_role": "model_probability_x_turkey_executable_price_only",
                     "executable_price_source": "iddaa_official_turkey",
                     "confirmed_lineup_required": False,
                     "t_minus_reselection": False,
@@ -411,7 +378,7 @@ def build_decision(
                     Jsonb(high_list, dumps=lambda x: json.dumps(x, default=json_default, ensure_ascii=False)),
                     Jsonb(value_list, dumps=lambda x: json.dumps(x, default=json_default, ensure_ascii=False)),
                     Jsonb(diagnostics, dumps=lambda x: json.dumps(x, default=json_default, ensure_ascii=False)),
-                    "playable-market-v2: model+international no-vig+Turkey executable price",
+                    "playable-market-v2: model+international probability sanity+Turkey executable EV",
                     run_id,
                 ),
             )

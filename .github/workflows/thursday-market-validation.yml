@@ -18,10 +18,11 @@ jobs:
         run: pip install -r requirements.txt
       - name: Compile final Thursday modules
         run: |
-          python -m py_compile export_app.py market_consensus_builder.py international_market_reference.py thursday_decision_engine.py thursday_decision_engine_v2.py thursday_opening_watch.py thursday_schedule_tick.py live_refresh.py turkey_value_workflow.py turkey_two_sided_odds.py weekly_trusted_predictions.py thursday_page.py
+          python -m py_compile export_app.py market_consensus_builder.py international_market_reference.py thursday_decision_engine.py thursday_decision_engine_v2.py thursday_decision_engine_v3.py thursday_opening_watch.py thursday_schedule_tick.py live_refresh.py turkey_value_workflow.py turkey_two_sided_odds.py weekly_trusted_predictions.py weekly_trusted_predictions_v2.py thursday_page.py
       - name: Validate no-vig, Turkey-value and weekly-reliability separation
         run: |
           python - <<'PY'
+          from pathlib import Path
           from market_consensus_builder import no_vig, no_vig_pair
           from international_market_reference import reference_quality
           from thursday_decision_engine import market_metrics
@@ -44,15 +45,33 @@ jobs:
           m = market_metrics(.72, 1.55, .69)
           assert abs(m['tr_implied_probability'] - 1/1.55) < 1e-12
           assert m['model_ev_vs_tr'] > .11
-          assert m['international_ev_vs_tr'] > .06
+          assert abs(m['model_market_gap'] - .03) < 1e-12
+          assert 'international_ev_vs_tr' not in m
+          assert 'international_edge_vs_tr' not in m
+
+          # Changing the foreign fair probability must never change Turkey-value math.
+          m2 = market_metrics(.72, 1.55, .40)
+          assert m2['model_ev_vs_tr'] == m['model_ev_vs_tr']
+          assert m2['model_edge_vs_tr'] == m['model_edge_vs_tr']
+
+          forbidden = (
+              'international_edge_vs_tr', 'international_ev_vs_tr',
+              'INTERNATIONAL_MIN_TR_EDGE', 'INTERNATIONAL_MIN_TR_EV',
+          )
+          for name in (
+              'thursday_decision_engine.py', 'thursday_decision_engine_v2.py',
+              'thursday_decision_engine_v3.py', 'weekly_trusted_predictions.py',
+              'weekly_trusted_predictions_v2.py',
+          ):
+              src = Path(name).read_text(encoding='utf-8')
+              for token in forbidden:
+                  assert token not in src, (name, token)
 
           assert not playable_decision_ready(.89, 0, 0.0)
           assert playable_decision_ready(.95, 0, 0.0)
           assert not playable_decision_ready(.95, 1, 0.0)
           assert playable_decision_ready(.95, 1, .80)
 
-          # Both executable sides are classified; this broadens selection only,
-          # not the model or the strict value gate.
           assert _side('over_2_5', 'Üst') == 'yes'
           assert _side('over_2_5', 'Alt') == 'no'
           assert _side('btts', 'Var') == 'yes'
@@ -68,9 +87,6 @@ jobs:
           })
           assert low['strict_high_confidence'] is False
           assert low['confidence_tier'] == 'Haftanın En Güvenilirleri'
-          high = dict(low)
-          high['confidence'] = .71
-          # _public takes internal rows; verify strict label using a fresh internal row.
           high_item = _public({
               'event_id':'y','match_date':None,'league':'L','home':'C','away':'D',
               'market':'btts','selection':'KG VAR','confidence':.71,

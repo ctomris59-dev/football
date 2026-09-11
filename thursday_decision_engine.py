@@ -6,9 +6,10 @@ User workflow: Thursday -> two frozen lists -> place bets -> done.
 Roles are deliberately separated:
 - validated V1 model = historical probability/ranking estimate; it is NOT assumed to
   be perfectly calibrated in every league/market/confidence band;
-- international paired same-book no-vig market = sanity/fair-value reference;
+- international paired same-book no-vig market = probability sanity/reference only;
+  it is never compared with the Turkish payout/price;
 - official Turkish İddaa price = the only executable price and the only price used for
-  the user's model EV.
+  the user's value/EV calculation.
 
 No T-1/T-3/confirmed-lineup re-selection exists in this decision path.
 """
@@ -37,8 +38,6 @@ HIGH_CONFIDENCE_MIN = float(os.getenv("HIGH_CONFIDENCE_MIN", "0.70"))
 VALUE_MIN_CONFIDENCE = float(os.getenv("VALUE_MIN_CONFIDENCE", "0.65"))
 VALUE_MIN_EDGE = float(os.getenv("VALUE_MIN_EDGE", "0.015"))
 VALUE_MIN_EV = float(os.getenv("VALUE_MIN_EV", "0.02"))
-INTERNATIONAL_MIN_TR_EDGE = float(os.getenv("INTERNATIONAL_MIN_TR_EDGE", "0.01"))
-INTERNATIONAL_MIN_TR_EV = float(os.getenv("INTERNATIONAL_MIN_TR_EV", "0.01"))
 INTERNATIONAL_MAX_MODEL_DIVERGENCE = float(os.getenv("INTERNATIONAL_MAX_MODEL_DIVERGENCE", "0.12"))
 MIN_MODEL_DATA_QUALITY = float(os.getenv("THURSDAY_MIN_MODEL_DATA_QUALITY", "0.80"))
 MIN_PLAYER_COVERAGE = float(os.getenv("THURSDAY_MIN_PLAYER_COVERAGE", "0.70"))
@@ -103,14 +102,17 @@ def weekend_bounds(now: Optional[datetime] = None) -> Tuple[date, datetime, date
 
 
 def market_metrics(model_p: float, tr_price: float, international_p: float) -> Dict[str, float]:
+    """Value uses only model probability and the executable Turkey price.
+
+    The international probability is used only for model-vs-market sanity context;
+    it is never converted into EV/edge against the Turkish price.
+    """
     model_p, tr_price, international_p = float(model_p), float(tr_price), float(international_p)
     tr_implied = 1.0 / tr_price
     return {
         "tr_implied_probability": tr_implied,
         "model_edge_vs_tr": model_p - tr_implied,
         "model_ev_vs_tr": model_p * tr_price - 1.0,
-        "international_edge_vs_tr": international_p - tr_implied,
-        "international_ev_vs_tr": international_p * tr_price - 1.0,
         "model_market_gap": model_p - international_p,
     }
 
@@ -267,9 +269,6 @@ def _public_item(row: Dict[str, Any], *, include_value: bool) -> Dict[str, Any]:
     item = {
         "event_id": row["event_id"], "match_date": row["match_date"], "league": row["league"],
         "home": row["home"], "away": row["away"], "market": row["market"], "selection": row["selection"],
-        # Backward-compatible field plus explicit semantic name. Audit evidence shows
-        # raw V1 is not perfectly calibrated, so callers should describe this as a
-        # model estimate rather than guaranteed real-world probability.
         "confidence": model_p,
         "model_probability_estimate": model_p,
         "confidence_semantics": "raw_v1_probability_estimate_not_perfectly_calibrated",
@@ -292,8 +291,6 @@ def _public_item(row: Dict[str, Any], *, include_value: bool) -> Dict[str, Any]:
             "tr_implied_probability": metrics["tr_implied_probability"],
             "model_edge_vs_tr": metrics["model_edge_vs_tr"],
             "model_ev_vs_tr": metrics["model_ev_vs_tr"],
-            "international_edge_vs_tr": metrics["international_edge_vs_tr"],
-            "international_ev_vs_tr": metrics["international_ev_vs_tr"],
         })
     return item
 
@@ -376,22 +373,21 @@ def build_decision(database_url: str = DATABASE_URL, *, now: Optional[datetime] 
                 if (
                     metrics["model_edge_vs_tr"] >= VALUE_MIN_EDGE
                     and metrics["model_ev_vs_tr"] >= VALUE_MIN_EV
-                    and metrics["international_edge_vs_tr"] >= INTERNATIONAL_MIN_TR_EDGE
-                    and metrics["international_ev_vs_tr"] >= INTERNATIONAL_MIN_TR_EV
                 ):
                     value_candidates.append(r)
             value_rows = _one_per_fixture(
                 value_candidates,
                 lambda r: (
-                    min(r["metrics"]["model_ev_vs_tr"], r["metrics"]["international_ev_vs_tr"]),
+                    r["metrics"]["model_ev_vs_tr"],
                     r["confidence"],
                     r["metrics"]["model_edge_vs_tr"],
                 ),
             )
             value_rows.sort(
                 key=lambda r: (
-                    min(r["metrics"]["model_ev_vs_tr"], r["metrics"]["international_ev_vs_tr"]),
+                    r["metrics"]["model_ev_vs_tr"],
                     r["confidence"],
+                    r["metrics"]["model_edge_vs_tr"],
                 ),
                 reverse=True,
             )
@@ -430,8 +426,6 @@ def build_decision(database_url: str = DATABASE_URL, *, now: Optional[datetime] 
                     "value_min_confidence": VALUE_MIN_CONFIDENCE,
                     "model_edge_vs_tr_min": VALUE_MIN_EDGE,
                     "model_ev_vs_tr_min": VALUE_MIN_EV,
-                    "international_edge_vs_tr_min": INTERNATIONAL_MIN_TR_EDGE,
-                    "international_ev_vs_tr_min": INTERNATIONAL_MIN_TR_EV,
                     "max_model_market_divergence": INTERNATIONAL_MAX_MODEL_DIVERGENCE,
                     "min_model_data_quality": MIN_MODEL_DATA_QUALITY,
                     "min_player_coverage": MIN_PLAYER_COVERAGE,
@@ -441,8 +435,10 @@ def build_decision(database_url: str = DATABASE_URL, *, now: Optional[datetime] 
                     "candidate_coverage_min": CANDIDATE_COVERAGE_MIN,
                     "no_candidate_bulletin_coverage_min": NO_CANDIDATE_BULLETIN_COVERAGE_MIN,
                     "model_source": "validated_v1_probability_estimate",
-                    "model_probability_semantics": "not_assumed_perfectly_calibrated; international market remains mandatory sanity filter",
-                    "international_role": "paired_same-book_no-vig_reference",
+                    "model_probability_semantics": "not_assumed_perfectly_calibrated; international market remains mandatory probability sanity filter",
+                    "international_role": "paired_same-book_no-vig_probability_sanity_only",
+                    "international_vs_turkey_price_comparison": "disabled_all_markets",
+                    "value_role": "model_probability_x_turkey_executable_price_only",
                     "executable_price_source": "iddaa_official_turkey",
                     "confirmed_lineup_required": False,
                     "t_minus_reselection": False,
@@ -499,7 +495,7 @@ def build_decision(database_url: str = DATABASE_URL, *, now: Optional[datetime] 
                     Jsonb(high_list, dumps=lambda x: json.dumps(x, default=json_default, ensure_ascii=False)),
                     Jsonb(value_list, dumps=lambda x: json.dumps(x, default=json_default, ensure_ascii=False)),
                     Jsonb(diagnostics, dumps=lambda x: json.dumps(x, default=json_default, ensure_ascii=False)),
-                    "model estimate+international no-vig reference+Turkey executable price",
+                    "model probability+international no-vig sanity only+Turkey executable EV",
                     run_id,
                 ),
             )
