@@ -6,7 +6,10 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch live weekly preview
+      - name: Fetch live fixture contexts
         run: |
           set -euo pipefail
-          curl --fail --silent --show-error --max-time 120 https://football-dataset-export.onrender.com/weekly-preview | python -m json.tool
+          echo '=== MANCHESTER UNITED - MANCHESTER CITY ==='
+          curl --fail --silent --show-error --max-time 120 https://football-dataset-export.onrender.com/fixture-context/401879278 | python -m json.tool
+          echo '=== COMO - PARMA ==='
+          curl --fail --silent --show-error --max-time 120 https://football-dataset-export.onrender.com/fixture-context/401874933 | python -m json.tool
