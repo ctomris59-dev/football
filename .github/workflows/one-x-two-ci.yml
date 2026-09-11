@@ -1,0 +1,33 @@
+name: one-x-two-ci
+
+on:
+  push:
+    branches: [main, 'feature/**', 'research/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  one-x-two:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+      - name: Compile 1X2 modules
+        run: python -m py_compile one_x_two_engine.py one_x_two_audit.py
+      - name: Run deterministic unit tests
+        run: pytest -q test_one_x_two_engine.py
+      - name: Prove live holdout exclusion
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('one_x_two_audit.py').read_text()
+          assert 'LIVE_HOLDOUT = "2627"' in text
+          assert 'tuple(TEST_SEASONS) != ("2425", "2526")' in text
+          assert 'LIVE_HOLDOUT in TEST_SEASONS' in text
+          print('one-x-two-holdout-contract-ok')
+          PY
