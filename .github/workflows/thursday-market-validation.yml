@@ -15,10 +15,10 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt pytest
       - name: Compile final Thursday modules
         run: |
-          python -m py_compile export_app.py market_consensus_builder.py international_market_reference.py thursday_decision_engine.py thursday_decision_engine_v2.py thursday_decision_engine_v3.py thursday_opening_watch.py thursday_schedule_tick.py live_refresh.py turkey_value_workflow.py turkey_two_sided_odds.py weekly_trusted_predictions.py weekly_trusted_predictions_v2.py thursday_page.py
+          python -m py_compile export_app.py market_consensus_builder.py international_market_reference.py thursday_decision_engine.py thursday_decision_engine_v2.py thursday_decision_engine_v3.py thursday_opening_watch.py thursday_schedule_tick.py live_refresh.py turkey_value_workflow.py turkey_two_sided_odds.py weekly_trusted_predictions.py weekly_trusted_predictions_v2.py thursday_page.py test_ranked_list_policy.py
       - name: Validate no-vig, Turkey-value and weekly-reliability separation
         run: |
           python - <<'PY'
@@ -98,6 +98,8 @@ jobs:
           assert high_item['confidence_tier'] == 'Yüksek Güven'
           print('thursday-market-validation-ok')
           PY
+      - name: Validate Core4/Strong/Other tiers and value-badge-only policy
+        run: pytest -q test_ranked_list_policy.py
       - name: Validate Thursday scheduler window, weekly horizon and auth
         run: |
           python - <<'PY'
