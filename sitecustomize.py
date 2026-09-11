@@ -1,26 +1,31 @@
 """Optional process-start hooks for one-shot 1X2 historical audits.
 
-Normal production is inert: both flags default false. Hooks are only used to run
-holdout-safe research on the existing free Render service without creating a new
-resource.
+Normal production is inert: both flags default false. During Render builds Python
+may import sitecustomize before project dependencies are installed. In that phase
+we fail closed and do nothing. When the actual runtime interpreter starts and the
+database driver is available, an explicitly enabled audit runs synchronously so a
+result is written before the service is considered ready.
 """
 from __future__ import annotations
 
 import logging
 import os
-import threading
 
 _V1_ENABLED = os.getenv("RUN_ONE_X_TWO_AUDIT_ONCE", "false").lower() in {"1", "true", "yes"}
 _V2_ENABLED = os.getenv("RUN_ONE_X_TWO_V2_AUDIT_ONCE", "false").lower() in {"1", "true", "yes"}
 _DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 _log = logging.getLogger("one-x-two-site-hook")
-_v1_lock = threading.Lock()
-_v2_lock = threading.Lock()
+
+
+def _runtime_dependencies_ready() -> bool:
+    try:
+        import psycopg  # noqa: F401
+    except ModuleNotFoundError:
+        return False
+    return True
 
 
 def _run_v1() -> None:
-    if not _v1_lock.acquire(blocking=False):
-        return
     try:
         from one_x_two_audit import run_audit
         result = run_audit(_DATABASE_URL)
@@ -31,13 +36,9 @@ def _run_v1() -> None:
         )
     except Exception:
         _log.exception("ONE_X_TWO_AUDIT_ONCE_FAILED")
-    finally:
-        _v1_lock.release()
 
 
 def _run_v2() -> None:
-    if not _v2_lock.acquire(blocking=False):
-        return
     try:
         from one_x_two_coupon_v2_audit import run_v2_audit
         result = run_v2_audit(_DATABASE_URL)
@@ -49,11 +50,10 @@ def _run_v2() -> None:
         )
     except Exception:
         _log.exception("ONE_X_TWO_V2_AUDIT_ONCE_FAILED")
-    finally:
-        _v2_lock.release()
 
 
-if _DATABASE_URL and _V1_ENABLED:
-    threading.Thread(target=_run_v1, name="one-x-two-audit-once-site", daemon=True).start()
-if _DATABASE_URL and _V2_ENABLED:
-    threading.Thread(target=_run_v2, name="one-x-two-v2-audit-once-site", daemon=True).start()
+if _DATABASE_URL and (_V1_ENABLED or _V2_ENABLED) and _runtime_dependencies_ready():
+    if _V1_ENABLED:
+        _run_v1()
+    if _V2_ENABLED:
+        _run_v2()
