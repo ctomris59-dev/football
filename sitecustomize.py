@@ -1,15 +1,15 @@
 """Optional process-start hooks for one-shot 1X2 historical audits.
 
-Normal production is inert: both flags default false. During Render builds Python
-may import sitecustomize before project dependencies are installed. In that phase
-we fail closed and do nothing. When the actual runtime interpreter starts and the
-database driver is available, an explicitly enabled audit runs synchronously so a
-result is written before the service is considered ready.
+Normal production is inert: both flags default false. Render build interpreters may
+import sitecustomize before dependencies exist; those invocations fail closed. At
+runtime, explicitly enabled audits start in background threads so web-service port
+binding is never delayed while holdout-safe research runs.
 """
 from __future__ import annotations
 
 import logging
 import os
+import threading
 
 _V1_ENABLED = os.getenv("RUN_ONE_X_TWO_AUDIT_ONCE", "false").lower() in {"1", "true", "yes"}
 _V2_ENABLED = os.getenv("RUN_ONE_X_TWO_V2_AUDIT_ONCE", "false").lower() in {"1", "true", "yes"}
@@ -52,8 +52,13 @@ def _run_v2() -> None:
         _log.exception("ONE_X_TWO_V2_AUDIT_ONCE_FAILED")
 
 
+def _start(name: str, fn) -> None:
+    _log.warning("%s_STARTED", name)
+    threading.Thread(target=fn, name=name.lower().replace("_", "-"), daemon=True).start()
+
+
 if _DATABASE_URL and (_V1_ENABLED or _V2_ENABLED) and _runtime_dependencies_ready():
     if _V1_ENABLED:
-        _run_v1()
+        _start("ONE_X_TWO_AUDIT_ONCE", _run_v1)
     if _V2_ENABLED:
-        _run_v2()
+        _start("ONE_X_TWO_V2_AUDIT_ONCE", _run_v2)
