@@ -1,4 +1,6 @@
-from weekly_trusted_predictions import _selected_market_probability, _public
+from types import SimpleNamespace
+
+from weekly_trusted_predictions import _fixture_market_specs, _selected_market_probability, _public
 from turkey_two_sided_odds import _side
 from schedule_context import schedule_rank_factor
 
@@ -44,3 +46,18 @@ def test_schedule_rank_factor_only_penalizes_short_rest():
 
 def test_pending_intervening_match_is_not_finalizable():
     assert schedule_rank_factor(4.0, pending_pre_fixture_match=True) == 0.0
+
+
+def test_fresh_preview_evaluates_all_supported_corner_lines():
+    pred = SimpleNamespace(p_over_2_5=.61, p_btts=.58, lambda_total_corners=10.0)
+    specs = _fixture_market_specs(pred, {'p_over_2_5': .61, 'p_btts': .58})
+    corner_specs = [s for s in specs if s['corner_line'] is not None]
+    assert [s['market'] for s in corner_specs] == [
+        'corners_over_7_5',
+        'corners_over_8_5',
+        'corners_over_9_5',
+        'corners_over_10_5',
+    ]
+    assert [s['corner_line'] for s in corner_specs] == [7.5, 8.5, 9.5, 10.5]
+    assert all(0.0 < s['p_yes'] < 1.0 for s in corner_specs)
+    assert all(s['confidence_semantics'] == 'selected_side_raw_v1_probability_from_same_frozen_corner_lambda' for s in corner_specs)
