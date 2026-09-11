@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
-"""Thursday watcher: mandatory weekly reliability list + optional value list.
+"""Thursday watcher: one reliability-ranked Top-10 with optional value badges.
 
-The first list is always the best available V1-ranked, Turkey-playable forecast set
-once the Friday-Monday bulletin is sufficiently complete. It is not artificially
-labelled 70%+: each item carries its real V1 selected-side estimate and only >=70%
-items receive the strict High Confidence badge.
-
-The second list remains strict model + international no-vig + Turkey value. It may
-legitimately be empty. Later T-1/T-3 information does not rewrite a frozen week.
+The primary list is always the best available V1-ranked, Turkey-playable forecast set
+once the Friday-Monday bulletin is sufficiently complete. Positions 1-4 are Core 4,
+5-8 are Strong, and 9-10 are Other Reliable. Positive Turkey-executable model EV is
+metadata on the existing pick only: value never creates a second user-facing list and
+never changes the reliability order. Later T-1/T-3 information does not rewrite a
+frozen week.
 """
 from __future__ import annotations
 
 import json
 import os
 from datetime import date, datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import psycopg
@@ -36,7 +35,7 @@ CREATE TABLE IF NOT EXISTS thursday_final_decisions(
  finalized_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
  decision_run_id BIGINT NOT NULL,
  payload JSONB NOT NULL,
- source TEXT NOT NULL DEFAULT 'v1_reliability+optional_value+iddaa_official'
+ source TEXT NOT NULL DEFAULT 'v1_rank_tiers+value_badge+iddaa_official'
 );
 CREATE TABLE IF NOT EXISTS thursday_watch_checks(
  week_key DATE NOT NULL,
@@ -47,6 +46,42 @@ CREATE TABLE IF NOT EXISTS thursday_watch_checks(
  PRIMARY KEY(week_key,check_hour)
 );
 """
+
+
+def _pick_key(item: Dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(item.get("event_id") or ""),
+        str(item.get("market") or ""),
+        str(item.get("selection") or ""),
+    )
+
+
+def _rank_tier(rank: int) -> str:
+    if rank <= 4:
+        return "core4"
+    if rank <= 8:
+        return "strong"
+    return "other_reliable"
+
+
+def _decorate_ranked_picks(
+    picks: List[Dict[str, Any]], value_list: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Attach display tiers/value metadata without changing order or membership."""
+    values = {_pick_key(v): v for v in value_list}
+    decorated: List[Dict[str, Any]] = []
+    for rank, original in enumerate(picks, start=1):
+        item = dict(original)
+        value = values.get(_pick_key(original))
+        item["rank"] = rank
+        item["list_tier"] = _rank_tier(rank)
+        item["is_value"] = bool(value)
+        if value:
+            item["model_ev_vs_tr"] = value.get("model_ev_vs_tr")
+            item["model_edge_vs_tr"] = value.get("model_edge_vs_tr")
+            item["value_semantics"] = "model_probability_x_turkey_executable_price_only"
+        decorated.append(item)
+    return decorated
 
 
 def _allowed_now(now: Optional[datetime] = None) -> tuple[bool, datetime, str]:
@@ -172,6 +207,9 @@ def main(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None) ->
             if decision.get("decision_ready")
             else []
         )
+        ranked_picks = _decorate_ranked_picks(trusted.get("picks") or [], value_list)
+        strict_ranked = [p for p in ranked_picks if p.get("strict_high_confidence")]
+
         status = "ready_to_finalize" if trusted.get("ready") else "pending_bulletin"
         if turkey_ready and not trusted.get("ready"):
             status = "pending_reliable_universe"
@@ -185,11 +223,12 @@ def main(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None) ->
             "international": international,
             "international_1x2": international_1x2,
             "decision_run_id": decision.get("decision_run_id"),
-            "decision_engine": decision.get("decision_engine"),
+            "decision_engine": "weekly_reliability_rank_tiers_v2",
             "official_fixture_coverage": trusted.get("official_fixture_coverage"),
-            "weekly_reliable": trusted.get("picks") or [],
-            "strict_high_confidence": trusted.get("strict_high_confidence") or [],
-            "strict_high_confidence_count": trusted.get("strict_high_confidence_count"),
+            "weekly_reliable": ranked_picks,
+            "strict_high_confidence": strict_ranked,
+            "strict_high_confidence_count": len(strict_ranked),
+            # Legacy/debug field only. User-facing output uses badges on weekly_reliable.
             "high_confidence_value": value_list,
             "value_decision_ready": bool(decision.get("decision_ready")),
             "value_candidate_preview": decision.get("candidate_preview") or [],
@@ -200,23 +239,28 @@ def main(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None) ->
                 "week_key": week_key,
                 "finalized_at": datetime.now(timezone.utc),
                 "decision_run_id": decision.get("decision_run_id") or 0,
-                "decision_engine": "weekly_v1_reliability_plus_optional_value_v1",
+                "decision_engine": "weekly_reliability_rank_tiers_v2",
                 "official_fixture_coverage": trusted.get("official_fixture_coverage"),
-                # Backward-compatible key: the pinned page/API already reads this.
-                # Semantics are now explicit in each item's confidence_tier.
-                "high_confidence": trusted.get("picks") or [],
-                "weekly_reliable": trusted.get("picks") or [],
-                "strict_high_confidence": trusted.get("strict_high_confidence") or [],
+                # Backward-compatible key. Membership/order are identical to weekly_reliable.
+                "high_confidence": ranked_picks,
+                "weekly_reliable": ranked_picks,
+                "strict_high_confidence": strict_ranked,
+                # Retained for API compatibility/debugging; no separate user-facing list.
                 "high_confidence_value": value_list,
                 "policy": {
                     "primary_list": trusted.get("policy") or {},
-                    "value_list": (decision.get("diagnostics") or {}).get("policy") or {},
-                    "value_optional": True,
+                    "rank_tiers": {"1-4": "core4", "5-8": "strong", "9-10": "other_reliable"},
+                    "ranking_priority": "prediction_reliability_not_value",
+                    "turkey_price_affects_reliability_rank": False,
+                    "value_display": "badge_only_never_reorders_or_replaces_pick",
+                    "value_calculation": "model_probability_x_turkey_executable_price_only",
+                    "legacy_value_list_user_facing": False,
+                    "value_engine": (decision.get("diagnostics") or {}).get("policy") or {},
                 },
                 "sources": {
                     "model": "validated_v1_plus_guarded_1x2_market_when_activated",
-                    "international_primary": "binary paired no-vig plus separate three-way 1X2 no-vig; strong contradiction rejected",
-                    "international_value": "mandatory no-vig market reference",
+                    "international_primary": "no-vig probability sanity/contradiction reference only; no Turkey price comparison",
+                    "turkey_value": "model probability multiplied by Turkey executable price only",
                     "executable_price": "iddaa_official_turkey",
                 },
             }
@@ -224,7 +268,7 @@ def main(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None) ->
                 conn.execute(DDL)
                 conn.execute(
                     """INSERT INTO thursday_final_decisions(week_key,decision_run_id,payload,source)
-                       VALUES(%s,%s,%s,'v1_reliability+optional_value+iddaa_official')
+                       VALUES(%s,%s,%s,'v1_rank_tiers+value_badge+iddaa_official')
                        ON CONFLICT(week_key) DO NOTHING""",
                     (
                         week_key,
