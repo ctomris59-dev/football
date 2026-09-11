@@ -2,7 +2,7 @@ name: one-x-two-market-ci
 
 on:
   push:
-    branches: [main, 'feature/**']
+    branches: [main, 'feature/**', 'fix/**']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -43,6 +43,10 @@ jobs:
           shadow = Path('shadow_1x2_preview_once.py').read_text()
           assert 'LIVE_HOLDOUT_SEASON in TEST_SEASONS' in audit
           assert 'TEST_SEASONS != ("2425", "2526")' in audit
+          assert 'GATE_VERSION = "two-fold-week-block-v1"' in audit
+          assert '"validation_protocol": validation_protocol' in audit
+          assert '"holdout_excluded": True' in audit
+          assert '"live_holdout_season": LIVE_HOLDOUT_SEASON' in audit
           assert 'one-x-two-market-v1' in audit
           assert 'registry_activation_mode(conn, ONE_X_TWO_POLICY_KEY)' in weekly
           assert 'if one_x_two_mode != ONE_X_TWO_ACTIVE_MODE' in weekly
