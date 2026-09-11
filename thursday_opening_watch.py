@@ -129,9 +129,8 @@ def main(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None) ->
 
     try:
         turkey = run_import(database_url)
-        # Expand the same official bulletin to both sides of each target market. This
-        # does not alter value logic; it only lets the weekly V1 list choose its
-        # stronger predicted side when that side is actually executable in Turkey.
+        # Expand the same official bulletin to both sides of each binary target plus
+        # full-time 1/0/2. This changes only the executable-price layer.
         try:
             from turkey_two_sided_odds import run_import as run_two_sided
             turkey_two_sided = run_two_sided(database_url)
@@ -144,16 +143,25 @@ def main(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None) ->
         )
 
         international: Dict[str, Any]
+        international_1x2: Dict[str, Any]
         if turkey_ready:
             try:
                 from international_market_reference import refresh_and_map
                 international = refresh_and_map(database_url, start=start, end=end)
             except Exception as exc:
                 international = {"status": "failed", "error": str(exc)[:1200]}
+
+            # Uses the same already-fetched multi-bookmaker snapshot; no extra odds
+            # provider request is made here. 1X2 needs its own three-way no-vig math.
+            try:
+                from one_x_two_market_reference import build_refs as build_1x2_refs
+                international_1x2 = build_1x2_refs(database_url, start=start, end=end)
+            except Exception as exc:
+                international_1x2 = {"status": "failed_optional", "error": str(exc)[:1200]}
         else:
             international = {"status": "waiting_for_turkey_prices"}
+            international_1x2 = {"status": "waiting_for_turkey_prices"}
 
-        # Strict value engine remains untouched and is now explicitly secondary.
         decision = build_decision(database_url, now=now)
 
         from weekly_trusted_predictions import build as build_weekly_trusted
@@ -175,6 +183,7 @@ def main(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None) ->
             "turkey": turkey,
             "turkey_two_sided": turkey_two_sided,
             "international": international,
+            "international_1x2": international_1x2,
             "decision_run_id": decision.get("decision_run_id"),
             "decision_engine": decision.get("decision_engine"),
             "official_fixture_coverage": trusted.get("official_fixture_coverage"),
@@ -205,9 +214,9 @@ def main(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None) ->
                     "value_optional": True,
                 },
                 "sources": {
-                    "model": "validated_v1",
-                    "international_primary": "safety_check_when_available; strong contradiction rejected",
-                    "international_value": "mandatory paired_same-book_no-vig_consensus",
+                    "model": "validated_v1_plus_guarded_1x2_market_when_activated",
+                    "international_primary": "binary paired no-vig plus separate three-way 1X2 no-vig; strong contradiction rejected",
+                    "international_value": "mandatory no-vig market reference",
                     "executable_price": "iddaa_official_turkey",
                 },
             }
