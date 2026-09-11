@@ -127,6 +127,20 @@ def weekly_preview():
     }
 
 
+@router.get("/weekly-candidates")
+def weekly_candidates():
+    """Read-only full ranked list plus executable multiline-corner candidates."""
+    if not DATABASE_URL:
+        return {"ok": False, "status": "failed", "error": "DATABASE_URL missing"}
+    from candidate_dump import dump
+    return {
+        "ok": True,
+        "status": "success",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        **dump(DATABASE_URL),
+    }
+
+
 @router.get("/fixture-context/{event_id}")
 def fixture_context(event_id: str):
     """Price-independent current V1 + all-competition schedule/player context for one fixture."""
