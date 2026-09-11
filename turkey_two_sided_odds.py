@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Store both executable sides of the three Turkish target markets.
+"""Store all executable sides of the Turkish target markets.
 
-The original collector keeps the positive side needed by the strict value workflow.
-This companion pass expands only the executable-price layer so the weekly reliability
-list may choose the model's stronger side (Over/Under, BTTS Yes/No, Corners Over/Under)
-without changing V1 probabilities or value thresholds.
+The original collector keeps the positive side needed by the strict binary value
+workflow. This companion pass expands the executable-price layer so the weekly
+reliability list may choose Over/Under, BTTS Yes/No, Corners Over/Under and the
+three full-time match-result outcomes 1/0/2 without changing model probabilities.
 """
 from __future__ import annotations
 
@@ -25,8 +25,11 @@ from turkey_iddaa_odds_collector import (
     classify_market,
     match_fixture,
     render_market_name,
+    team_score,
 )
-from turkey_value_workflow import store_price, valid_price
+from turkey_value_workflow import store_price, valid_market_price, valid_price
+
+ALL_TARGET_MARKETS = set(TARGET_MARKETS) | {"match_result"}
 
 SELECTIONS = {
     "over_2_5": {"yes": "2.5 ÜST", "no": "2.5 ALT"},
@@ -59,6 +62,31 @@ def _prices(market_key: str, outcomes: Iterable[Dict[str, Any]]) -> Dict[str, fl
     return found
 
 
+def _result_selection(outcome_name: Any, home: str, away: str) -> Optional[str]:
+    name = _ascii(outcome_name)
+    if name in {"1", "ev sahibi", "ev sahibi kazanir", "home", "home win"}:
+        return "1"
+    if name in {"0", "x", "beraberlik", "draw", "tie"}:
+        return "0"
+    if name in {"2", "deplasman", "deplasman kazanir", "away", "away win"}:
+        return "2"
+    hs, aws = team_score(outcome_name, home), team_score(outcome_name, away)
+    if hs >= 0.72 and hs - aws >= 0.10:
+        return "1"
+    if aws >= 0.72 and aws - hs >= 0.10:
+        return "2"
+    return None
+
+
+def _result_prices(outcomes: Iterable[Dict[str, Any]], home: str, away: str) -> Dict[str, float]:
+    found: Dict[str, float] = {}
+    for outcome in outcomes or []:
+        selection = _result_selection(outcome.get("n"), home, away)
+        if selection and valid_market_price(outcome.get("odd"), "match_result"):
+            found[selection] = float(outcome["odd"])
+    return found
+
+
 def run_import(database_url: str = DATABASE_URL) -> Dict[str, Any]:
     if not database_url:
         raise RuntimeError("Missing DATABASE_URL")
@@ -68,7 +96,7 @@ def run_import(database_url: str = DATABASE_URL) -> Dict[str, Any]:
             raise RuntimeError("No current Friday-Monday ESPN fixtures available")
 
         session = requests.Session()
-        session.headers.update({"Accept": "application/json", "User-Agent": "football-weekly-reliability/1.0"})
+        session.headers.update({"Accept": "application/json", "User-Agent": "football-weekly-reliability/1.1"})
         events_payload = _get_json(session, "events?st=1&type=0&version=0")
         config_payload = _get_json(session, "get_market_config")
         events = ((events_payload.get("data") or {}).get("events") or [])
@@ -85,8 +113,19 @@ def run_import(database_url: str = DATABASE_URL) -> Dict[str, Any]:
             for market in event.get("m") or []:
                 rendered = render_market_name(market, market_config)
                 key = classify_market(rendered, market)
-                if key not in TARGET_MARKETS:
+                if key not in ALL_TARGET_MARKETS:
                     continue
+                if key == "match_result":
+                    prices = _result_prices(market.get("o") or [], fixture["home"], fixture["away"])
+                    # Require all three outcomes from the same official market before storing.
+                    if set(prices) != {"1", "0", "2"}:
+                        continue
+                    for selection, price in prices.items():
+                        counts[f"match_result:{selection}"] += 1
+                        if store_price(conn, fixture["event_id"], "match_result", selection, SOURCE, price):
+                            stored += 1
+                    continue
+
                 for side, price in _prices(key, market.get("o") or []).items():
                     selection = SELECTIONS[key][side]
                     counts[f"{key}:{side}"] += 1
@@ -100,6 +139,7 @@ def run_import(database_url: str = DATABASE_URL) -> Dict[str, Any]:
             "fixture_coverage": round(len(matched) / len(fixtures), 4) if fixtures else 0.0,
             "stored_rows": stored,
             "selection_counts": dict(counts),
+            "match_result_enabled": True,
             "horizon_start": horizon_start,
             "horizon_end": horizon_end,
         }

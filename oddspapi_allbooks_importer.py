@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Quota-efficient all-bookmaker OddsPapi snapshots for three production markets.
+"""Quota-efficient all-bookmaker OddsPapi snapshots for production markets.
 
-One odds request returns every available bookmaker. Only O/U 2.5, BTTS and
-corners O/U 8.5 are normalized, avoiding storage of unrelated markets.
+One odds request returns every available bookmaker. O/U 2.5, BTTS, corners O/U
+8.5 and three-way full-time match result are normalized, avoiding storage of
+unrelated markets.
 """
 from __future__ import annotations
 
@@ -30,9 +31,12 @@ CREATE TABLE IF NOT EXISTS oddspapi_allbooks_runs(
 """
 
 def market_kind(name: Any, handicap: Any) -> Optional[str]:
-    n=str(name or '').lower()
+    n=str(name or '').lower().strip()
+    compact=' '.join(n.split())
     try: line=float(handicap) if handicap is not None else None
     except Exception: line=None
+    if compact in {'match result','1x2','full time result','fulltime result','3 way moneyline','moneyline 3 way'}:
+        return 'match_result'
     if 'both teams to score' in n: return 'btts'
     if 'corner' in n and line is not None and abs(line-8.5)<0.01: return 'corners_over_8_5'
     if line is not None and abs(line-2.5)<0.01 and ('over under' in n or 'total' in n or 'goal' in n): return 'over_2_5'

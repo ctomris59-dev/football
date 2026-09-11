@@ -1,0 +1,49 @@
+name: one-x-two-market-ci
+
+on:
+  push:
+    branches: [main, 'feature/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  one-x-two-market:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+      - name: Compile integration modules
+        run: >-
+          python -m py_compile
+          one_x_two_market_reference.py
+          one_x_two_market_audit.py
+          weekly_trusted_predictions_v2.py
+          thursday_decision_engine_v3.py
+          turkey_two_sided_odds.py
+          turkey_iddaa_odds_collector.py
+          turkey_value_workflow.py
+          oddspapi_allbooks_importer.py
+          thursday_opening_watch.py
+          sitecustomize.py
+      - name: Run deterministic integration tests
+        run: pytest -q test_one_x_two_market_integration.py
+      - name: Prove holdout and fail-closed contracts
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          audit = Path('one_x_two_market_audit.py').read_text()
+          weekly = Path('weekly_trusted_predictions_v2.py').read_text()
+          value = Path('thursday_decision_engine_v3.py').read_text()
+          assert 'LIVE_HOLDOUT_SEASON in TEST_SEASONS' in audit
+          assert 'TEST_SEASONS != ("2425", "2526")' in audit
+          assert 'one-x-two-market-v1' in audit
+          assert 'registry_activation_mode(conn, ONE_X_TWO_POLICY_KEY)' in weekly
+          assert 'if one_x_two_mode != ONE_X_TWO_ACTIVE_MODE' in weekly
+          assert 'three_way_same_book_no_vig' in value
+          print('one-x-two-market-contract-ok')
+          PY

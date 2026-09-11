@@ -5,6 +5,9 @@ This collector is intentionally independent of the legacy production readiness g
 It matches official İddaa events directly to ESPN upcoming fixtures for Friday-Monday
 and stores only the three markets used by the Thursday decision engine:
 O2.5 goals, BTTS Yes, O8.5 corners.
+
+The shared classifier also recognizes the full-time match-result market so the
+companion all-sides collector can store 1/0/2 without broadening this legacy pass.
 """
 from __future__ import annotations
 
@@ -124,6 +127,8 @@ def classify_market(rendered_name: str, market: Dict[str, Any]) -> Optional[str]
     line = _line_value(market, rendered_name)
     if "ilk yari" in n or "first half" in n:
         return None
+    if n in {"mac sonucu", "match result", "1x2", "tam zamanli mac sonucu", "full time result", "fulltime result"}:
+        return "match_result"
     if "toplam korner sayisi" in n or "total corners" in n:
         return "corners_over_8_5" if line is not None and abs(line - 8.5) < 1e-9 else None
     if n in {"karsilikli gol", "both teams to score"}:
