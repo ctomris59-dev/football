@@ -6,8 +6,8 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch live weekly preview
+      - name: Fetch full live weekly candidates
         run: |
           set -euo pipefail
-          echo '=== MULTILINE FRESH PREVIEW VERIFY ==='
-          curl --fail --silent --show-error --max-time 120 https://football-dataset-export.onrender.com/weekly-preview | python -m json.tool
+          echo '=== FULL WEEKLY CANDIDATES ==='
+          curl --fail --silent --show-error --max-time 120 https://football-dataset-export.onrender.com/weekly-candidates | python -m json.tool
