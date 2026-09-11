@@ -18,10 +18,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt pytest
       - name: Compile 1X2 modules
-        run: python -m py_compile one_x_two_engine.py one_x_two_audit.py
+        run: python -m py_compile one_x_two_engine.py one_x_two_audit.py one_x_two_weekly.py
       - name: Run deterministic unit tests
         run: pytest -q test_one_x_two_engine.py
-      - name: Prove live holdout exclusion
+      - name: Import weekly integration
+        run: python -c "import one_x_two_weekly; print('one-x-two-weekly-import-ok')"
+      - name: Prove live holdout exclusion and canonical history contract
         run: |
           python - <<'PY'
           from pathlib import Path
@@ -29,5 +31,7 @@ jobs:
           assert 'LIVE_HOLDOUT = "2627"' in text
           assert 'tuple(TEST_SEASONS) != ("2425", "2526")' in text
           assert 'LIVE_HOLDOUT in TEST_SEASONS' in text
-          print('one-x-two-holdout-contract-ok')
+          assert 'm["home_team"] = canon(raw.get("home_team"))' in text
+          assert 'm["away_team"] = canon(raw.get("away_team"))' in text
+          print('one-x-two-holdout-and-canonical-contract-ok')
           PY
