@@ -9,4 +9,5 @@ jobs:
       - name: Fetch live weekly preview
         run: |
           set -euo pipefail
+          echo '=== MULTILINE FRESH PREVIEW VERIFY ==='
           curl --fail --silent --show-error --max-time 120 https://football-dataset-export.onrender.com/weekly-preview | python -m json.tool
