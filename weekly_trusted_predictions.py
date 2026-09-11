@@ -2,9 +2,9 @@
 """Build the mandatory weekly reliability-ranked list.
 
 Frozen V1 remains the fail-closed baseline. Operational all-competition schedule
-context may de-rank/block a candidate. Lineup Stability V2 and advanced goal-model
-challengers can affect production only when their dedicated registry rows contain
-holdout-safe two-fold evidence accepted by research_change_control.
+context may de-rank/block a candidate. Validated goal-model, legacy Lineup V2, and
+the sequential ranking challenger stack can affect production only when their
+registry evidence is accepted by research_change_control.
 """
 from __future__ import annotations
 
@@ -31,6 +31,13 @@ from lineup_stability_v2_policy import (
 from match_environment_builder import latest_environment
 from model_engine_v1 import predict_match
 from production_predictor import canon
+from ranking_challenger_stack_policy import (
+    FEATURE_LINEUP as STACK_FEATURE_LINEUP,
+    MODE_V1 as STACK_MODE_V1,
+    POLICY_KEY as RANKING_STACK_POLICY_KEY,
+    feature_enabled as stack_feature_enabled,
+    live_factors as ranking_stack_live_factors,
+)
 from research_change_control import registry_activation_mode
 from schedule_context import SCHEDULE_CONTEXT_VERSION, team_schedule_context
 from thursday_decision_engine import (
@@ -64,11 +71,7 @@ MARKETS = GOAL_MARKETS + (
 
 
 def _fixture_market_specs(pred: Any, advanced: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Return every market candidate evaluated by fresh preview for one fixture.
-
-    Goal/BTTS probabilities may come from the guarded goal challenger. Every corner
-    line deliberately remains tied to the same frozen V1 total-corner Poisson lambda.
-    """
+    """Return every market candidate evaluated by fresh preview for one fixture."""
     specs: List[Dict[str, Any]] = []
     for market, attr, yes_selection, no_selection in GOAL_MARKETS:
         specs.append({
@@ -96,6 +99,22 @@ def _selected_market_probability(ref: Optional[Dict[str, Any]], selected_yes: bo
         return None
     p_yes = float(ref["reference_p_yes"])
     return p_yes if selected_yes else 1.0 - p_yes
+
+
+def _latest_corner_pressure_signal(conn, event_id: str) -> Optional[float]:
+    """Read the already-built, pre-match corner pressure signal; fail soft."""
+    try:
+        row = conn.execute(
+            """SELECT corner_pressure_signal FROM fixture_pressure_snapshots
+                WHERE event_id=%s ORDER BY snapshot_hour DESC LIMIT 1""",
+            (event_id,),
+        ).fetchone()
+    except Exception:
+        return None
+    try:
+        return float(row[0]) if row and row[0] is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _public(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -126,6 +145,12 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
         "lineup_v2_active": row.get("lineup_v2_active", False),
         "lineup_v2_available": row.get("lineup_v2_available", False),
         "lineup_v2_factor": row.get("lineup_v2_factor", 1.0),
+        "ranking_stack_mode": row.get("ranking_stack_mode", STACK_MODE_V1),
+        "ranking_stack_factor": row.get("ranking_stack_factor", 1.0),
+        "missing_player_available": row.get("missing_player_available", False),
+        "missing_player_factor": row.get("missing_player_factor", 1.0),
+        "corner_specific_available": row.get("corner_specific_available", False),
+        "corner_specific_factor": row.get("corner_specific_factor", 1.0),
         "tr_price": row["price"].get("tr_price"),
         "tr_opening_price": row["price"].get("tr_opening_price"),
         "tr_source": row["price"].get("tr_source"),
@@ -147,12 +172,13 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
     if as_of.tzinfo is None:
         as_of = as_of.replace(tzinfo=timezone.utc)
     week_key, start, end = weekend_bounds(as_of)
-    # Read-only list construction deliberately uses autocommit: optional context
-    # lookups are fail-soft and must never poison the rest of the read transaction.
     with psycopg.connect(database_url, autocommit=True) as conn:
         conn.execute(TURKEY_PRICE_DDL)
+        ranking_stack_mode = registry_activation_mode(conn, RANKING_STACK_POLICY_KEY)
+        ranking_stack_active = ranking_stack_mode != STACK_MODE_V1
         lineup_v2_mode = registry_activation_mode(conn, LINEUP_V2_POLICY_KEY)
-        lineup_v2_active = lineup_v2_mode == LINEUP_V2_ACTIVE_MODE
+        legacy_lineup_v2_active = (not ranking_stack_active) and lineup_v2_mode == LINEUP_V2_ACTIVE_MODE
+        stack_lineup_active = ranking_stack_active and stack_feature_enabled(ranking_stack_mode, STACK_FEATURE_LINEUP)
         advanced_goal_mode = registry_activation_mode(conn, ADVANCED_GOAL_POLICY_KEY)
         fixtures = conn.execute(
             """SELECT event_id,match_date,league_name,home_team,away_team
@@ -203,10 +229,18 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                 continue
 
             schedule_factor = min(float(home_sched.get("rank_factor") or 0.0), float(away_sched.get("rank_factor") or 0.0))
-            environment = latest_environment(conn, str(eid))
-            lineup_factor, lineup_available = (1.0, False)
-            if lineup_v2_active:
-                lineup_factor, lineup_available = lineup_v2_factor_from_environment(environment)
+            environment = latest_environment(conn, str(eid)) or {}
+            corner_pressure = _latest_corner_pressure_signal(conn, str(eid))
+            if corner_pressure is not None:
+                environment = dict(environment)
+                pressure = dict(environment.get("pressure") or {}) if isinstance(environment.get("pressure"), dict) else {}
+                pressure["corner_pressure_signal"] = corner_pressure
+                environment["pressure"] = pressure
+
+            legacy_lineup_factor, legacy_lineup_available = (1.0, False)
+            if legacy_lineup_v2_active:
+                legacy_lineup_factor, legacy_lineup_available = lineup_v2_factor_from_environment(environment)
+
             gate_diag.update({
                 "schedule_context_version": SCHEDULE_CONTEXT_VERSION,
                 "schedule_scope": "all_competitions_with_domestic_fallback",
@@ -222,9 +256,10 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                 "advanced_goal_meta": advanced.get("meta") or {},
                 "lineup_v2_policy_key": LINEUP_V2_POLICY_KEY,
                 "lineup_v2_mode": lineup_v2_mode,
-                "lineup_v2_active": lineup_v2_active,
-                "lineup_v2_available": lineup_available,
-                "lineup_v2_factor": lineup_factor,
+                "lineup_v2_active": bool(legacy_lineup_v2_active or stack_lineup_active),
+                "ranking_stack_policy_key": RANKING_STACK_POLICY_KEY,
+                "ranking_stack_mode": ranking_stack_mode,
+                "ranking_stack_active": ranking_stack_active,
             })
 
             for spec in _fixture_market_specs(pred, advanced):
@@ -248,14 +283,41 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                     continue
                 market_check = "aligned" if ref_selected is not None else "reference_unavailable"
                 data_quality = float(gate_diag.get("model_data_quality") or 0.0)
-                ranking_score = confidence * (0.75 + 0.25 * data_quality) * schedule_factor * float(lineup_factor)
+
+                if ranking_stack_active:
+                    stack = ranking_stack_live_factors(environment, market, selected_yes, ranking_stack_mode)
+                    ranking_factor = float(stack["combined_factor"])
+                    lineup_factor = float(stack["lineup_factor"])
+                    lineup_available = bool(stack["lineup_available"])
+                else:
+                    stack = {
+                        "mode": STACK_MODE_V1,
+                        "combined_factor": float(legacy_lineup_factor),
+                        "lineup_factor": float(legacy_lineup_factor),
+                        "lineup_available": bool(legacy_lineup_available),
+                        "missing_player_factor": 1.0,
+                        "missing_player_available": False,
+                        "corner_specific_factor": 1.0,
+                        "corner_specific_available": False,
+                    }
+                    ranking_factor = float(legacy_lineup_factor)
+                    lineup_factor = float(legacy_lineup_factor)
+                    lineup_available = bool(legacy_lineup_available)
+
+                ranking_score = confidence * (0.75 + 0.25 * data_quality) * schedule_factor * ranking_factor
                 rows.append({
                     "event_id": str(eid), "match_date": match_date, "league": league_s,
                     "home": str(home), "away": str(away), "market": market, "selection": selection,
                     "confidence": confidence, "ranking_score": ranking_score, "schedule_rank_factor": schedule_factor,
                     "goal_model_mode": effective_goal_mode, "advanced_goal_available": advanced_available,
-                    "lineup_v2_active": lineup_v2_active, "lineup_v2_available": lineup_available,
-                    "lineup_v2_factor": lineup_factor,
+                    "lineup_v2_active": bool(legacy_lineup_v2_active or stack_lineup_active),
+                    "lineup_v2_available": lineup_available, "lineup_v2_factor": lineup_factor,
+                    "ranking_stack_mode": stack.get("mode", STACK_MODE_V1),
+                    "ranking_stack_factor": ranking_factor,
+                    "missing_player_available": bool(stack.get("missing_player_available", False)),
+                    "missing_player_factor": float(stack.get("missing_player_factor", 1.0)),
+                    "corner_specific_available": bool(stack.get("corner_specific_available", False)),
+                    "corner_specific_factor": float(stack.get("corner_specific_factor", 1.0)),
                     "price": price, "international": ref, "international_selected_probability": ref_selected,
                     "market_check": market_check, "early_context": gate_diag,
                     "corner_line": spec.get("corner_line"),
@@ -287,7 +349,7 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
             "policy": {
                 "list_semantics": "weekly_reliability_ranking_not_guaranteed_70pct",
                 "strict_high_confidence_min": HIGH_CONFIDENCE_MIN,
-                "ranking": "guarded_goal_or_frozen_multiline_corner_probability_x_data_quality_x_operational_schedule_factor_x_guarded_lineup_v2_factor",
+                "ranking": "guarded_probability_x_data_quality_x_schedule_x_holdout_safe_ranking_stack",
                 "advanced_goal_policy_key": ADVANCED_GOAL_POLICY_KEY,
                 "advanced_goal_mode": advanced_goal_mode,
                 "advanced_goal_fail_closed": True,
@@ -299,7 +361,11 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                 "schedule_scope": "all_competitions_with_domestic_fallback",
                 "lineup_v2_policy_key": LINEUP_V2_POLICY_KEY,
                 "lineup_v2_mode": lineup_v2_mode,
-                "lineup_v2_active": lineup_v2_active,
+                "lineup_v2_active": bool(legacy_lineup_v2_active or stack_lineup_active),
+                "ranking_stack_policy_key": RANKING_STACK_POLICY_KEY,
+                "ranking_stack_mode": ranking_stack_mode,
+                "ranking_stack_active": ranking_stack_active,
+                "ranking_stack_fail_closed": True,
                 "pending_intervening_official_match": "exclude_until_next_refresh",
                 "turkey_price_required": True,
                 "international_reference": "reject strong contradiction when available; missing reference allowed for reliability list",

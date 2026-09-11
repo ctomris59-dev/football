@@ -6,6 +6,7 @@ Active weekly preparation:
 - all-competition club schedules (domestic + UEFA) for true rest/fatigue context;
 - current injury availability (freshness-gated, optional);
 - current rosters + real historical starts -> expected-XI/player context;
+- optional one-shot leakage-safe ranking-stack audit before weekly ranking;
 - optional xG/Elo/pressure refresh + unified match-environment shadow snapshot;
 - official Turkish İddaa opening-price watch;
 - synchronized two-sided Turkey price refresh for goals/BTTS/base corners;
@@ -14,10 +15,9 @@ Active weekly preparation:
 - exact-line 7.5/8.5/9.5/10.5 corner upgrade using the same frozen V1 corner lambda.
 
 International prices are never executable prices and never replace model confidence.
-The match-environment layer is shadow-only: xG regression, pace, Elo, venue and
-scoreline diagnostics cannot alter frozen V1 probabilities without two-fold OOS
-validation. All-competition rest is an operational data-correction layer and can
-block/de-rank a candidate when a real intervening match exists.
+The match-environment layer is shadow-only unless a holdout-safe two-fold registry
+activation explicitly permits a ranking challenger. All-competition rest remains
+an operational correction and can block/de-rank a candidate.
 """
 from __future__ import annotations
 
@@ -81,8 +81,6 @@ def _run() -> Dict[str, Any]:
     from espn_current_importer import run_import as espn_current
     run_step("espn_current", lambda: espn_current(DATABASE_URL), steps)
 
-    # Critical schedule-context fix: collect each Big Five club's domestic + UEFA
-    # schedule before ranking so rest is not accidentally league-only.
     from espn_team_schedule_importer import run_import as espn_team_schedule
     run_step("espn_team_schedule_all_comp", lambda: espn_team_schedule(DATABASE_URL), steps)
 
@@ -99,8 +97,16 @@ def _run() -> Dict[str, Any]:
     from player_context_orchestrator import run as player_context
     run_step("player_context", lambda: player_context(DATABASE_URL), steps)
 
-    # These context sources are useful but are deliberately non-blocking. If an
-    # external xG endpoint is unavailable, V1 + Turkey prices can still operate.
+    # Historical challenger validation runs before this week's ranking so a passed
+    # policy can affect only future/unfrozen decisions. Failure is non-blocking and
+    # the registry remains fail-closed at v1_only.
+    if os.getenv("RUN_RANKING_STACK_AUDIT_ONCE", "false").strip().lower() in {"1", "true", "yes"}:
+        try:
+            from ranking_challenger_stack_once import run as ranking_stack_once
+            run_step("ranking_challenger_stack_once", lambda: ranking_stack_once(DATABASE_URL), steps, optional=True)
+        except Exception as exc:
+            steps["ranking_challenger_stack_once"] = {"status": "unavailable_optional", "error": str(exc)[:500]}
+
     try:
         from understat_xg_importer import run_import as understat_xg
         run_step("understat_xg_shadow", lambda: understat_xg(DATABASE_URL), steps, optional=True)
@@ -128,13 +134,6 @@ def _run() -> Dict[str, Any]:
     from thursday_opening_watch import main as opening_watch
     run_step("opening_watch", lambda: opening_watch(DATABASE_URL), steps)
 
-    # Once a Thursday decision is frozen, opening_watch() returns early and no longer
-    # refreshes the executable Turkey price table. The multiline-corner pass still
-    # writes fresh corner rows, so the 6-hour freshness gate could make older KG/2.5
-    # rows disappear while corners remained visible. Refresh every two-sided base
-    # market immediately before the corner pass so all market families share the
-    # same freshness window. This is append-only price storage; frozen opening odds
-    # and the already-finalized decision are not rewritten by this step.
     from turkey_two_sided_odds import run_import as turkey_all_sides
     run_step("turkey_prices_all_sides", lambda: turkey_all_sides(DATABASE_URL), steps)
 

@@ -23,21 +23,23 @@ jobs:
             match_environment_builder.py \
             schedule_context.py \
             live_refresh.py \
-            weekly_trusted_predictions.py
+            weekly_trusted_predictions.py \
+            ranking_challenger_stack_policy.py
       - name: Run deterministic feature tests
-        run: pytest -q test_match_environment_features.py test_weekly_reliable_output.py
+        run: pytest -q test_match_environment_features.py test_weekly_reliable_output.py test_ranking_challenger_stack_policy.py
       - name: Prove guarded integration contract
         run: |
           python - <<'PY'
           from pathlib import Path
           weekly = Path('weekly_trusted_predictions.py').read_text()
           env = Path('match_environment_builder.py').read_text()
-          # Environment remains shadow by default; only a registry-gated lineup V2
-          # factor may alter ranking, never the frozen V1 probability itself.
+          # Environment remains shadow by default. Ranking context can alter order
+          # only through registry-gated policies; frozen model confidence is unchanged.
           assert 'shadow_unless_guarded_policy_activated' in weekly
           assert 'registry_activation_mode' in weekly
-          assert 'lineup_v2_active' in weekly
-          assert 'ranking_score = confidence * (0.75 + 0.25 * data_quality) * schedule_factor * float(lineup_factor)' in weekly
+          assert 'RANKING_STACK_POLICY_KEY' in weekly
+          assert 'ranking_stack_fail_closed' in weekly
+          assert 'ranking_score = confidence * (0.75 + 0.25 * data_quality) * schedule_factor * ranking_factor' in weekly
           assert 'model_probability_estimate' in weekly and 'row["confidence"]' in weekly
           assert 'production_probability_changed' in env
           assert 'not DataGaffer proprietary XoG' in env
