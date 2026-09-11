@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 import psycopg
 from psycopg.types.json import Jsonb
 
-from thursday_decision_engine_v2 import build_decision
+from thursday_decision_engine_v3 import build_decision
 from thursday_decision_engine import json_default, weekend_bounds
 from turkey_iddaa_odds_collector import run_import
 
@@ -164,7 +164,7 @@ def main(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None) ->
 
         decision = build_decision(database_url, now=now)
 
-        from weekly_trusted_predictions import build as build_weekly_trusted
+        from weekly_trusted_predictions_v2 import build as build_weekly_trusted
         trusted = build_weekly_trusted(database_url, now=now)
 
         value_list = (
