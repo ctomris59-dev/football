@@ -1,0 +1,38 @@
+name: ranking-challenger-stack-ci
+
+on:
+  push:
+    branches: [main, 'feature/ranking-challenger-stack-v1']
+  pull_request:
+    branches: [main]
+
+jobs:
+  challenger-stack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+      - name: Compile challenger and integration modules
+        run: |
+          python -m py_compile \
+            ranking_challenger_stack_policy.py \
+            ranking_challenger_stack_audit.py \
+            ranking_challenger_stack_once.py \
+            weekly_trusted_predictions.py \
+            live_refresh.py
+      - name: Run policy unit tests
+        run: pytest -q test_ranking_challenger_stack_policy.py test_lineup_stability_v2_policy.py
+      - name: Import integration modules
+        run: |
+          python - <<'PY'
+          import ranking_challenger_stack_policy
+          import ranking_challenger_stack_audit
+          import ranking_challenger_stack_once
+          import weekly_trusted_predictions
+          import live_refresh
+          print('ranking-stack-imports-ok')
+          PY
