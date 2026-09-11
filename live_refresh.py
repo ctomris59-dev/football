@@ -8,6 +8,7 @@ Active weekly preparation:
 - current rosters + real historical starts -> expected-XI/player context;
 - optional xG/Elo/pressure refresh + unified match-environment shadow snapshot;
 - official Turkish İddaa opening-price watch;
+- synchronized two-sided Turkey price refresh for goals/BTTS/base corners;
 - international paired same-book no-vig validation after Turkey target prices appear;
 - frozen weekly decision;
 - exact-line 7.5/8.5/9.5/10.5 corner upgrade using the same frozen V1 corner lambda.
@@ -126,6 +127,16 @@ def _run() -> Dict[str, Any]:
 
     from thursday_opening_watch import main as opening_watch
     run_step("opening_watch", lambda: opening_watch(DATABASE_URL), steps)
+
+    # Once a Thursday decision is frozen, opening_watch() returns early and no longer
+    # refreshes the executable Turkey price table. The multiline-corner pass still
+    # writes fresh corner rows, so the 6-hour freshness gate could make older KG/2.5
+    # rows disappear while corners remained visible. Refresh every two-sided base
+    # market immediately before the corner pass so all market families share the
+    # same freshness window. This is append-only price storage; frozen opening odds
+    # and the already-finalized decision are not rewritten by this step.
+    from turkey_two_sided_odds import run_import as turkey_all_sides
+    run_step("turkey_prices_all_sides", lambda: turkey_all_sides(DATABASE_URL), steps)
 
     from multiline_corner_upgrade import upgrade_final
     run_step("multiline_corners", lambda: upgrade_final(DATABASE_URL), steps)
