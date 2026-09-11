@@ -22,7 +22,7 @@ def test_missing_player_factor_is_bounded_and_fail_closed():
     assert factor == 1.0 and available is False
 
     factor, available = missing_player_factor(
-        {"injury_impact": 0.32}, {"injury_impact": 0.04}
+        {"injury_impact": 0.40}, {"injury_impact": 0.04}
     )
     assert available is True
     assert factor == 0.95
