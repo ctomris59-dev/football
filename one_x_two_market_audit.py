@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import psycopg
 from psycopg.types.json import Jsonb
@@ -29,6 +29,7 @@ POLICY_VERSION = "one-x-two-market-poisson-v1"
 ACTIVE_MODE = "one_x_two_market_v1"
 VERSION = "one-x-two-market-two-fold-v1"
 TEST_SEASONS = (DEV_SEASON, FINAL_HOLDOUT_SEASON)
+GATE_VERSION = "two-fold-week-block-v1"
 
 MIN_MATCHES_PER_FOLD = 1500
 MIN_TOP1_ACCURACY = 0.48
@@ -92,12 +93,21 @@ def run_audit(database_url: Optional[str] = None) -> Dict[str, Any]:
             for fold in TEST_SEASONS:
                 reasons.extend(_fold_gate(fold, by_fold[fold]))
             passed = not reasons
+            validation_protocol = {
+                "gate_version": GATE_VERSION,
+                "test_seasons": list(TEST_SEASONS),
+                "holdout_excluded": True,
+                "live_holdout_season": LIVE_HOLDOUT_SEASON,
+                "holdout_rule": "2627 outcomes are never queried for tuning or validation",
+            }
             result = {
                 "version": VERSION,
                 "policy_key": POLICY_KEY,
                 "policy_version": POLICY_VERSION,
                 "gate_passed": passed,
                 "recommended_activation": ACTIVE_MODE if passed else "v1_only",
+                "validation_protocol": validation_protocol,
+                # Backward-compatible top-level fields retained for older diagnostics.
                 "test_seasons": list(TEST_SEASONS),
                 "live_holdout_season": LIVE_HOLDOUT_SEASON,
                 "live_holdout_excluded": True,
