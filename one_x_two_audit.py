@@ -156,7 +156,13 @@ def run_audit(database_url: Optional[str] = None) -> Dict[str, Any]:
         try:
             matches = _load_matches(conn)
             by_div: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-            for m in matches:
+            for raw in matches:
+                # V1 performs exact team-key lookups inside each historical row.
+                # Normalize both the history and fixture side with the same production
+                # canonicalizer so aliases cannot silently collapse to league priors.
+                m = dict(raw)
+                m["home_team"] = canon(raw.get("home_team"))
+                m["away_team"] = canon(raw.get("away_team"))
                 by_div[str(m["division"])].append(m)
 
             scored_rows: List[Dict[str, Any]] = []
@@ -173,7 +179,7 @@ def run_audit(database_url: Optional[str] = None) -> Dict[str, Any]:
                         continue
                     history = list(train)
                     for match in tests:
-                        pred = predict_match(history, canon(match["home_team"]), canon(match["away_team"]), recent_matches=18)
+                        pred = predict_match(history, match["home_team"], match["away_team"], recent_matches=18)
                         one = from_v1_prediction(pred)
                         probs = one.probabilities()
                         actual = actual_outcome(match["home_goals"], match["away_goals"])
