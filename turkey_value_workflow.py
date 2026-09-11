@@ -13,6 +13,7 @@ from typing import Any, Optional
 
 TR_PRICE_MIN = float(os.getenv("TR_PRICE_MIN", "1.01"))
 TR_PRICE_MAX = float(os.getenv("TR_PRICE_MAX", "5.00"))
+TR_1X2_PRICE_MAX = float(os.getenv("TR_1X2_PRICE_MAX", "20.00"))
 TR_PRICE_MAX_AGE_HOURS = float(os.getenv("TR_PRICE_MAX_AGE_HOURS", "6"))
 
 DDL = """
@@ -40,11 +41,20 @@ CREATE TABLE IF NOT EXISTS turkey_opening_odds(
 """
 
 
-def valid_price(price: Any) -> bool:
+def price_max_for_market(market: str) -> float:
+    return TR_1X2_PRICE_MAX if str(market) == "match_result" else TR_PRICE_MAX
+
+
+def valid_market_price(price: Any, market: str) -> bool:
     try:
-        return TR_PRICE_MIN <= float(price) <= TR_PRICE_MAX
+        return TR_PRICE_MIN <= float(price) <= price_max_for_market(market)
     except (TypeError, ValueError):
         return False
+
+
+def valid_price(price: Any) -> bool:
+    """Backward-compatible validator for the legacy non-1X2 markets."""
+    return valid_market_price(price, "")
 
 
 def store_price(
@@ -57,7 +67,7 @@ def store_price(
     at: Optional[datetime] = None,
 ) -> bool:
     """Store one valid Turkey price and freeze the first valid price as opening."""
-    if not valid_price(price):
+    if not valid_market_price(price, market):
         return False
     conn.execute(DDL)
     at = at or datetime.now(timezone.utc)
@@ -78,6 +88,7 @@ def store_price(
 
 def latest_tr_price(conn, event_id: str, market: str, selection: str):
     """Return the freshest valid executable Turkey price plus immutable opening."""
+    max_price = price_max_for_market(market)
     return conn.execute(
         """SELECT s.source,s.price,s.fetched_at,o.opening_price,o.first_seen_at
            FROM turkey_odds_snapshots s
@@ -87,5 +98,5 @@ def latest_tr_price(conn, event_id: str, market: str, selection: str):
              AND s.price BETWEEN %s AND %s
              AND s.fetched_at>=NOW()-(%s||' hours')::interval
            ORDER BY s.fetched_at DESC LIMIT 1""",
-        (str(event_id), market, selection, TR_PRICE_MIN, TR_PRICE_MAX, TR_PRICE_MAX_AGE_HOURS),
+        (str(event_id), market, selection, TR_PRICE_MIN, max_price, TR_PRICE_MAX_AGE_HOURS),
     ).fetchone()
