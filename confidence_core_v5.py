@@ -1,29 +1,33 @@
 #!/usr/bin/env python3
-"""Probability-first weekly football publication engine.
+"""Probability-first diversified weekly football publication engine.
 
-The six evidence layers remain available, but they are no longer six independent
-rejection gates.  The weekly product is now a reliability ranking:
-- probability drives the decision;
-- xG / opponent strength / XI / market / Dixon-Coles improve or penalise the score;
-- missing secondary evidence lowers rank instead of automatically deleting a match;
-- EV/value never blocks a Core4 selection.
+The six evidence layers remain available, but they are not independent rejection
+rules. Probability drives the weekly ranking. xG, opponent strength, expected XI,
+market consensus and Dixon-Coles are supporting evidence that can raise/lower a
+candidate softly. EV/value never blocks a Core4 selection.
 
-Hard rejection is reserved for genuinely unsafe rows: no executable Turkish price,
-very low model direction agreement, or a strong model-vs-market contradiction when
-a fresh international reference exists.
+V7 keeps the pure reliability ranking intact, then builds Core4 as a small weekly
+portfolio so one market or one league cannot monopolise all four slots. The first
+pass allows at most two selections from the same market family and at most two from
+the same league. If that cannot fill four slots, staged soft fallbacks relax league
+concentration first and only then the market cap. Thus diversification improves the
+weekly product without recreating a zero-pick rejection engine.
 
 The live 2026/27 outcomes are not used to tune weights or thresholds.
 """
 from __future__ import annotations
 
 import json
+from collections import Counter
 from typing import Any, Dict, List
 
 import confidence_core_v4 as v4
 from thursday_decision_engine import DATABASE_URL, LIST_LIMIT, weekend_bounds
 
-POLICY_VERSION = "confidence-core-v6-probability-first-2026-09-17"
+POLICY_VERSION = "confidence-core-v7-diversified-reliability-2026-09-17"
 CORE4_SIZE = 4
+CORE_MAX_SAME_MARKET = 2
+CORE_MAX_SAME_LEAGUE = 2
 
 # Only genuinely contradictory evidence can remove a candidate. Everything else
 # affects the ranking score softly.
@@ -104,7 +108,7 @@ def _build_v4_week_frozen(database_url: str, *, now=None, limit: int, strict_pic
 
 def _candidate_probability(row: Dict[str, Any]) -> float:
     # Prefer market-anchored consensus when available; otherwise the multi-model
-    # median remains usable.  This deliberately does not require positive EV.
+    # median remains usable. This deliberately does not require positive EV.
     return float(
         row.get("consensus_probability")
         or row.get("calibrated_probability")
@@ -178,6 +182,54 @@ def _dedupe_best(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return list(best.values())
 
 
+def _diversified_core(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Select four from reliability-ranked rows without market/league clustering.
+
+    The caps are portfolio rules, not model rejection thresholds. Staged fallback
+    guarantees that diversification itself cannot recreate a zero/short list when
+    enough otherwise valid candidates exist.
+    """
+    selected: List[Dict[str, Any]] = []
+    selected_ids = set()
+    market_counts: Counter = Counter()
+    league_counts: Counter = Counter()
+
+    def add_pass(max_market: int | None, max_league: int | None) -> None:
+        for row in rows:
+            if len(selected) >= CORE4_SIZE:
+                return
+            eid = str(row.get("event_id"))
+            if eid in selected_ids:
+                continue
+            market = str(row.get("market") or "unknown")
+            league = str(row.get("league") or "unknown")
+            if max_market is not None and market_counts[market] >= max_market:
+                continue
+            if max_league is not None and league_counts[league] >= max_league:
+                continue
+            picked = dict(row)
+            picked["core_diversification"] = {
+                "market_family": market,
+                "league": league,
+                "stage": "balanced" if max_market == CORE_MAX_SAME_MARKET and max_league == CORE_MAX_SAME_LEAGUE else "soft_fallback",
+            }
+            selected.append(picked)
+            selected_ids.add(eid)
+            market_counts[market] += 1
+            league_counts[league] += 1
+
+    # Normal target: max two from one market family, max two from one league.
+    add_pass(CORE_MAX_SAME_MARKET, CORE_MAX_SAME_LEAGUE)
+    # If necessary, keep market diversity but relax league concentration first.
+    if len(selected) < CORE4_SIZE:
+        add_pass(CORE_MAX_SAME_MARKET, None)
+    # Last resort: fill the four best remaining valid candidates. Never force a
+    # lower-quality row merely to satisfy an aesthetic portfolio cap.
+    if len(selected) < CORE4_SIZE:
+        add_pass(None, None)
+    return selected[:CORE4_SIZE]
+
+
 def _rerank(rows: List[Dict[str, Any]], tier: str, limit: int) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for i, raw in enumerate(rows[:limit], start=1):
@@ -194,7 +246,7 @@ def _rerank(rows: List[Dict[str, Any]], tier: str, limit: int) -> List[Dict[str,
 def build(database_url: str = DATABASE_URL, *, now=None, limit: int = LIST_LIMIT, strict_picks=None) -> Dict[str, Any]:
     base = _build_v4_week_frozen(database_url, now=now, limit=max(limit, 20), strict_picks=strict_picks)
 
-    # V4's confidence rows contain evidence-complete candidates. Fallback rows are
+    # V4 confidence rows contain evidence-complete candidates. Fallback rows are
     # deliberately re-admitted because missing one secondary evidence layer should
     # no longer erase an otherwise strong favourite/profile.
     pool = list(base.get("confidence_ranked") or base.get("ranked_picks") or [])
@@ -210,9 +262,10 @@ def build(database_url: str = DATABASE_URL, *, now=None, limit: int = LIST_LIMIT
     )
 
     confidence_ranked = _rerank(candidates, "reliability_ranked", limit)
-    confidence_core4 = _rerank(candidates, "core4", CORE4_SIZE)
+    diversified = _diversified_core(candidates)
+    confidence_core4 = _rerank(diversified, "core4", CORE4_SIZE)
 
-    # Value stays visible only as an optional badge/list; it never controls Core4.
+    # Value stays visible only as an optional diagnostic; it never controls Core4.
     values = [dict(r) for r in candidates if float(r.get("model_ev_vs_tr") or -9.0) >= VALUE_MIN_EV]
     values.sort(key=lambda r: float(r.get("model_ev_vs_tr") or 0.0), reverse=True)
     value_picks = _rerank(values, "value_optional", limit)
@@ -233,18 +286,27 @@ def build(database_url: str = DATABASE_URL, *, now=None, limit: int = LIST_LIMIT
         "publication_complete": True,
         "core4_slots_filled": len(confidence_core4),
         "core4_probability_first": True,
+        "core4_diversified": True,
     })
     policy = dict(base.get("policy") or {})
     policy.update({
         "policy_version": POLICY_VERSION,
-        "selection_semantics": "probability_first_reliability_ranking",
+        "selection_semantics": "probability_first_diversified_reliability_ranking",
         "core4_target": CORE4_SIZE,
+        "core4_max_same_market": CORE_MAX_SAME_MARKET,
+        "core4_max_same_league": CORE_MAX_SAME_LEAGUE,
+        "core4_diversification_soft_fallback": True,
         "value_required_for_core4": False,
         "positive_ev_required_for_core4": False,
         "xg_required_for_core4": False,
         "multi_book_required_for_core4": False,
         "injury_feed_required_for_core4": False,
         "dixon_coles_required_for_core4": False,
+        # Override legacy V4 wording so API consumers do not see contradictory flags.
+        "confidence_core_requires_xg": False,
+        "confidence_core_requires_multi_book": False,
+        "confidence_core_requires_four_model_families": False,
+        "confidence_core_not_forced_when_evidence_missing": False,
         "secondary_evidence_is_soft_penalty": True,
         "hard_max_model_market_gap": HARD_MAX_MARKET_GAP,
         "hard_min_direction_agreement": HARD_MIN_DIRECTION_AGREEMENT,
@@ -254,7 +316,7 @@ def build(database_url: str = DATABASE_URL, *, now=None, limit: int = LIST_LIMIT
         "current_season_result_tuning": False,
     })
     result["policy"] = policy
-    print("WEEKLY_CORE4_V6_RESULT", json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":")), flush=True)
+    print("WEEKLY_CORE4_V7_RESULT", json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":")), flush=True)
     return result
 
 
