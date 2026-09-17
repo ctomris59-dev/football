@@ -1,9 +1,8 @@
-"""Optional process-start hooks for one-shot football audits and shadow previews.
+"""Optional process-start hooks for football audits and strict weekly migration.
 
-Normal production is inert: all flags default false. Render build interpreters may
-import sitecustomize before dependencies exist; those invocations fail closed. At
-runtime, explicitly enabled jobs start in background threads so web-service port
-binding is never delayed while holdout-safe research or shadow diagnostics run.
+Normal research hooks remain opt-in. The strict-week migration is safe to run on
+web-service startup: it only rebuilds when the current week's stored final was
+created by an older selection policy. Once a strict-v3 final exists it is inert.
 """
 from __future__ import annotations
 
@@ -16,7 +15,7 @@ _V2_ENABLED = os.getenv("RUN_ONE_X_TWO_V2_AUDIT_ONCE", "false").lower() in {"1",
 _MARKET_ENABLED = os.getenv("RUN_ONE_X_TWO_MARKET_AUDIT_ONCE", "false").lower() in {"1", "true", "yes"}
 _SHADOW_1X2_ENABLED = os.getenv("RUN_SHADOW_1X2_PREVIEW_ONCE", "false").lower() in {"1", "true", "yes"}
 _DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-_log = logging.getLogger("one-x-two-site-hook")
+_log = logging.getLogger("football-site-hook")
 
 
 def _runtime_dependencies_ready() -> bool:
@@ -83,12 +82,37 @@ def _run_shadow_1x2() -> None:
         _log.exception("SHADOW_1X2_PREVIEW_ONCE_FAILED")
 
 
+def _run_strict_week_migration() -> None:
+    """Replace this week's legacy frozen decision with strict-playable-v3 once."""
+    try:
+        from thursday_opening_watch import CURRENT_SOURCE, latest_final, main
+        final = latest_final(_DATABASE_URL)
+        old_source = str((final or {}).get("source") or "")
+        if final and old_source == CURRENT_SOURCE:
+            _log.warning("STRICT_WEEK_MIGRATION_NOT_NEEDED source=%s", CURRENT_SOURCE)
+            return
+        _log.warning("STRICT_WEEK_MIGRATION_STARTED old_source=%s", old_source or "none")
+        result = main(_DATABASE_URL)
+        _log.warning(
+            "STRICT_WEEK_MIGRATION_COMPLETED status=%s source=%s picks=%s",
+            result.get("status"),
+            result.get("source") or CURRENT_SOURCE,
+            len(((result.get("payload") or {}).get("verified_playable") or result.get("verified_playable") or [])),
+        )
+    except Exception:
+        _log.exception("STRICT_WEEK_MIGRATION_FAILED")
+
+
 def _start(name: str, fn) -> None:
     _log.warning("%s_STARTED", name)
     threading.Thread(target=fn, name=name.lower().replace("_", "-"), daemon=True).start()
 
 
-if _DATABASE_URL and (_V1_ENABLED or _V2_ENABLED or _MARKET_ENABLED or _SHADOW_1X2_ENABLED) and _runtime_dependencies_ready():
+if _DATABASE_URL and _runtime_dependencies_ready():
+    # Production safety migration: legacy Thursday finals must not survive a strict
+    # policy deploy. This becomes a no-op after the current-source final is stored.
+    _start("STRICT_WEEK_MIGRATION", _run_strict_week_migration)
+
     if _V1_ENABLED:
         _start("ONE_X_TWO_AUDIT_ONCE", _run_v1)
     if _V2_ENABLED:
