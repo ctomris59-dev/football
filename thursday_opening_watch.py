@@ -97,11 +97,18 @@ def latest_final(database_url: str = DATABASE_URL, week_key: Optional[date] = No
         ).fetchone()
     if not row:
         return None
+    payload = dict(row[2] or {})
+    # export_app and the existing /persembe frontend still read the legacy
+    # high_confidence key. Normalize at read-time so today's already-stored Core4
+    # final is immediately visible without rewriting historical JSON.
+    ranked = payload.get("ranked_picks") or payload.get("weekly_reliable") or []
+    if ranked:
+        payload["high_confidence"] = ranked
     return {
         "week_key": week_key,
         "finalized_at": row[0],
         "decision_run_id": int(row[1]),
-        "payload": row[2],
+        "payload": payload,
         "source": row[3],
     }
 
@@ -144,12 +151,16 @@ def main(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None) ->
         if existing:
             existing_source = str(existing[3] or "")
             if existing_source == CURRENT_SOURCE:
+                payload = dict(existing[2] or {})
+                ranked = payload.get("ranked_picks") or payload.get("weekly_reliable") or []
+                if ranked:
+                    payload["high_confidence"] = ranked
                 result = {
                     "status": "already_finalized",
                     "week_key": week_key,
                     "finalized_at": existing[0],
                     "decision_run_id": int(existing[1]),
-                    "payload": existing[2],
+                    "payload": payload,
                     "source": existing_source,
                 }
                 print("THURSDAY_FINAL_DECISION", json.dumps(result, ensure_ascii=False, default=json_default, separators=(",", ":")), flush=True)
@@ -192,17 +203,14 @@ def main(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None) ->
             international = {"status": "waiting_for_turkey_prices"}
             international_1x2 = {"status": "waiting_for_turkey_prices"}
 
-        # Keep the old decision engine for audit diagnostics/value bookkeeping.
         decision = build_decision(database_url, now=now)
 
-        # Strict verification layer: conservative and allowed to be empty.
         from weekly_trusted_predictions_v2 import build as build_strict
         strict = build_strict(database_url, now=now)
         value_list = decision.get("high_confidence_value") or [] if decision.get("decision_ready") else []
         verified_picks = _decorate_verified_picks(strict.get("picks") or [], value_list)
         strict_70 = [p for p in verified_picks if p.get("strict_high_confidence")]
 
-        # Primary practical decision product: Core4 + optional ranked candidates.
         from weekly_core4_decision import build as build_core4
         core = build_core4(database_url, now=now, strict_picks=verified_picks)
         core4 = core.get("core4") or []
@@ -252,8 +260,9 @@ def main(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None) ->
                 "ranked_picks": ranked_picks,
                 "weekly_reliable": ranked_picks,
                 "verified_playable": verified_picks,
-                # Backward compatibility: high_confidence is strict-only now.
-                "high_confidence": strict_70,
+                # Legacy field for the existing API/frontend; semantics are now
+                # weekly ranked decisions, not a >=70% probability claim.
+                "high_confidence": ranked_picks,
                 "strict_high_confidence": strict_70,
                 "high_confidence_value": value_list,
                 "policy": {
