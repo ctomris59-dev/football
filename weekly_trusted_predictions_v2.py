@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Weekly reliability list with guarded 1X2 as a fourth market family.
+"""Strict weekly shortlist with guarded 1X2 as an optional fourth market family.
 
-The existing BTTS/goal/corner engine remains unchanged. When the dedicated 1X2
-probability audit registry is active, the most likely 1/0/2 outcome for each fixture
-is evaluated with the same data-quality, schedule, player-context, Turkey-price and
-international-contradiction guards, then competes against the existing best market
-for that fixture. One selection per fixture is preserved.
+The base goal/BTTS/corner pool is already fail-closed. 1X2 may compete only when
+its registry is active and the candidate independently passes the same strict
+Turkey-price, international-reference, data and injury-feed requirements.
 """
 from __future__ import annotations
 
@@ -36,6 +34,7 @@ from ranking_challenger_stack_policy import (
 )
 from research_change_control import registry_activation_mode
 from schedule_context import SCHEDULE_CONTEXT_VERSION, team_schedule_context
+from strict_selection_policy_v3 import POLICY_VERSION, qualify_candidate
 from thursday_decision_engine import (
     DATABASE_URL,
     HIGH_CONFIDENCE_MIN,
@@ -48,11 +47,12 @@ from thursday_decision_engine import (
     _price_payload,
     weekend_bounds,
 )
-from weekly_trusted_predictions import MIN_WEEKLY_PICKS, build as build_base
+from weekly_trusted_predictions import build as build_base, latest_injury_covered_teams
 
 
 def _public_1x2(row: Dict[str, Any]) -> Dict[str, Any]:
     ref = row.get("international") or {}
+    qualification = row.get("qualification") or {}
     return {
         "event_id": row["event_id"],
         "match_date": row["match_date"],
@@ -64,7 +64,7 @@ def _public_1x2(row: Dict[str, Any]) -> Dict[str, Any]:
         "confidence": row["confidence"],
         "model_probability_estimate": row["confidence"],
         "confidence_semantics": "selected_1x2_probability_from_frozen_v1_home_away_poisson_lambdas",
-        "confidence_tier": "Yüksek Güven" if row["confidence"] >= HIGH_CONFIDENCE_MIN else "Haftanın En Güvenilirleri",
+        "confidence_tier": "Doğrulanmış Aday",
         "strict_high_confidence": row["confidence"] >= HIGH_CONFIDENCE_MIN,
         "ranking_score": row["ranking_score"],
         "schedule_rank_factor": row.get("schedule_rank_factor", 1.0),
@@ -85,7 +85,13 @@ def _public_1x2(row: Dict[str, Any]) -> Dict[str, Any]:
         "international_fair_probability": row.get("international_selected_probability"),
         "international_bookmakers": ref.get("bookmaker_count"),
         "international_quality": ref.get("quality"),
-        "market_check": row["market_check"],
+        "market_check": "aligned",
+        "qualification": "strict_playable",
+        "model_edge_vs_tr": qualification.get("model_edge_vs_tr"),
+        "model_ev_vs_tr": qualification.get("model_ev_vs_tr"),
+        "model_market_gap": qualification.get("model_market_gap"),
+        "tr_implied_probability": qualification.get("tr_implied_probability"),
+        "policy_version": POLICY_VERSION,
         "early_context": row["early_context"],
         "one_x_two_probabilities": row.get("one_x_two_probabilities"),
         "one_x_two_registry_mode": ONE_X_TWO_ACTIVE_MODE,
@@ -93,7 +99,7 @@ def _public_1x2(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _build_1x2_candidates(database_url: str, *, now: datetime) -> Dict[str, Any]:
-    week_key, start, end = weekend_bounds(now)
+    _week_key, start, end = weekend_bounds(now)
     with psycopg.connect(database_url, autocommit=True) as conn:
         one_x_two_mode = registry_activation_mode(conn, ONE_X_TWO_POLICY_KEY)
         if one_x_two_mode != ONE_X_TWO_ACTIVE_MODE:
@@ -104,6 +110,7 @@ def _build_1x2_candidates(database_url: str, *, now: datetime) -> Dict[str, Any]
         lineup_v2_mode = registry_activation_mode(conn, LINEUP_V2_POLICY_KEY)
         legacy_lineup_v2_active = (not ranking_stack_active) and lineup_v2_mode == LINEUP_V2_ACTIVE_MODE
         stack_lineup_active = ranking_stack_active and stack_feature_enabled(ranking_stack_mode, STACK_FEATURE_LINEUP)
+        injury_covered = latest_injury_covered_teams(conn)
 
         fixtures = conn.execute(
             """SELECT event_id,match_date,league_name,home_team,away_team
@@ -125,11 +132,16 @@ def _build_1x2_candidates(database_url: str, *, now: datetime) -> Dict[str, Any]
                 excluded["no_history"] += 1
                 continue
 
+            if canon(home) not in injury_covered or canon(away) not in injury_covered:
+                excluded["injury_context_missing"] += 1
+                continue
+
             pred = predict_match(history, canon(home), canon(away), recent_matches=18)
             one = from_v1_prediction(pred)
             selection, confidence = ranked_outcomes(one)[0]
 
-            home_player_ctx, away_player_ctx = _player_context(conn, str(home)), _player_context(conn, str(away))
+            home_player_ctx = _player_context(conn, str(home))
+            away_player_ctx = _player_context(conn, str(away))
             legacy_home_rest = _last_rest_days(history, str(home), match_date)
             legacy_away_rest = _last_rest_days(history, str(away), match_date)
             home_sched = team_schedule_context(conn, str(home), match_date, as_of=now, fallback_rest_days=legacy_home_rest)
@@ -139,7 +151,8 @@ def _build_1x2_candidates(database_url: str, *, now: datetime) -> Dict[str, Any]
                 continue
 
             eligible, blockers, gate_diag = _early_gate(
-                pred, home_player_ctx, away_player_ctx, home_sched.get("rest_days"), away_sched.get("rest_days")
+                pred, home_player_ctx, away_player_ctx,
+                home_sched.get("rest_days"), away_sched.get("rest_days")
             )
             if not eligible:
                 for blocker in blockers:
@@ -153,10 +166,17 @@ def _build_1x2_candidates(database_url: str, *, now: datetime) -> Dict[str, Any]
 
             ref = latest_1x2_ref(conn, str(eid))
             ref_selected = selected_1x2_probability(ref, selection)
-            if ref_selected is not None and abs(float(confidence) - ref_selected) > INTERNATIONAL_MAX_MODEL_DIVERGENCE:
-                excluded["strong_1x2_international_contradiction"] += 1
+            qualification = qualify_candidate(
+                confidence=float(confidence),
+                tr_price=price.get("tr_price"),
+                international_probability=ref_selected,
+                international_quality=(ref or {}).get("quality"),
+                international_bookmakers=(ref or {}).get("bookmaker_count"),
+                max_model_divergence=INTERNATIONAL_MAX_MODEL_DIVERGENCE,
+            )
+            if not qualification.get("qualified"):
+                excluded[str(qualification.get("reason") or "strict_policy_rejected")] += 1
                 continue
-            market_check = "aligned" if ref_selected is not None else "reference_unavailable"
 
             schedule_factor = min(float(home_sched.get("rank_factor") or 0.0), float(away_sched.get("rank_factor") or 0.0))
             environment = latest_environment(conn, str(eid)) or {}
@@ -186,10 +206,11 @@ def _build_1x2_candidates(database_url: str, *, now: datetime) -> Dict[str, Any]
             ranking_score = float(confidence) * (0.75 + 0.25 * data_quality) * schedule_factor * ranking_factor
             gate_diag.update({
                 "schedule_context_version": SCHEDULE_CONTEXT_VERSION,
-                "schedule_scope": "all_competitions_with_domestic_fallback",
+                "schedule_scope": "all_competitions_completed_only_with_domestic_fallback",
                 "schedule_rank_factor": schedule_factor,
                 "home_schedule": home_sched,
                 "away_schedule": away_sched,
+                "injury_context_complete": True,
                 "match_environment": environment,
                 "one_x_two_policy_key": ONE_X_TWO_POLICY_KEY,
                 "one_x_two_registry_mode": one_x_two_mode,
@@ -208,7 +229,8 @@ def _build_1x2_candidates(database_url: str, *, now: datetime) -> Dict[str, Any]
                 "missing_player_factor": float(stack.get("missing_player_factor", 1.0)),
                 "price": price, "international": ref,
                 "international_selected_probability": ref_selected,
-                "market_check": market_check, "early_context": gate_diag,
+                "market_check": "aligned", "qualification": qualification,
+                "early_context": gate_diag,
                 "one_x_two_probabilities": {"1": round(one.p1, 6), "0": round(one.px, 6), "2": round(one.p2, 6)},
             })
 
@@ -227,41 +249,27 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
     if as_of.tzinfo is None:
         as_of = as_of.replace(tzinfo=timezone.utc)
 
-    # Ask the existing engine for the complete one-per-fixture baseline, then let
-    # one guarded 1X2 candidate per fixture compete with that baseline.
+    # Build all already-qualified base selections, then let a separately-qualified
+    # 1X2 candidate compete. There is still one selection maximum per fixture.
     base = build_base(database_url, now=as_of, limit=1000)
     x12 = _build_1x2_candidates(database_url, now=as_of)
-    if not x12["active"]:
-        picks = (base.get("picks") or [])[:limit]
-        strict = [p for p in picks if p.get("strict_high_confidence")]
-        out = dict(base)
-        out["picks"] = picks
-        out["strict_high_confidence"] = strict
-        out["strict_high_confidence_count"] = len(strict)
-        out["ranked_pick_count"] = len(picks)
-        policy = dict(out.get("policy") or {})
-        policy.update({
-            "one_x_two_policy_key": ONE_X_TWO_POLICY_KEY,
-            "one_x_two_registry_mode": x12["registry_mode"],
-            "one_x_two_market_active": False,
-            "one_x_two_fail_closed": True,
-        })
-        out["policy"] = policy
-        return out
 
     best_by_fixture: Dict[str, Dict[str, Any]] = {}
-    for item in list(base.get("picks") or []) + list(x12["rows"]):
+    candidates = list(base.get("picks") or [])
+    if x12.get("active"):
+        candidates.extend(x12.get("rows") or [])
+    for item in candidates:
         key = str(item.get("event_id"))
         cur = best_by_fixture.get(key)
         candidate_key = (
             float(item.get("ranking_score") or 0.0),
             float(item.get("confidence") or 0.0),
-            item.get("market_check") == "aligned",
+            float(item.get("model_ev_vs_tr") or 0.0),
         )
         current_key = (
             float(cur.get("ranking_score") or 0.0),
             float(cur.get("confidence") or 0.0),
-            cur.get("market_check") == "aligned",
+            float(cur.get("model_ev_vs_tr") or 0.0),
         ) if cur else None
         if cur is None or candidate_key > current_key:
             best_by_fixture[key] = item
@@ -271,43 +279,42 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
         key=lambda p: (
             float(p.get("ranking_score") or 0.0),
             float(p.get("confidence") or 0.0),
-            p.get("market_check") == "aligned",
+            float(p.get("model_ev_vs_tr") or 0.0),
         ),
         reverse=True,
     )
     picks = merged[:limit]
     strict = [p for p in picks if p.get("strict_high_confidence")]
-    ready = float(base.get("official_fixture_coverage") or 0.0) >= 0.90 and len(picks) >= min(
-        MIN_WEEKLY_PICKS, max(1, int(base.get("fixture_count") or 0))
-    )
 
     result = dict(base)
     result.update({
-        "ready": ready,
+        "policy_version": POLICY_VERSION,
+        "ready": bool(base.get("ready")),
         "picks": picks,
         "strict_high_confidence": strict,
         "strict_high_confidence_count": len(strict),
         "ranked_pick_count": len(picks),
         "one_x_two_diagnostics": {
-            "registry_mode": x12["registry_mode"],
-            "candidate_rows": len(x12["rows"]),
-            "excluded_counts": x12["excluded"],
+            "registry_mode": x12.get("registry_mode"),
+            "candidate_rows": len(x12.get("rows") or []),
+            "excluded_counts": x12.get("excluded") or {},
             "one_x_two_in_ranked_picks": sum(p.get("market") == "match_result" for p in picks),
             "probability_source": "frozen_v1_home_away_poisson_lambdas",
+            "strict_playable_policy": POLICY_VERSION,
             "turkey_price_required": True,
-            "international_reference": "three_way_same_book_no_vig_when_available",
+            "international_reference": "three_way_same_book_no_vig_mandatory",
         },
     })
     policy = dict(result.get("policy") or {})
     policy.update({
-        "ranking": "existing_guarded_market_pool_plus_holdout_safe_1x2_candidate",
+        "ranking": "strict_playable_pool_plus_guarded_1x2",
         "one_x_two_policy_key": ONE_X_TWO_POLICY_KEY,
-        "one_x_two_registry_mode": x12["registry_mode"],
-        "one_x_two_market_active": True,
+        "one_x_two_registry_mode": x12.get("registry_mode"),
+        "one_x_two_market_active": bool(x12.get("active")),
         "one_x_two_fail_closed": True,
         "one_x_two_probability_source": "frozen_v1_home_away_poisson_lambdas",
         "one_x_two_turkey_price_required": True,
-        "one_x_two_international_reference": "three_way_same_book_no_vig",
+        "one_x_two_international_reference": "three_way_same_book_no_vig_mandatory",
     })
     result["policy"] = policy
     print("WEEKLY_TRUSTED_V2_RESULT", json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":")), flush=True)
