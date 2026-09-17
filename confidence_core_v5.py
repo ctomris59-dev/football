@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Production confidence/value gate for the six-layer football engine.
+"""Probability-first weekly football publication engine.
 
-V5 keeps all six evidence layers and adds two production guarantees:
-1) Core4 is a maximum, never a quota;
-2) all expensive strength/DC fits are frozen at the weekly decision cutoff and
-   memoized, so the same league model is not re-fit for every weekend match day.
+The six evidence layers remain available, but they are no longer six independent
+rejection gates.  The weekly product is now a reliability ranking:
+- probability drives the decision;
+- xG / opponent strength / XI / market / Dixon-Coles improve or penalise the score;
+- missing secondary evidence lowers rank instead of automatically deleting a match;
+- EV/value never blocks a Core4 selection.
+
+Hard rejection is reserved for genuinely unsafe rows: no executable Turkish price,
+very low model direction agreement, or a strong model-vs-market contradiction when
+a fresh international reference exists.
 
 The live 2026/27 outcomes are not used to tune weights or thresholds.
 """
@@ -16,40 +22,16 @@ from typing import Any, Dict, List
 import confidence_core_v4 as v4
 from thursday_decision_engine import DATABASE_URL, LIST_LIMIT, weekend_bounds
 
-POLICY_VERSION = "confidence-core-v5-honest-publication-2026-09-17"
+POLICY_VERSION = "confidence-core-v6-probability-first-2026-09-17"
 CORE4_SIZE = 4
-MIN_1X2_CONSENSUS = 0.55
-MIN_1X2_LOWER = 0.50
-MIN_BINARY_CONSENSUS = 0.60
-MIN_BINARY_LOWER = 0.56
-MIN_EVIDENCE = 0.80
-MIN_DIRECTION_AGREEMENT = 0.75
-PLAYABLE_MIN_EV = 0.00
+
+# Only genuinely contradictory evidence can remove a candidate. Everything else
+# affects the ranking score softly.
+HARD_MAX_MARKET_GAP = 0.16
+HARD_MIN_DIRECTION_AGREEMENT = 0.50
+MIN_REASONABLE_BINARY = 0.52
+MIN_REASONABLE_1X2 = 0.34
 VALUE_MIN_EV = 0.02
-
-
-def _passes_confidence(row: Dict[str, Any]) -> bool:
-    consensus = float(row.get("consensus_probability") or row.get("calibrated_probability") or 0.0)
-    lower = float(row.get("confidence_lower_bound") or 0.0)
-    evidence = float(row.get("evidence_quality") or 0.0)
-    agreement = float(row.get("direction_agreement") or 0.0)
-    if evidence < MIN_EVIDENCE or agreement < MIN_DIRECTION_AGREEMENT:
-        return False
-    if row.get("market") == "match_result":
-        return consensus >= MIN_1X2_CONSENSUS and lower >= MIN_1X2_LOWER
-    return consensus >= MIN_BINARY_CONSENSUS and lower >= MIN_BINARY_LOWER
-
-
-def _rerank(rows: List[Dict[str, Any]], tier: str, limit: int) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for i, raw in enumerate(rows[:limit], start=1):
-        row = dict(raw)
-        row["rank"] = i
-        row["list_tier"] = tier
-        row["policy_version"] = POLICY_VERSION
-        row["publication_gate_passed"] = True
-        out.append(row)
-    return out
 
 
 def _rows_signature(rows) -> tuple:
@@ -71,13 +53,7 @@ def _rows_signature(rows) -> tuple:
 
 
 def _build_v4_week_frozen(database_url: str, *, now=None, limit: int, strict_picks=None):
-    """Run V4 with one past-only feature snapshot per league for the weekly slate.
-
-    V4 intentionally used match-day cutoffs. For a Thursday-frozen product this caused
-    identical historical strength/DC models to be fitted repeatedly. Here all history
-    is frozen at the Friday 00:00 Istanbul horizon boundary and model fits are memoized.
-    No future result can enter a later Saturday/Sunday fixture during the same run.
-    """
+    """Freeze all causal feature/model fits at the weekly decision cutoff."""
     _week_key, cutoff, _end = weekend_bounds(now)
     original_history = v4._history_rows
     original_enrich = v4._enrich_xg
@@ -118,7 +94,7 @@ def _build_v4_week_frozen(database_url: str, *, now=None, limit: int, strict_pic
     v4.fit_opponent_strengths = cached_opp
     v4.fit_dc_rho = cached_dc
     try:
-        return v4.build(database_url, now=now, limit=limit, strict_picks=strict_picks)
+        return v4.build(database_url, now=now, limit=max(limit, 20), strict_picks=strict_picks)
     finally:
         v4._history_rows = original_history
         v4._enrich_xg = original_enrich
@@ -126,27 +102,120 @@ def _build_v4_week_frozen(database_url: str, *, now=None, limit: int, strict_pic
         v4.fit_dc_rho = original_fit_dc
 
 
+def _candidate_probability(row: Dict[str, Any]) -> float:
+    # Prefer market-anchored consensus when available; otherwise the multi-model
+    # median remains usable.  This deliberately does not require positive EV.
+    return float(
+        row.get("consensus_probability")
+        or row.get("calibrated_probability")
+        or row.get("model_probability_estimate")
+        or row.get("confidence")
+        or 0.0
+    )
+
+
+def _hard_reject(row: Dict[str, Any]) -> bool:
+    if row.get("tr_price") is None:
+        return True
+    p = _candidate_probability(row)
+    if row.get("market") == "match_result":
+        if p < MIN_REASONABLE_1X2:
+            return True
+    elif p < MIN_REASONABLE_BINARY:
+        return True
+    agreement = float(row.get("direction_agreement") or 0.0)
+    if agreement < HARD_MIN_DIRECTION_AGREEMENT:
+        return True
+    gap = row.get("model_market_gap")
+    if gap is not None and abs(float(gap)) > HARD_MAX_MARKET_GAP:
+        return True
+    return False
+
+
+def _reliability_score(row: Dict[str, Any]) -> float:
+    """Probability-first score with soft evidence penalties, never EV-driven."""
+    p = _candidate_probability(row)
+    lower = float(row.get("confidence_lower_bound") or p)
+    evidence = float(row.get("evidence_quality") or 0.0)
+    agreement = float(row.get("direction_agreement") or 0.0)
+
+    # Probability dominates. Lower bound and evidence stabilise close calls.
+    score = 0.66 * p + 0.14 * lower + 0.12 * evidence + 0.08 * agreement
+
+    # Missing evidence is a modest penalty, not an exclusion.
+    if not row.get("xg_used"):
+        score *= 0.965
+    if not row.get("opponent_model_available"):
+        score *= 0.975
+    if not row.get("dixon_coles_available"):
+        score *= 0.985
+    if not row.get("injury_feed_complete"):
+        score *= 0.980
+    books = row.get("international_bookmakers")
+    if books is None:
+        score *= 0.960
+    elif int(books or 0) < 2:
+        score *= 0.980
+
+    # Mild penalty for market disagreement that is below the hard-reject boundary.
+    gap = row.get("model_market_gap")
+    if gap is not None:
+        score *= max(0.94, 1.0 - 0.18 * abs(float(gap)))
+    return score
+
+
+def _dedupe_best(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    best: Dict[str, Dict[str, Any]] = {}
+    for raw in rows:
+        row = dict(raw)
+        if _hard_reject(row):
+            continue
+        row["reliability_score"] = _reliability_score(row)
+        eid = str(row.get("event_id"))
+        cur = best.get(eid)
+        if cur is None or float(row["reliability_score"]) > float(cur.get("reliability_score") or -1.0):
+            best[eid] = row
+    return list(best.values())
+
+
+def _rerank(rows: List[Dict[str, Any]], tier: str, limit: int) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for i, raw in enumerate(rows[:limit], start=1):
+        row = dict(raw)
+        row["rank"] = i
+        row["list_tier"] = tier
+        row["policy_version"] = POLICY_VERSION
+        row["publication_gate_passed"] = True
+        row["selection_semantics"] = "probability_first_reliability; value_not_required"
+        out.append(row)
+    return out
+
+
 def build(database_url: str = DATABASE_URL, *, now=None, limit: int = LIST_LIMIT, strict_picks=None) -> Dict[str, Any]:
     base = _build_v4_week_frozen(database_url, now=now, limit=max(limit, 20), strict_picks=strict_picks)
-    ranked = list(base.get("confidence_ranked") or base.get("ranked_picks") or [])
-    qualified = [r for r in ranked if _passes_confidence(r)]
-    qualified.sort(
+
+    # V4's confidence rows contain evidence-complete candidates. Fallback rows are
+    # deliberately re-admitted because missing one secondary evidence layer should
+    # no longer erase an otherwise strong favourite/profile.
+    pool = list(base.get("confidence_ranked") or base.get("ranked_picks") or [])
+    pool.extend(list(base.get("fallback_candidates") or []))
+    candidates = _dedupe_best(pool)
+    candidates.sort(
         key=lambda r: (
-            float(r.get("confidence_lower_bound") or 0.0),
-            float(r.get("consensus_probability") or 0.0),
+            float(r.get("reliability_score") or 0.0),
+            _candidate_probability(r),
             float(r.get("evidence_quality") or 0.0),
         ),
         reverse=True,
     )
-    confidence_ranked = _rerank(qualified, "confidence_ranked", limit)
-    confidence_core4 = _rerank(qualified, "confidence_core4", CORE4_SIZE)
 
-    values = [dict(r) for r in (base.get("value_picks") or []) if float(r.get("model_ev_vs_tr") or 0.0) >= VALUE_MIN_EV]
-    values.sort(key=lambda r: (float(r.get("model_ev_vs_tr") or 0.0), float(r.get("evidence_quality") or 0.0)), reverse=True)
-    value_picks = _rerank(values, "value", limit)
+    confidence_ranked = _rerank(candidates, "reliability_ranked", limit)
+    confidence_core4 = _rerank(candidates, "core4", CORE4_SIZE)
 
-    playable = [r for r in confidence_ranked if float(r.get("model_ev_vs_tr") or -9.0) >= PLAYABLE_MIN_EV]
-    playable = _rerank(playable, "playable_confidence", CORE4_SIZE)
+    # Value stays visible only as an optional badge/list; it never controls Core4.
+    values = [dict(r) for r in candidates if float(r.get("model_ev_vs_tr") or -9.0) >= VALUE_MIN_EV]
+    values.sort(key=lambda r: float(r.get("model_ev_vs_tr") or 0.0), reverse=True)
+    value_picks = _rerank(values, "value_optional", limit)
 
     result = dict(base)
     result.update({
@@ -155,32 +224,37 @@ def build(database_url: str = DATABASE_URL, *, now=None, limit: int = LIST_LIMIT
         "core4": confidence_core4,
         "confidence_ranked": confidence_ranked,
         "ranked_picks": confidence_ranked,
+        "weekly_reliable": confidence_ranked,
         "value_picks": value_picks,
-        "playable_picks": playable,
+        "playable_picks": confidence_core4,
         "trust_fixture_candidates": len(confidence_ranked),
         "value_fixture_candidates": len(value_picks),
-        "ready": bool(float(base.get("official_fixture_coverage") or 0.0) >= 0.90),
+        "ready": bool(float(base.get("official_fixture_coverage") or 0.0) >= 0.90 and len(confidence_core4) >= CORE4_SIZE),
         "publication_complete": True,
         "core4_slots_filled": len(confidence_core4),
-        "core4_not_forced": True,
+        "core4_probability_first": True,
     })
     policy = dict(base.get("policy") or {})
     policy.update({
         "policy_version": POLICY_VERSION,
-        "core4_is_maximum_not_quota": True,
-        "publication_min_1x2_consensus": MIN_1X2_CONSENSUS,
-        "publication_min_1x2_lower_bound": MIN_1X2_LOWER,
-        "publication_min_binary_consensus": MIN_BINARY_CONSENSUS,
-        "publication_min_binary_lower_bound": MIN_BINARY_LOWER,
-        "publication_min_evidence": MIN_EVIDENCE,
-        "playable_requires_nonnegative_ev": True,
-        "confidence_and_value_remain_separate": True,
+        "selection_semantics": "probability_first_reliability_ranking",
+        "core4_target": CORE4_SIZE,
+        "value_required_for_core4": False,
+        "positive_ev_required_for_core4": False,
+        "xg_required_for_core4": False,
+        "multi_book_required_for_core4": False,
+        "injury_feed_required_for_core4": False,
+        "dixon_coles_required_for_core4": False,
+        "secondary_evidence_is_soft_penalty": True,
+        "hard_max_model_market_gap": HARD_MAX_MARKET_GAP,
+        "hard_min_direction_agreement": HARD_MIN_DIRECTION_AGREEMENT,
+        "probability_is_primary_signal": True,
         "weekly_feature_cutoff": "Friday 00:00 Europe/Istanbul; one causal snapshot per league",
         "strength_and_dc_fit_memoized": True,
         "current_season_result_tuning": False,
     })
     result["policy"] = policy
-    print("WEEKLY_CORE4_V5_RESULT", json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":")), flush=True)
+    print("WEEKLY_CORE4_V6_RESULT", json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":")), flush=True)
     return result
 
 
