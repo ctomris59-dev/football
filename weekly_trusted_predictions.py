@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""Build the mandatory weekly reliability-ranked list.
+"""Build the strict, variable-length weekly playable shortlist.
 
-Frozen V1 remains the fail-closed baseline. Operational all-competition schedule
-context may de-rank/block a candidate. Validated goal-model, legacy Lineup V2, and
-the sequential ranking challenger stack can affect production only when their
-registry evidence is accepted by research_change_control.
+Frozen V1 remains the probability baseline. A selection reaches the user-facing
+list only when Turkey executable price, international no-vig validation, player
+context, injury-feed coverage and positive model EV are all present. The list may
+contain zero to LIST_LIMIT selections; Top-10 is never force-filled.
 """
 from __future__ import annotations
 
 import json
-import os
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import psycopg
 
@@ -40,6 +39,7 @@ from ranking_challenger_stack_policy import (
 )
 from research_change_control import registry_activation_mode
 from schedule_context import SCHEDULE_CONTEXT_VERSION, team_schedule_context
+from strict_selection_policy_v3 import POLICY_VERSION, policy_payload, qualify_candidate
 from thursday_decision_engine import (
     DATABASE_URL,
     HIGH_CONFIDENCE_MIN,
@@ -56,22 +56,20 @@ from thursday_decision_engine import (
     weekend_bounds,
 )
 
-MIN_WEEKLY_PICKS = int(os.getenv("WEEKLY_RELIABLE_MIN_PICKS", "5"))
+# Retained for backward compatibility with callers/tests. v3 does not require a
+# minimum number of picks; sufficient bulletin coverage can finalize an empty list.
+MIN_WEEKLY_PICKS = 0
 
 GOAL_MARKETS = (
     ("over_2_5", "p_over_2_5", "2.5 ÜST", "2.5 ALT"),
     ("btts", "p_btts", "KG VAR", "KG YOK"),
 )
-
-# Backward-compatible descriptor for callers that inspect the legacy fixed market set.
-# Fresh-preview construction itself uses GOAL_MARKETS plus all dynamic corner lines below.
 MARKETS = GOAL_MARKETS + (
     ("corners_over_8_5", "p_corners_over_8_5", "8.5 KORNER ÜST", "8.5 KORNER ALT"),
 )
 
 
 def _fixture_market_specs(pred: Any, advanced: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Return every market candidate evaluated by fresh preview for one fixture."""
     specs: List[Dict[str, Any]] = []
     for market, attr, yes_selection, no_selection in GOAL_MARKETS:
         specs.append({
@@ -102,7 +100,6 @@ def _selected_market_probability(ref: Optional[Dict[str, Any]], selected_yes: bo
 
 
 def _latest_corner_pressure_signal(conn, event_id: str) -> Optional[float]:
-    """Read the already-built, pre-match corner pressure signal; fail soft."""
     try:
         row = conn.execute(
             """SELECT corner_pressure_signal FROM fixture_pressure_snapshots
@@ -117,6 +114,35 @@ def _latest_corner_pressure_signal(conn, event_id: str) -> Optional[float]:
         return None
 
 
+def latest_injury_covered_teams(conn) -> Set[str]:
+    """Teams explicitly present in the freshest FotMob availability snapshot.
+
+    An empty injury list is valid only when the team itself is present in the feed.
+    This prevents missing injury data from silently becoming zero injury impact.
+    """
+    try:
+        hour_row = conn.execute(
+            "SELECT MAX(snapshot_hour) FROM fotmob_fixture_availability_snapshots"
+        ).fetchone()
+        hour = hour_row[0] if hour_row else None
+        if hour is None:
+            return set()
+        rows = conn.execute(
+            """SELECT home_team,away_team FROM fotmob_fixture_availability_snapshots
+                WHERE snapshot_hour=%s""",
+            (hour,),
+        ).fetchall()
+    except Exception:
+        return set()
+    covered: Set[str] = set()
+    for home, away in rows:
+        if home:
+            covered.add(canon(home))
+        if away:
+            covered.add(canon(away))
+    return covered
+
+
 def _public(row: Dict[str, Any]) -> Dict[str, Any]:
     ref = row.get("international") or {}
     goal_mode = row.get("goal_model_mode", ADVANCED_V1_MODE)
@@ -125,6 +151,7 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
         if goal_mode == ADVANCED_V1_MODE
         else "selected_side_guarded_advanced_goal_probability_estimate_not_perfectly_calibrated"
     )
+    qualification = row.get("qualification") or {}
     out = {
         "event_id": row["event_id"],
         "match_date": row["match_date"],
@@ -136,7 +163,9 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
         "confidence": row["confidence"],
         "model_probability_estimate": row["confidence"],
         "confidence_semantics": semantics,
-        "confidence_tier": "Yüksek Güven" if row["confidence"] >= HIGH_CONFIDENCE_MIN else "Haftanın En Güvenilirleri",
+        # Do not market raw point estimates as "high confidence" until live
+        # calibration/shadow evidence validates that terminology.
+        "confidence_tier": "Doğrulanmış Aday",
         "strict_high_confidence": row["confidence"] >= HIGH_CONFIDENCE_MIN,
         "ranking_score": row["ranking_score"],
         "schedule_rank_factor": row.get("schedule_rank_factor", 1.0),
@@ -157,7 +186,13 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
         "international_fair_probability": row.get("international_selected_probability"),
         "international_bookmakers": ref.get("bookmaker_count"),
         "international_quality": ref.get("quality"),
-        "market_check": row["market_check"],
+        "market_check": "aligned",
+        "qualification": "strict_playable",
+        "model_edge_vs_tr": qualification.get("model_edge_vs_tr"),
+        "model_ev_vs_tr": qualification.get("model_ev_vs_tr"),
+        "model_market_gap": qualification.get("model_market_gap"),
+        "tr_implied_probability": qualification.get("tr_implied_probability"),
+        "policy_version": POLICY_VERSION,
         "early_context": row["early_context"],
     }
     if row.get("corner_line") is not None:
@@ -172,6 +207,7 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
     if as_of.tzinfo is None:
         as_of = as_of.replace(tzinfo=timezone.utc)
     week_key, start, end = weekend_bounds(as_of)
+
     with psycopg.connect(database_url, autocommit=True) as conn:
         conn.execute(TURKEY_PRICE_DDL)
         ranking_stack_mode = registry_activation_mode(conn, RANKING_STACK_POLICY_KEY)
@@ -180,6 +216,8 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
         legacy_lineup_v2_active = (not ranking_stack_active) and lineup_v2_mode == LINEUP_V2_ACTIVE_MODE
         stack_lineup_active = ranking_stack_active and stack_feature_enabled(ranking_stack_mode, STACK_FEATURE_LINEUP)
         advanced_goal_mode = registry_activation_mode(conn, ADVANCED_GOAL_POLICY_KEY)
+        injury_covered = latest_injury_covered_teams(conn)
+
         fixtures = conn.execute(
             """SELECT event_id,match_date,league_name,home_team,away_team
                  FROM espn_upcoming
@@ -202,6 +240,7 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
             if not history:
                 excluded["no_history"] += 1
                 continue
+
             pred = predict_match(history, canon(home), canon(away), recent_matches=18)
             advanced = apply_advanced_goal_mode(pred, history, canon(home), canon(away), advanced_goal_mode)
             advanced_available = bool(advanced.get("available", True))
@@ -210,7 +249,8 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                 advanced = apply_advanced_goal_mode(pred, history, canon(home), canon(away), ADVANCED_V1_MODE)
                 effective_goal_mode = ADVANCED_V1_MODE
 
-            home_player_ctx, away_player_ctx = _player_context(conn, str(home)), _player_context(conn, str(away))
+            home_player_ctx = _player_context(conn, str(home))
+            away_player_ctx = _player_context(conn, str(away))
             legacy_home_rest = _last_rest_days(history, str(home), match_date)
             legacy_away_rest = _last_rest_days(history, str(away), match_date)
             home_sched = team_schedule_context(conn, str(home), match_date, as_of=as_of, fallback_rest_days=legacy_home_rest)
@@ -218,6 +258,11 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
 
             if home_sched.get("pending_pre_fixture_match") or away_sched.get("pending_pre_fixture_match"):
                 excluded["pending_intervening_official_match"] += 1
+                continue
+
+            # Missing availability feed coverage is not equivalent to zero injuries.
+            if canon(home) not in injury_covered or canon(away) not in injury_covered:
+                excluded["injury_context_missing"] += 1
                 continue
 
             home_rest = home_sched.get("rest_days")
@@ -247,6 +292,7 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                 "schedule_rank_factor": schedule_factor,
                 "home_schedule": home_sched,
                 "away_schedule": away_sched,
+                "injury_context_complete": True,
                 "match_environment": environment,
                 "match_environment_semantics": "shadow_unless_guarded_policy_activated",
                 "advanced_goal_policy_key": ADVANCED_GOAL_POLICY_KEY,
@@ -269,6 +315,7 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                 confidence = p_yes if selected_yes else 1.0 - p_yes
                 selection = spec["yes_selection"] if selected_yes else spec["no_selection"]
                 is_corner = spec.get("corner_line") is not None
+
                 price = _price_payload(conn, str(eid), market, selection)
                 if not price:
                     excluded["selected_corner_line_not_priced" if is_corner else "selected_side_not_priced"] += 1
@@ -278,12 +325,19 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
 
                 ref = latest_ref(conn, str(eid), market)
                 ref_selected = _selected_market_probability(ref, selected_yes)
-                if ref_selected is not None and abs(confidence - ref_selected) > INTERNATIONAL_MAX_MODEL_DIVERGENCE:
-                    excluded["strong_international_contradiction"] += 1
+                qualification = qualify_candidate(
+                    confidence=confidence,
+                    tr_price=price.get("tr_price"),
+                    international_probability=ref_selected,
+                    international_quality=(ref or {}).get("quality"),
+                    international_bookmakers=(ref or {}).get("bookmaker_count"),
+                    max_model_divergence=INTERNATIONAL_MAX_MODEL_DIVERGENCE,
+                )
+                if not qualification.get("qualified"):
+                    excluded[str(qualification.get("reason") or "strict_policy_rejected")] += 1
                     continue
-                market_check = "aligned" if ref_selected is not None else "reference_unavailable"
-                data_quality = float(gate_diag.get("model_data_quality") or 0.0)
 
+                data_quality = float(gate_diag.get("model_data_quality") or 0.0)
                 if ranking_stack_active:
                     stack = ranking_stack_live_factors(environment, market, selected_yes, ranking_stack_mode)
                     ranking_factor = float(stack["combined_factor"])
@@ -308,7 +362,8 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                 rows.append({
                     "event_id": str(eid), "match_date": match_date, "league": league_s,
                     "home": str(home), "away": str(away), "market": market, "selection": selection,
-                    "confidence": confidence, "ranking_score": ranking_score, "schedule_rank_factor": schedule_factor,
+                    "confidence": confidence, "ranking_score": ranking_score,
+                    "schedule_rank_factor": schedule_factor,
                     "goal_model_mode": effective_goal_mode, "advanced_goal_available": advanced_available,
                     "lineup_v2_active": bool(legacy_lineup_v2_active or stack_lineup_active),
                     "lineup_v2_available": lineup_available, "lineup_v2_factor": lineup_factor,
@@ -318,26 +373,45 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                     "missing_player_factor": float(stack.get("missing_player_factor", 1.0)),
                     "corner_specific_available": bool(stack.get("corner_specific_available", False)),
                     "corner_specific_factor": float(stack.get("corner_specific_factor", 1.0)),
-                    "price": price, "international": ref, "international_selected_probability": ref_selected,
-                    "market_check": market_check, "early_context": gate_diag,
+                    "price": price, "international": ref,
+                    "international_selected_probability": ref_selected,
+                    "market_check": "aligned", "qualification": qualification,
+                    "early_context": gate_diag,
                     "corner_line": spec.get("corner_line"),
                     "confidence_semantics": spec.get("confidence_semantics"),
                 })
                 if is_corner:
                     corner_candidate_rows += 1
 
-        one_per_fixture = _one_per_fixture(rows, lambda r: (float(r["ranking_score"]), float(r["confidence"]), r["market_check"] == "aligned"))
-        one_per_fixture.sort(key=lambda r: (float(r["ranking_score"]), float(r["confidence"]), r["market_check"] == "aligned"), reverse=True)
+        one_per_fixture = _one_per_fixture(
+            rows,
+            lambda r: (float(r["ranking_score"]), float(r["confidence"]), float((r.get("qualification") or {}).get("model_ev_vs_tr") or 0.0)),
+        )
+        one_per_fixture.sort(
+            key=lambda r: (float(r["ranking_score"]), float(r["confidence"]), float((r.get("qualification") or {}).get("model_ev_vs_tr") or 0.0)),
+            reverse=True,
+        )
         picks = [_public(r) for r in one_per_fixture[:limit]]
         strict_high = [p for p in picks if p["strict_high_confidence"]]
         coverage = _latest_import_coverage(conn, len(fixtures))
         official_coverage = float(coverage.get("fixture_coverage") or 0.0)
-        ready = official_coverage >= 0.90 and len(picks) >= min(MIN_WEEKLY_PICKS, max(1, len(fixtures)))
+        # v3 explicitly permits a finalized zero-pick week. Coverage, not quota,
+        # determines whether the universe was sufficiently observed.
+        ready = official_coverage >= 0.90
+
         result = {
-            "status": "success", "week_key": week_key, "horizon_start": start, "horizon_end": end,
-            "fixture_count": len(fixtures), "official_fixture_coverage": official_coverage, "ready": ready,
-            "picks": picks, "strict_high_confidence": strict_high,
-            "strict_high_confidence_count": len(strict_high), "ranked_pick_count": len(picks),
+            "status": "success",
+            "policy_version": POLICY_VERSION,
+            "week_key": week_key,
+            "horizon_start": start,
+            "horizon_end": end,
+            "fixture_count": len(fixtures),
+            "official_fixture_coverage": official_coverage,
+            "ready": ready,
+            "picks": picks,
+            "strict_high_confidence": strict_high,
+            "strict_high_confidence_count": len(strict_high),
+            "ranked_pick_count": len(picks),
             "excluded_counts": dict(excluded),
             "multiline_corner_diagnostics": {
                 "evaluated_lines": list(SUPPORTED_CORNER_LINES),
@@ -347,9 +421,9 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                 "turkey_exact_line_price_required": True,
             },
             "policy": {
-                "list_semantics": "weekly_reliability_ranking_not_guaranteed_70pct",
+                **policy_payload(),
                 "strict_high_confidence_min": HIGH_CONFIDENCE_MIN,
-                "ranking": "guarded_probability_x_data_quality_x_schedule_x_holdout_safe_ranking_stack",
+                "ranking": "strict_playable_probability_x_data_quality_x_schedule_x_holdout_safe_ranking_stack",
                 "advanced_goal_policy_key": ADVANCED_GOAL_POLICY_KEY,
                 "advanced_goal_mode": advanced_goal_mode,
                 "advanced_goal_fail_closed": True,
@@ -358,7 +432,8 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                 "multiline_corners_in_fresh_preview": True,
                 "turkey_exact_corner_line_price_required": True,
                 "schedule_context_version": SCHEDULE_CONTEXT_VERSION,
-                "schedule_scope": "all_competitions_with_domestic_fallback",
+                "schedule_scope": "all_competitions_completed_only_with_domestic_fallback",
+                "injury_feed_coverage_required": True,
                 "lineup_v2_policy_key": LINEUP_V2_POLICY_KEY,
                 "lineup_v2_mode": lineup_v2_mode,
                 "lineup_v2_active": bool(legacy_lineup_v2_active or stack_lineup_active),
@@ -367,9 +442,8 @@ def build(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None, l
                 "ranking_stack_active": ranking_stack_active,
                 "ranking_stack_fail_closed": True,
                 "pending_intervening_official_match": "exclude_until_next_refresh",
-                "turkey_price_required": True,
-                "international_reference": "reject strong contradiction when available; missing reference allowed for reliability list",
-                "value_separate": True,
+                "international_reference": "mandatory quality-approved no-vig reference",
+                "value_separate": False,
             },
         }
         print("WEEKLY_TRUSTED_RESULT", json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":")), flush=True)
