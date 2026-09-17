@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-"""Practical weekly Core4 decision selector.
+"""Practical weekly Core4 decision selector with EV-aware ranking.
 
 Purpose
 -------
 The strict-playable policy is intentionally conservative and may return zero rows.
-That is useful as a verification badge, but it is not a useful weekly decision
-product. This selector therefore ranks the *best available* Turkey-playable choices
-across the Friday-Monday slate and guarantees a Core4 when at least four priced,
-modelled fixtures exist.
+That remains useful as a verification badge, but the primary weekly product is a
+Core4 selected from the best Turkey-playable choices across the Friday-Monday slate.
 
 Important semantics
 -------------------
@@ -16,8 +14,10 @@ Important semantics
 - Strict-v3 remains a separate verification layer and can be empty.
 - Turkey executable price is mandatory.
 - A strong international-market contradiction is a hard reject.
-- Missing international/player/injury context is an uncertainty penalty, not an
-  automatic zero-pick outcome.
+- Missing international/player/injury context is an uncertainty penalty.
+- EV is now a first-class ranking input: positive EV is preferred for Core4 and
+  materially negative EV receives a strong asymmetric penalty.
+- If four positive-EV fixtures exist, no negative-EV row may enter Core4.
 - Current-season results are not used to tune thresholds here; this is an
   operational ranking contract around the frozen V1 probability engine.
 """
@@ -50,10 +50,12 @@ from thursday_decision_engine import (
     weekend_bounds,
 )
 
-POLICY_VERSION = "core4-decision-v1-2026-09-17"
+POLICY_VERSION = "core4-decision-v2-ev-aware-2026-09-17"
 CORE4_SIZE = 4
 MIN_BINARY_CONFIDENCE = 0.54
 MIN_1X2_CONFIDENCE = 0.40
+CORE_MIN_EV = 0.0
+CORE_NEAR_FAIR_MIN_EV = -0.02
 HARD_MARKET_DIVERGENCE = max(0.16, float(INTERNATIONAL_MAX_MODEL_DIVERGENCE))
 
 SOFT_BLOCKER_FACTORS: Dict[str, float] = {
@@ -129,18 +131,45 @@ def _market_factor(confidence: float, ref_probability: Optional[float], quality:
 
 
 def _price_factor(confidence: float, tr_price: float) -> Tuple[float, float, float]:
+    """Return an asymmetric EV factor, edge and model EV at Turkey price.
+
+    V1 only moved ranking by roughly +/-3%, which let deeply negative-EV choices
+    remain near the top. V2 rewards positive EV modestly but penalizes negative EV
+    much more aggressively. Probability still matters, but a bad executable price
+    can no longer be almost ignored.
+    """
     price = float(tr_price)
     implied = 1.0 / price
     edge = float(confidence) - implied
     ev = float(confidence) * price - 1.0
-    # Price is informative but must not dominate the probability ranking. Bound its
-    # effect to roughly +/-3% so a long price cannot manufacture a Core4 row.
-    factor = 1.0 + max(-0.03, min(0.03, ev * 0.12))
+    if ev >= 0.0:
+        factor = 1.0 + min(0.10, ev * 0.45)
+    else:
+        factor = max(0.72, 1.0 + ev * 1.20)
     return factor, edge, ev
+
+
+def _ev_bucket(ev: float) -> int:
+    if ev >= CORE_MIN_EV:
+        return 2
+    if ev >= CORE_NEAR_FAIR_MIN_EV:
+        return 1
+    return 0
+
+
+def _row_rank_key(row: Dict[str, Any]) -> Tuple[int, float, float, float]:
+    ev = float(row.get("model_ev_vs_tr") if row.get("model_ev_vs_tr") is not None else -9.0)
+    return (
+        _ev_bucket(ev),
+        float(row["decision_score"]),
+        float(row["confidence"]),
+        ev,
+    )
 
 
 def _public(row: Dict[str, Any], rank: int, strict_keys: Set[Tuple[str, str, str]]) -> Dict[str, Any]:
     key = (str(row["event_id"]), str(row["market"]), str(row["selection"]))
+    ev = float(row.get("model_ev_vs_tr") if row.get("model_ev_vs_tr") is not None else -9.0)
     return {
         "rank": rank,
         "list_tier": "core4" if rank <= CORE4_SIZE else "ranked_candidate",
@@ -164,7 +193,8 @@ def _public(row: Dict[str, Any], rank: int, strict_keys: Set[Tuple[str, str, str
         "market_check": row.get("market_check"),
         "model_market_gap": row.get("model_market_gap"),
         "model_edge_vs_tr": row.get("model_edge_vs_tr"),
-        "model_ev_vs_tr": row.get("model_ev_vs_tr"),
+        "model_ev_vs_tr": ev,
+        "ev_status": "positive" if ev >= CORE_MIN_EV else ("near_fair" if ev >= CORE_NEAR_FAIR_MIN_EV else "negative"),
         "data_quality": row.get("data_quality"),
         "schedule_rank_factor": row.get("schedule_factor"),
         "context_penalty": row.get("context_penalty"),
@@ -247,8 +277,6 @@ def build(
             data_quality = min(1.0, max(0.35, float(gate_diag.get("model_data_quality") or getattr(pred, "data_quality", 0.0) or 0.0)))
             quality_factor = 0.80 + 0.20 * data_quality
 
-            # Binary goal markets. We rank the model-preferred side only; the system
-            # does not manufacture both sides of one market as separate candidates.
             binary_specs = (
                 ("over_2_5", float(pred.p_over_2_5), "2.5 ÜST", "2.5 ALT"),
                 ("btts", float(pred.p_btts), "KG VAR", "KG YOK"),
@@ -288,7 +316,6 @@ def build(
                 })
                 market_counts[market] += 1
 
-            # Guarded 1X2 candidate from the same frozen V1 lambdas.
             try:
                 one = from_v1_prediction(pred)
                 selection, confidence = ranked_outcomes(one)[0]
@@ -324,41 +351,52 @@ def build(
                 else:
                     excluded["turkey_1x2_price_missing"] += 1
 
-        # One bet maximum per fixture: pick the strongest risk-adjusted market.
+        # One bet maximum per fixture. Positive EV now wins the first comparison
+        # bucket, then near-fair, then materially negative EV. Inside each bucket we
+        # retain the full risk-adjusted score/probability ordering.
         best_by_fixture: Dict[str, Dict[str, Any]] = {}
         for row in rows:
             current = best_by_fixture.get(row["event_id"])
-            candidate_key = (float(row["decision_score"]), float(row["confidence"]), float(row.get("model_ev_vs_tr") or -9.0))
-            current_key = (
-                float(current["decision_score"]), float(current["confidence"]), float(current.get("model_ev_vs_tr") or -9.0)
-            ) if current else None
-            if current is None or candidate_key > current_key:
+            if current is None or _row_rank_key(row) > _row_rank_key(current):
                 best_by_fixture[row["event_id"]] = row
 
-        ranked = list(best_by_fixture.values())
-        ranked.sort(
-            key=lambda r: (float(r["decision_score"]), float(r["confidence"]), float(r.get("model_ev_vs_tr") or -9.0)),
-            reverse=True,
-        )
+        ranked_all = list(best_by_fixture.values())
+        ranked_all.sort(key=_row_rank_key, reverse=True)
+        positive = [r for r in ranked_all if float(r.get("model_ev_vs_tr") or 0.0) >= CORE_MIN_EV]
+        near_fair = [
+            r for r in ranked_all
+            if CORE_NEAR_FAIR_MIN_EV <= float(r.get("model_ev_vs_tr") or -9.0) < CORE_MIN_EV
+        ]
+        negative = [r for r in ranked_all if float(r.get("model_ev_vs_tr") or -9.0) < CORE_NEAR_FAIR_MIN_EV]
 
-        # Core4 is a product contract: if at least four playable/modelled fixtures
-        # exist, publish the best four. Additional rows are shown only when they stay
-        # reasonably close to the fourth-ranked decision score.
-        core_raw = ranked[:CORE4_SIZE]
-        if len(core_raw) >= CORE4_SIZE:
-            fourth_score = float(core_raw[-1]["decision_score"])
-            extra_floor = max(0.50, fourth_score * 0.90)
-            display_raw = [r for r in ranked[:limit] if len(core_raw) < CORE4_SIZE or float(r["decision_score"]) >= extra_floor]
-            if len(display_raw) < CORE4_SIZE:
-                display_raw = ranked[:CORE4_SIZE]
+        # Core4 contract with EV protection:
+        # 1) use positive-EV fixtures first;
+        # 2) only if needed, add near-fair rows (down to -2% EV);
+        # 3) only as a last-resort product fallback, use the least-bad negative rows.
+        core_pool = positive[:CORE4_SIZE]
+        if len(core_pool) < CORE4_SIZE:
+            core_pool.extend(near_fair[: CORE4_SIZE - len(core_pool)])
+        if len(core_pool) < CORE4_SIZE:
+            core_pool.extend(negative[: CORE4_SIZE - len(core_pool)])
+
+        core_ids = {str(r["event_id"]) for r in core_pool}
+        remaining = [r for r in ranked_all if str(r["event_id"]) not in core_ids]
+        ordered = core_pool + remaining
+
+        if len(core_pool) >= CORE4_SIZE:
+            fourth_score = float(core_pool[-1]["decision_score"])
+            extra_floor = max(0.45, fourth_score * 0.88)
+            extras = [r for r in remaining if float(r["decision_score"]) >= extra_floor]
+            display_raw = (core_pool + extras)[:limit]
         else:
-            display_raw = ranked[:limit]
+            display_raw = ordered[:limit]
 
         public = [_public(row, idx, strict_keys) for idx, row in enumerate(display_raw, start=1)]
         core4 = public[:CORE4_SIZE]
         coverage = _latest_import_coverage(conn, len(fixtures))
         official_coverage = float(coverage.get("fixture_coverage") or 0.0)
         ready = bool(official_coverage >= 0.90 and len(core4) >= CORE4_SIZE)
+        negative_core_fallbacks = sum(float(p.get("model_ev_vs_tr") or -9.0) < CORE_NEAR_FAIR_MIN_EV for p in core4)
 
         result = {
             "status": "success",
@@ -369,20 +407,29 @@ def build(
             "fixture_count": len(fixtures),
             "official_fixture_coverage": official_coverage,
             "candidate_market_rows": len(rows),
-            "candidate_fixture_rows": len(ranked),
+            "candidate_fixture_rows": len(ranked_all),
+            "positive_ev_fixture_candidates": len(positive),
+            "near_fair_fixture_candidates": len(near_fair),
+            "negative_ev_fixture_candidates": len(negative),
+            "negative_ev_core_fallbacks": negative_core_fallbacks,
             "ready": ready,
             "core4": core4,
             "ranked_picks": public,
             "excluded_counts": dict(excluded),
             "market_candidate_counts": dict(market_counts),
             "policy": {
-                "selection_semantics": "relative_weekly_core4_plus_optional_ranked_candidates",
+                "selection_semantics": "ev_aware_relative_weekly_core4_plus_optional_ranked_candidates",
                 "core4_required_when_four_playable_modelled_fixtures_exist": True,
                 "core4_size": CORE4_SIZE,
                 "core4_is_not_70pct_claim": True,
                 "strict_verification_is_separate": True,
                 "turkey_executable_price_required": True,
                 "strong_market_contradiction_rejected": True,
+                "core_positive_ev_preferred": True,
+                "core_min_ev": CORE_MIN_EV,
+                "core_near_fair_min_ev": CORE_NEAR_FAIR_MIN_EV,
+                "negative_ev_core_only_last_resort": True,
+                "negative_ev_penalty": "asymmetric_price_factor_min_0.72",
                 "missing_international_reference": "soft_uncertainty_penalty",
                 "missing_injury_feed": "soft_uncertainty_penalty",
                 "early_gate_blockers": "soft_risk_penalties_except_no_history_or_pending_fixture",
