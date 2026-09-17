@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
-"""Production confidence/value post-gate for the six-layer V4 engine.
+"""Production confidence/value gate for the six-layer football engine.
 
-V5 keeps all six V4 evidence layers, but fixes the remaining product-level problem:
-'Core4' is a maximum of four genuinely strong confidence decisions, never a quota.
-It also exposes a separate playable intersection so a high-confidence event with a
-bad Turkish price is not silently presented as a good bet.
+V5 keeps all six evidence layers and adds two production guarantees:
+1) Core4 is a maximum, never a quota;
+2) all expensive strength/DC fits are frozen at the weekly decision cutoff and
+   memoized, so the same league model is not re-fit for every weekend match day.
 
-No threshold here is tuned on 2026/27 outcomes. These are conservative publication
-rules around the already-frozen six-layer model/evidence stack.
+The live 2026/27 outcomes are not used to tune weights or thresholds.
 """
 from __future__ import annotations
 
 import json
 from typing import Any, Dict, List
 
-from confidence_core_v4 import build as build_v4
-from thursday_decision_engine import DATABASE_URL, LIST_LIMIT
+import confidence_core_v4 as v4
+from thursday_decision_engine import DATABASE_URL, LIST_LIMIT, weekend_bounds
 
 POLICY_VERSION = "confidence-core-v5-honest-publication-2026-09-17"
 CORE4_SIZE = 4
-
-# Publication floors. 1X2 has intrinsically lower winning probabilities than a
-# binary market, so thresholds are market-specific.
 MIN_1X2_CONSENSUS = 0.55
 MIN_1X2_LOWER = 0.50
 MIN_BINARY_CONSENSUS = 0.60
@@ -56,8 +52,82 @@ def _rerank(rows: List[Dict[str, Any]], tier: str, limit: int) -> List[Dict[str,
     return out
 
 
+def _rows_signature(rows) -> tuple:
+    if not rows:
+        return (0,)
+    first, last = rows[0], rows[-1]
+    hg = ag = 0.0
+    for r in rows:
+        try:
+            hg += float(r.get("home_goals") or 0.0)
+            ag += float(r.get("away_goals") or 0.0)
+        except Exception:
+            pass
+    return (
+        len(rows), str(first.get("match_date")), str(last.get("match_date")),
+        str(first.get("home_team")), str(last.get("away_team")),
+        round(hg, 3), round(ag, 3),
+    )
+
+
+def _build_v4_week_frozen(database_url: str, *, now=None, limit: int, strict_picks=None):
+    """Run V4 with one past-only feature snapshot per league for the weekly slate.
+
+    V4 intentionally used match-day cutoffs. For a Thursday-frozen product this caused
+    identical historical strength/DC models to be fitted repeatedly. Here all history
+    is frozen at the Friday 00:00 Istanbul horizon boundary and model fits are memoized.
+    No future result can enter a later Saturday/Sunday fixture during the same run.
+    """
+    _week_key, cutoff, _end = weekend_bounds(now)
+    original_history = v4._history_rows
+    original_enrich = v4._enrich_xg
+    original_fit_opp = v4.fit_opponent_strengths
+    original_fit_dc = v4.fit_dc_rho
+
+    history_cache: Dict[str, Any] = {}
+    xg_cache: Dict[str, Any] = {}
+    opp_cache: Dict[tuple, Any] = {}
+    dc_cache: Dict[tuple, Any] = {}
+
+    def frozen_history(conn, league, _before):
+        key = str(league)
+        if key not in history_cache:
+            history_cache[key] = original_history(conn, league, cutoff)
+        return history_cache[key]
+
+    def frozen_xg(conn, league, _before, history):
+        key = str(league)
+        if key not in xg_cache:
+            xg_cache[key] = original_enrich(conn, league, cutoff, history)
+        return xg_cache[key]
+
+    def cached_opp(rows):
+        sig = _rows_signature(rows)
+        if sig not in opp_cache:
+            opp_cache[sig] = original_fit_opp(rows)
+        return opp_cache[sig]
+
+    def cached_dc(rows):
+        sig = _rows_signature(rows)
+        if sig not in dc_cache:
+            dc_cache[sig] = original_fit_dc(rows)
+        return dc_cache[sig]
+
+    v4._history_rows = frozen_history
+    v4._enrich_xg = frozen_xg
+    v4.fit_opponent_strengths = cached_opp
+    v4.fit_dc_rho = cached_dc
+    try:
+        return v4.build(database_url, now=now, limit=limit, strict_picks=strict_picks)
+    finally:
+        v4._history_rows = original_history
+        v4._enrich_xg = original_enrich
+        v4.fit_opponent_strengths = original_fit_opp
+        v4.fit_dc_rho = original_fit_dc
+
+
 def build(database_url: str = DATABASE_URL, *, now=None, limit: int = LIST_LIMIT, strict_picks=None) -> Dict[str, Any]:
-    base = build_v4(database_url, now=now, limit=max(limit, 20), strict_picks=strict_picks)
+    base = _build_v4_week_frozen(database_url, now=now, limit=max(limit, 20), strict_picks=strict_picks)
     ranked = list(base.get("confidence_ranked") or base.get("ranked_picks") or [])
     qualified = [r for r in ranked if _passes_confidence(r)]
     qualified.sort(
@@ -75,7 +145,6 @@ def build(database_url: str = DATABASE_URL, *, now=None, limit: int = LIST_LIMIT
     values.sort(key=lambda r: (float(r.get("model_ev_vs_tr") or 0.0), float(r.get("evidence_quality") or 0.0)), reverse=True)
     value_picks = _rerank(values, "value", limit)
 
-    # Actionable list = confidence publication gate AND non-negative executable EV.
     playable = [r for r in confidence_ranked if float(r.get("model_ev_vs_tr") or -9.0) >= PLAYABLE_MIN_EV]
     playable = _rerank(playable, "playable_confidence", CORE4_SIZE)
 
@@ -106,6 +175,8 @@ def build(database_url: str = DATABASE_URL, *, now=None, limit: int = LIST_LIMIT
         "publication_min_evidence": MIN_EVIDENCE,
         "playable_requires_nonnegative_ev": True,
         "confidence_and_value_remain_separate": True,
+        "weekly_feature_cutoff": "Friday 00:00 Europe/Istanbul; one causal snapshot per league",
+        "strength_and_dc_fit_memoized": True,
         "current_season_result_tuning": False,
     })
     result["policy"] = policy
