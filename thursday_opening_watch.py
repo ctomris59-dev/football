@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Thursday watcher for the strict, variable-length playable shortlist.
+"""Thursday watcher for the practical Core4 decision workflow.
 
-A weekly final produced by an older policy is automatically superseded once this
-strict policy is deployed. The user-facing list may contain 0..10 selections and
-is never force-filled. Every published row must already have passed the strict
-playable policy in weekly_trusted_predictions_v2.
+The primary weekly product is now a risk-adjusted Core4 (plus optional ranked
+candidates). The conservative strict-playable-v3 list remains available as an
+independent verification layer/rosette and is allowed to be empty.
 """
 from __future__ import annotations
 
@@ -20,14 +19,15 @@ from psycopg.types.json import Jsonb
 from thursday_decision_engine_v3 import build_decision
 from thursday_decision_engine import json_default, weekend_bounds
 from turkey_iddaa_odds_collector import run_import
-from strict_selection_policy_v3 import POLICY_VERSION
+from strict_selection_policy_v3 import POLICY_VERSION as STRICT_POLICY_VERSION
+from weekly_core4_decision import POLICY_VERSION as CORE_POLICY_VERSION
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 ISTANBUL = ZoneInfo("Europe/Istanbul")
 FORCE = os.getenv("OPENING_WATCH_FORCE", "false").lower() in {"1", "true", "yes"}
 EARLIEST_THURSDAY_HOUR = int(os.getenv("THURSDAY_EARLIEST_FINALIZE_HOUR", "9"))
 FRIDAY_CUTOFF_HOUR = int(os.getenv("FRIDAY_OPENING_WATCH_CUTOFF_HOUR", "12"))
-CURRENT_SOURCE = f"{POLICY_VERSION}+iddaa_official+international_no_vig"
+CURRENT_SOURCE = f"{CORE_POLICY_VERSION}+iddaa_official+risk_adjusted"
 
 DDL = """
 CREATE TABLE IF NOT EXISTS thursday_final_decisions(
@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS thursday_final_decisions(
  finalized_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
  decision_run_id BIGINT NOT NULL,
  payload JSONB NOT NULL,
- source TEXT NOT NULL DEFAULT 'strict-playable-v3'
+ source TEXT NOT NULL DEFAULT 'core4-decision-v1'
 );
 CREATE TABLE IF NOT EXISTS thursday_watch_checks(
  week_key DATE NOT NULL,
@@ -59,19 +59,17 @@ def _pick_key(item: Dict[str, Any]) -> tuple[str, str, str]:
 def _decorate_verified_picks(
     picks: List[Dict[str, Any]], value_list: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
-    """Attach rank/value metadata without changing strict membership."""
     values = {_pick_key(v): v for v in value_list}
     decorated: List[Dict[str, Any]] = []
     for rank, original in enumerate(picks, start=1):
         item = dict(original)
         value = values.get(_pick_key(original))
-        item["rank"] = rank
-        item["list_tier"] = "verified_playable"
-        item["is_value"] = bool(value) or item.get("qualification") == "strict_playable"
+        item["verified_rank"] = rank
+        item["strict_verified"] = True
+        item["verification_tier"] = "strict_playable"
         if value:
             item["model_ev_vs_tr"] = value.get("model_ev_vs_tr", item.get("model_ev_vs_tr"))
             item["model_edge_vs_tr"] = value.get("model_edge_vs_tr", item.get("model_edge_vs_tr"))
-        item["value_semantics"] = "strict_playable_requires_positive_model_ev_at_turkey_price"
         decorated.append(item)
     return decorated
 
@@ -156,7 +154,6 @@ def main(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None) ->
                 }
                 print("THURSDAY_FINAL_DECISION", json.dumps(result, ensure_ascii=False, default=json_default, separators=(",", ":")), flush=True)
                 return result
-            # A legacy weekly final must never block a stricter deployed policy.
             superseded_source = existing_source
             conn.execute("DELETE FROM thursday_final_decisions WHERE week_key=%s", (week_key,))
             print(
@@ -186,7 +183,6 @@ def main(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None) ->
                 international = refresh_and_map(database_url, start=start, end=end)
             except Exception as exc:
                 international = {"status": "failed", "error": str(exc)[:1200]}
-
             try:
                 from one_x_two_market_reference import build_refs as build_1x2_refs
                 international_1x2 = build_1x2_refs(database_url, start=start, end=end)
@@ -196,19 +192,23 @@ def main(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None) ->
             international = {"status": "waiting_for_turkey_prices"}
             international_1x2 = {"status": "waiting_for_turkey_prices"}
 
+        # Keep the old decision engine for audit diagnostics/value bookkeeping.
         decision = build_decision(database_url, now=now)
 
-        from weekly_trusted_predictions_v2 import build as build_weekly_trusted
-        trusted = build_weekly_trusted(database_url, now=now)
-
+        # Strict verification layer: conservative and allowed to be empty.
+        from weekly_trusted_predictions_v2 import build as build_strict
+        strict = build_strict(database_url, now=now)
         value_list = decision.get("high_confidence_value") or [] if decision.get("decision_ready") else []
-        verified_picks = _decorate_verified_picks(trusted.get("picks") or [], value_list)
+        verified_picks = _decorate_verified_picks(strict.get("picks") or [], value_list)
         strict_70 = [p for p in verified_picks if p.get("strict_high_confidence")]
 
-        status = "ready_to_finalize" if trusted.get("ready") else "pending_bulletin"
-        if turkey_ready and not trusted.get("ready"):
-            status = "pending_reliable_universe"
+        # Primary practical decision product: Core4 + optional ranked candidates.
+        from weekly_core4_decision import build as build_core4
+        core = build_core4(database_url, now=now, strict_picks=verified_picks)
+        core4 = core.get("core4") or []
+        ranked_picks = core.get("ranked_picks") or []
 
+        status = "ready_to_finalize" if core.get("ready") else "pending_core4"
         result: Dict[str, Any] = {
             "status": status,
             "week_key": week_key,
@@ -219,44 +219,73 @@ def main(database_url: str = DATABASE_URL, *, now: Optional[datetime] = None) ->
             "international": international,
             "international_1x2": international_1x2,
             "decision_run_id": decision.get("decision_run_id"),
-            "decision_engine": POLICY_VERSION,
-            "official_fixture_coverage": trusted.get("official_fixture_coverage"),
+            "decision_engine": CORE_POLICY_VERSION,
+            "official_fixture_coverage": core.get("official_fixture_coverage"),
+            "core4": core4,
+            "ranked_picks": ranked_picks,
+            "weekly_reliable": ranked_picks,
             "verified_playable": verified_picks,
-            "weekly_reliable": verified_picks,
             "strict_high_confidence": strict_70,
             "strict_high_confidence_count": len(strict_70),
             "high_confidence_value": value_list,
-            "value_decision_ready": bool(decision.get("decision_ready")),
-            "excluded_counts": trusted.get("excluded_counts") or {},
+            "core_diagnostics": {
+                "candidate_market_rows": core.get("candidate_market_rows"),
+                "candidate_fixture_rows": core.get("candidate_fixture_rows"),
+                "market_candidate_counts": core.get("market_candidate_counts") or {},
+                "excluded_counts": core.get("excluded_counts") or {},
+            },
+            "strict_diagnostics": {
+                "policy_version": STRICT_POLICY_VERSION,
+                "verified_count": len(verified_picks),
+                "excluded_counts": strict.get("excluded_counts") or {},
+            },
         }
 
-        if trusted.get("ready"):
+        if core.get("ready"):
             payload = {
                 "week_key": week_key,
                 "finalized_at": datetime.now(timezone.utc),
                 "decision_run_id": decision.get("decision_run_id") or 0,
-                "decision_engine": POLICY_VERSION,
-                "official_fixture_coverage": trusted.get("official_fixture_coverage"),
+                "decision_engine": CORE_POLICY_VERSION,
+                "official_fixture_coverage": core.get("official_fixture_coverage"),
+                "core4": core4,
+                "ranked_picks": ranked_picks,
+                "weekly_reliable": ranked_picks,
                 "verified_playable": verified_picks,
-                "weekly_reliable": verified_picks,
-                # Compatibility only; no longer semantically means >=70%.
-                "high_confidence": verified_picks,
+                # Backward compatibility: high_confidence is strict-only now.
+                "high_confidence": strict_70,
                 "strict_high_confidence": strict_70,
                 "high_confidence_value": value_list,
                 "policy": {
-                    "primary_list": trusted.get("policy") or {},
-                    "selection_semantics": "strict_playable_variable_0_to_10",
-                    "force_fill_top10": False,
-                    "ranking_priority": "only_after_strict_playable_qualification",
-                    "turkey_price_required": True,
-                    "international_reference_required": True,
-                    "positive_model_ev_required": True,
-                    "legacy_core4_disabled": True,
-                    "no_bet_week_allowed": True,
+                    "primary_list": core.get("policy") or {},
+                    "selection_semantics": "core4_relative_weekly_rank_plus_separate_strict_verification",
+                    "core4_required": True,
+                    "core4_size": 4,
+                    "core4_is_not_70pct_claim": True,
+                    "strict_verification_policy": strict.get("policy") or {},
+                    "strict_verification_can_be_empty": True,
+                    "turkey_price_required_for_core": True,
+                    "strong_market_contradiction_rejected": True,
+                    "missing_context_penalized_not_automatically_rejected": True,
+                    "current_season_result_tuning": False,
+                },
+                "diagnostics": {
+                    "core": {
+                        "candidate_market_rows": core.get("candidate_market_rows"),
+                        "candidate_fixture_rows": core.get("candidate_fixture_rows"),
+                        "market_candidate_counts": core.get("market_candidate_counts") or {},
+                        "excluded_counts": core.get("excluded_counts") or {},
+                    },
+                    "strict": {
+                        "policy_version": STRICT_POLICY_VERSION,
+                        "verified_count": len(verified_picks),
+                        "excluded_counts": strict.get("excluded_counts") or {},
+                    },
                 },
                 "sources": {
-                    "model": "validated_v1_plus_guarded_1x2_when_strictly_qualified",
-                    "international_primary": "mandatory no-vig probability sanity reference",
+                    "model": "frozen_v1 risk-adjusted weekly ranking",
+                    "strict_verification": STRICT_POLICY_VERSION,
+                    "international_primary": "no-vig sanity/contradiction reference where available",
                     "executable_price": "iddaa_official_turkey",
                 },
             }
