@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Compatibility entrypoint for Thursday confidence/value V3 finalization."""
-from thursday_opening_watch_v3 import *  # noqa: F401,F403
+"""Compatibility entrypoint for Thursday confidence/value V4 finalization."""
+from thursday_opening_watch_v4 import *  # noqa: F401,F403
 
 if __name__ == "__main__":
     import json
