@@ -5,7 +5,7 @@ Primary product surface:
 - Thursday model/context refresh;
 - official Turkey opening-price watch;
 - international paired same-book no-vig validation;
-- one frozen weekly decision containing exactly two lists.
+- one frozen weekly decision with Core4, reliability ranking and Value kept separate.
 
 Legacy research tables remain in Postgres for validation, but are not part of the
 weekly user-facing decision path.
@@ -180,7 +180,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Football Thursday Decision Service", version="5.3", lifespan=lifespan)
+app = FastAPI(title="Football Thursday Decision Service", version="5.4", lifespan=lifespan)
 from over25_research_endpoint import router as over25_research_router
 app.include_router(over25_research_router)
 
@@ -189,8 +189,8 @@ app.include_router(over25_research_router)
 def health():
     return {
         "ok": True,
-        "version": "5.3",
-        "workflow": "Thursday -> model + international no-vig + Turkey price -> two lists -> bet -> done",
+        "version": "5.4",
+        "workflow": "Thursday -> model/context -> Core4 + ranked reliability + separate Value list",
         "auto_live_refresh": AUTO_LIVE_REFRESH,
         "scheduler_auth_configured": bool(THURSDAY_SCHEDULER_KEY),
         "refresh": dict(refresh_state),
@@ -253,15 +253,11 @@ def opening_watch(x_scheduler_key: Optional[str] = Header(None, alias="X-Schedul
         opening_lock.release()
 
 
-@app.get("/thursday-list")
-def thursday_list():
-    if not DATABASE_URL:
-        raise HTTPException(500, "DATABASE_URL is not configured.")
-    from thursday_opening_watch import latest_final
-    final = latest_final(DATABASE_URL)
-    if not final:
-        return {"ok": True, "status": "pending", "message": "This week's model + international + Turkey opening decision has not been finalized yet."}
+def _decision_payload(final: dict[str, Any]) -> dict[str, Any]:
     payload = final.get("payload") or {}
+    core4 = payload.get("core4") or payload.get("confidence_core4") or payload.get("high_confidence") or []
+    ranked = payload.get("ranked_picks") or payload.get("confidence_ranked") or payload.get("weekly_reliable") or core4
+    values = payload.get("value_picks") or payload.get("high_confidence_value") or []
     return {
         "ok": True,
         "status": "finalized",
@@ -269,11 +265,35 @@ def thursday_list():
         "finalized_at": final.get("finalized_at"),
         "source": final.get("source"),
         "sources": payload.get("sources") or {},
-        "high_confidence": payload.get("high_confidence") or [],
-        "high_confidence_value": payload.get("high_confidence_value") or [],
+        "core4": core4,
+        "ranked_picks": ranked,
+        "value_picks": values,
+        # Legacy aliases retained for existing clients.
+        "high_confidence": core4,
+        "high_confidence_value": values,
         "official_fixture_coverage": payload.get("official_fixture_coverage"),
         "policy": payload.get("policy") or {},
     }
+
+
+@app.get("/thursday-list")
+def thursday_list():
+    if not DATABASE_URL:
+        raise HTTPException(500, "DATABASE_URL is not configured.")
+    from thursday_opening_watch import latest_final
+    final = latest_final(DATABASE_URL)
+    if not final:
+        return {
+            "ok": True,
+            "status": "pending",
+            "message": "This week's model + international + Turkey opening decision has not been finalized yet.",
+            "core4": [],
+            "ranked_picks": [],
+            "value_picks": [],
+            "high_confidence": [],
+            "high_confidence_value": [],
+        }
+    return _decision_payload(final)
 
 
 @app.get("/status")
@@ -330,18 +350,16 @@ def predictions(token: Optional[str] = Query(None), authorization: Optional[str]
     from thursday_opening_watch import latest_final
     final = latest_final(DATABASE_URL)
     if not final:
-        return {"ok": True, "status": "pending", "high_confidence": [], "high_confidence_value": []}
-    payload = final.get("payload") or {}
-    return {
-        "ok": True,
-        "status": "finalized",
-        "week_key": final.get("week_key"),
-        "finalized_at": final.get("finalized_at"),
-        "source": final.get("source"),
-        "sources": payload.get("sources") or {},
-        "high_confidence": payload.get("high_confidence") or [],
-        "high_confidence_value": payload.get("high_confidence_value") or [],
-    }
+        return {
+            "ok": True,
+            "status": "pending",
+            "core4": [],
+            "ranked_picks": [],
+            "value_picks": [],
+            "high_confidence": [],
+            "high_confidence_value": [],
+        }
+    return _decision_payload(final)
 
 
 @app.get("/download")
