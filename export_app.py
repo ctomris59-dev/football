@@ -298,7 +298,7 @@ def thursday_list():
 
 
 @app.get("/week-audit")
-def week_audit(week_key: str = Query(..., pattern=r"^\\d{4}-\\d{2}-\\d{2}$")):
+def week_audit(week_key: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$")):
     """Read-only public audit of football-only snapshots for a historical Friday week."""
     if not DATABASE_URL:
         raise HTTPException(500, "DATABASE_URL is not configured.")
