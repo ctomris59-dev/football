@@ -296,6 +296,87 @@ def thursday_list():
     return _decision_payload(final)
 
 
+
+@app.get("/week-audit")
+def week_audit(week_key: str = Query(..., pattern=r"^\\d{4}-\\d{2}-\\d{2}$")):
+    """Read-only public audit of football-only snapshots for a historical Friday week."""
+    if not DATABASE_URL:
+        raise HTTPException(500, "DATABASE_URL is not configured.")
+    from datetime import timedelta
+    try:
+        wk = datetime.fromisoformat(week_key).replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise HTTPException(400, "Invalid week_key")
+    start = wk - timedelta(hours=3)  # Friday 00:00 Istanbul == Thu 21:00 UTC
+    end = start + timedelta(days=4)
+    out: dict[str, Any] = {"week_key": week_key, "horizon_start": start, "horizon_end": end}
+    with psycopg.connect(DATABASE_URL) as conn:
+        try:
+            row = conn.execute(
+                """SELECT finalized_at,source,payload FROM thursday_final_decisions
+                   WHERE week_key=%s ORDER BY finalized_at DESC LIMIT 1""",
+                (week_key,),
+            ).fetchone()
+            out["final"] = {"finalized_at": row[0], "source": row[1], "payload": row[2]} if row else None
+        except Exception:
+            conn.rollback(); out["final"] = None
+        try:
+            rows = conn.execute(
+                """SELECT event_id,league_name,match_date,home_team,away_team,home_goals,away_goals
+                   FROM espn_current_matches
+                   WHERE match_date>=%s AND match_date<%s
+                   ORDER BY match_date""",
+                (start,end),
+            ).fetchall()
+            out["results"] = [
+                {"event_id":str(r[0]),"league":r[1],"match_date":r[2],"home":r[3],"away":r[4],
+                 "home_goals":r[5],"away_goals":r[6]} for r in rows
+            ]
+        except Exception:
+            conn.rollback(); out["results"]=[]
+        try:
+            rows = conn.execute(
+                """SELECT fixture_id,league_name,start_time,home_team,away_team,
+                          MIN(snapshot_hour),MAX(snapshot_hour),COUNT(DISTINCT bookmaker)
+                   FROM oddspapi_fixture_snapshots
+                   WHERE start_time>=%s AND start_time<%s AND snapshot_hour<=%s
+                   GROUP BY fixture_id,league_name,start_time,home_team,away_team
+                   ORDER BY start_time""",
+                (start,end,start),
+            ).fetchall()
+            out["pre_cutoff_oddspapi_fixtures"] = [
+                {"fixture_id":str(r[0]),"league":r[1],"match_date":r[2],"home":r[3],"away":r[4],
+                 "first_snapshot":r[5],"last_snapshot":r[6],"bookmakers":int(r[7] or 0)} for r in rows
+            ]
+        except Exception:
+            conn.rollback(); out["pre_cutoff_oddspapi_fixtures"]=[]
+        try:
+            row = conn.execute(
+                """SELECT COUNT(*),COUNT(DISTINCT event_id),MIN(fetched_at),MAX(fetched_at)
+                   FROM turkey_odds_snapshots
+                   WHERE fetched_at>=%s-INTERVAL '18 hours' AND fetched_at<%s+INTERVAL '18 hours'""",
+                (start,start),
+            ).fetchone()
+            out["turkey_snapshot_window"] = {
+                "rows":int(row[0] or 0),"events":int(row[1] or 0),"first":row[2],"last":row[3]
+            } if row else {}
+        except Exception:
+            conn.rollback(); out["turkey_snapshot_window"]={}
+        try:
+            row = conn.execute(
+                """SELECT COUNT(*),COUNT(DISTINCT fixture_id),MIN(snapshot_hour),MAX(snapshot_hour)
+                   FROM oddspapi_market_prices
+                   WHERE snapshot_hour>=%s-INTERVAL '18 hours' AND snapshot_hour<%s+INTERVAL '18 hours'""",
+                (start,start),
+            ).fetchone()
+            out["international_snapshot_window"] = {
+                "rows":int(row[0] or 0),"fixtures":int(row[1] or 0),"first":row[2],"last":row[3]
+            } if row else {}
+        except Exception:
+            conn.rollback(); out["international_snapshot_window"]={}
+    return out
+
+
 @app.get("/status")
 def status(token: Optional[str] = Query(None), authorization: Optional[str] = Header(None)):
     auth(token, authorization)
