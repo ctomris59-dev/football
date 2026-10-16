@@ -363,6 +363,25 @@ def week_audit(week_key: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$")):
         except Exception:
             conn.rollback(); out["turkey_snapshot_window"]={}
         try:
+            rows = conn.execute(
+                """SELECT season_code,division,league_name,match_date,kickoff_time,home_team,away_team,
+                          home_goals,away_goals,full_time_result,over_2_5,btts,corners_over_8_5,
+                          odds_home,odds_draw,odds_away,odds_over_2_5,odds_under_2_5
+                   FROM football_data_matches
+                   WHERE match_date >= %s AND match_date <= %s
+                   ORDER BY match_date,kickoff_time,league_name""",
+                (start.date(), end.date()),
+            ).fetchall()
+            out["football_data_results"] = [
+                {"season_code":r[0],"division":r[1],"league":r[2],"match_date":r[3],"kickoff_time":r[4],
+                 "home":r[5],"away":r[6],"home_goals":r[7],"away_goals":r[8],"result":r[9],
+                 "over_2_5":r[10],"btts":r[11],"corners_over_8_5":r[12],
+                 "odds_home":r[13],"odds_draw":r[14],"odds_away":r[15],
+                 "odds_over_2_5":r[16],"odds_under_2_5":r[17]} for r in rows
+            ]
+        except Exception:
+            conn.rollback(); out["football_data_results"]=[]
+        try:
             row = conn.execute(
                 """SELECT COUNT(*),COUNT(DISTINCT fixture_id),MIN(snapshot_hour),MAX(snapshot_hour)
                    FROM oddspapi_market_prices
