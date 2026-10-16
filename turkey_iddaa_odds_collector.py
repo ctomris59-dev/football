@@ -20,6 +20,7 @@ from difflib import SequenceMatcher
 from typing import Any, Dict, Iterable, Optional
 
 import psycopg
+from psycopg.types.json import Jsonb
 import requests
 
 from thursday_decision_engine import weekend_bounds
@@ -165,7 +166,93 @@ def _event_time(event: Dict[str, Any]) -> Optional[datetime]:
         return None
 
 
-def _weekend_fixtures(conn) -> tuple[list[Dict[str, Any]], datetime, datetime]:
+def _oddspapi_fixture_fallback(conn, database_url: str, start: datetime, end: datetime) -> list[Dict[str, Any]]:
+    """Seed current Big-Five fixtures from OddsPapi when ESPN has no weekend rows.
+
+    This is a fixture-source fallback only: it does not use bookmaker prices for
+    model ranking and it does not change any probability/selection thresholds.
+    Synthetic event ids remain stable for the week and downstream market mapping
+    continues to match by kickoff + team names.
+    """
+    try:
+        from oddspapi_canonical_importer import CanonicalOddsPapiImporter
+        from oddspapi_importer import API_KEY, to_int
+
+        if not API_KEY:
+            return []
+        imp = CanonicalOddsPapiImporter(database_url)
+        try:
+            selected, _catalog = imp.cached_catalog()
+            if len(selected) != 5:
+                return []
+            fixture_map = imp.fetch_fixture_map(start, end, selected)
+        finally:
+            imp.close()
+
+        league_slugs = {
+            "Premier League": "eng.1",
+            "La Liga": "esp.1",
+            "Serie A": "ita.1",
+            "Bundesliga": "ger.1",
+            "Ligue 1": "fra.1",
+        }
+        seeded: list[Dict[str, Any]] = []
+        for fid, item in fixture_map.items():
+            tid = to_int(item.get("tournamentId"))
+            meta = selected.get(tid) or {}
+            league_name = str(meta.get("_league_name") or "")
+            league_slug = league_slugs.get(league_name)
+            match_dt = None
+            try:
+                match_dt = datetime.fromisoformat(str(item.get("startTime") or "").replace("Z", "+00:00"))
+            except ValueError:
+                pass
+            home = str(item.get("participant1ShortName") or item.get("participant1Name") or "").strip()
+            away = str(item.get("participant2ShortName") or item.get("participant2Name") or "").strip()
+            if not league_slug or match_dt is None or not home or not away:
+                continue
+            if match_dt.tzinfo is None:
+                match_dt = match_dt.replace(tzinfo=timezone.utc)
+            if not (start <= match_dt < end):
+                continue
+            eid = f"oddspapi:{fid}"
+            conn.execute(
+                """INSERT INTO espn_upcoming(
+                        event_id,league_slug,league_name,match_date,
+                        home_team_id,home_team,away_team_id,away_team,
+                        status,is_current,raw,fetched_at,updated_at
+                    ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,'scheduled',TRUE,%s,NOW(),NOW())
+                    ON CONFLICT(event_id) DO UPDATE SET
+                        league_slug=EXCLUDED.league_slug,
+                        league_name=EXCLUDED.league_name,
+                        match_date=EXCLUDED.match_date,
+                        home_team=EXCLUDED.home_team,
+                        away_team=EXCLUDED.away_team,
+                        status='scheduled',
+                        is_current=TRUE,
+                        raw=EXCLUDED.raw,
+                        updated_at=NOW()""",
+                (
+                    eid, league_slug, league_name, match_dt,
+                    str(item.get("participant1Id") or "") or None, home,
+                    str(item.get("participant2Id") or "") or None, away,
+                    Jsonb(item),
+                ),
+            )
+            seeded.append({"event_id": eid, "match_date": match_dt, "home": home, "away": away, "source": "oddspapi_fixture_fallback"})
+        if seeded:
+            print(
+                "ODDSPAPI_FIXTURE_FALLBACK_RESULT",
+                json.dumps({"fixtures": len(seeded), "start": start, "end": end}, default=str, separators=(",", ":")),
+                flush=True,
+            )
+        return seeded
+    except Exception as exc:
+        print("ODDSPAPI_FIXTURE_FALLBACK_FAILED", str(exc)[:500], flush=True)
+        return []
+
+
+def _weekend_fixtures(conn, database_url: str) -> tuple[list[Dict[str, Any]], datetime, datetime]:
     _, start, end = weekend_bounds()
     rows = conn.execute(
         """SELECT event_id,match_date,home_team,away_team
@@ -174,7 +261,9 @@ def _weekend_fixtures(conn) -> tuple[list[Dict[str, Any]], datetime, datetime]:
             ORDER BY match_date""",
         (start, end),
     ).fetchall()
-    fixtures = [{"event_id": str(r[0]), "match_date": r[1], "home": str(r[2]), "away": str(r[3])} for r in rows]
+    fixtures = [{"event_id": str(r[0]), "match_date": r[1], "home": str(r[2]), "away": str(r[3]), "source": "espn"} for r in rows]
+    if not fixtures:
+        fixtures = _oddspapi_fixture_fallback(conn, database_url, start, end)
     return fixtures, start, end
 
 
@@ -222,7 +311,7 @@ def run_import(database_url: str = DATABASE_URL) -> Dict[str, Any]:
         conn.execute(DDL)
         import_run_id = int(conn.execute("INSERT INTO turkey_odds_import_runs(started_at) VALUES(%s) RETURNING id", (started,)).fetchone()[0])
         try:
-            fixtures, horizon_start, horizon_end = _weekend_fixtures(conn)
+            fixtures, horizon_start, horizon_end = _weekend_fixtures(conn, database_url)
             if not fixtures:
                 raise RuntimeError("No current weekend ESPN fixtures available for safe İddaa matching")
 
@@ -260,7 +349,7 @@ def run_import(database_url: str = DATABASE_URL) -> Dict[str, Any]:
                 "production_fixtures": len(fixtures), "matched_fixtures": matched,
                 "fixture_coverage": round(matched / len(fixtures), 4) if fixtures else 0.0,
                 "ambiguous_fixtures": ambiguous, "target_market_rows": target_rows, "stored_prices": stored,
-                "source": SOURCE, "horizon_start": horizon_start, "horizon_end": horizon_end,
+                "source": SOURCE, "fixture_source": (fixtures[0].get("source") if fixtures else None), "horizon_start": horizon_start, "horizon_end": horizon_end,
             }
             conn.execute(
                 """UPDATE turkey_odds_import_runs SET finished_at=NOW(),status='success',official_events=%s,
